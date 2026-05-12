@@ -34,9 +34,15 @@ class AuthRequest(BaseModel):
 
 
 class AuthResponse(BaseModel):
-    """Server returns a session token (short-lived)."""
+    """Server returns a session token (sliding TTL, 7 days)."""
     session_token: str
     expires_at: int
+    pubkey_hex: str
+
+
+class LogoutResponse(BaseModel):
+    """Result of session revocation."""
+    revoked: bool
 
 
 # ============================================================================
@@ -44,6 +50,23 @@ class AuthResponse(BaseModel):
 # ============================================================================
 
 USERNAME_PATTERN = re.compile(r"^[a-z0-9_]{3,20}$")
+RESERVED_USERNAMES = frozenset({
+    "admin", "administrator", "root", "system", "morok", "morok_app",
+    "support", "help", "abuse", "security", "official", "team",
+    "anonymous", "anon", "null", "undefined", "me", "self",
+    "channel", "group", "user", "users",
+})
+
+
+def normalize_username(raw: str) -> str:
+    """
+    Strip leading @, lowercase, trim whitespace.
+
+    Order matters: strip whitespace FIRST so leading "@" is exposed,
+    THEN lstrip the "@", THEN lowercase.
+    Does NOT validate — just normalizes.
+    """
+    return raw.strip().lstrip("@").lower()
 
 
 class UsernameClaim(BaseModel):
@@ -53,15 +76,16 @@ class UsernameClaim(BaseModel):
     @field_validator("username")
     @classmethod
     def validate_username(cls, v: str) -> str:
-        v = v.lower().lstrip("@").strip()
+        v = normalize_username(v)
         if not USERNAME_PATTERN.match(v):
             raise ValueError(
                 "Username must be 3-20 chars, lowercase letters, digits, "
                 "or underscores only"
             )
-        # Additional rules: cannot start with a digit, no leading underscore
         if v[0].isdigit() or v[0] == "_":
             raise ValueError("Username cannot start with digit or underscore")
+        if v in RESERVED_USERNAMES:
+            raise ValueError("This username is reserved")
         return v
 
 
@@ -73,37 +97,48 @@ class UserInfo(BaseModel):
     last_seen_at: int | None
 
 
+class MeInfo(BaseModel):
+    """
+    Information about the current authenticated user.
+
+    Same fields as UserInfo for now — but separate type so we can add
+    private-only fields later without leaking them via `lookup`.
+    """
+    pubkey_hex: str
+    username: str | None
+    home_relay: str
+    created_at: int
+
+
+class UsernameReleaseResponse(BaseModel):
+    """Result of releasing a username."""
+    released: bool
+    cooldown_until: int  # epoch seconds — others can claim after this
+
+
 # ============================================================================
-# MESSAGE ENVELOPE
+# MESSAGE ENVELOPE (not used yet — for future commits)
 # ============================================================================
 
 class EnvelopeIn(BaseModel):
-    """
-    A message envelope sent by a client.
-
-    Note: this is a wire format. Crypto verification happens in crypto.py
-    against the JSON dict directly (because canonical serialization rules
-    must match exactly between sender and verifier).
-    """
     from_: str = Field(..., alias="from", pattern=r"^[0-9a-f]{64}$")
     to: str = Field(..., pattern=r"^[0-9a-f]{64}$")
     ts: int = Field(..., ge=0)
-    ttl: int = Field(..., ge=1, le=86400)  # max 24h client-side TTL
-    blob: str  # base64 encrypted payload
+    ttl: int = Field(..., ge=1, le=86400)
+    blob: str
     sig: str = Field(..., pattern=r"^[0-9a-f]{128}$")
 
     model_config = {"populate_by_name": True}
 
 
 class EnvelopeAck(BaseModel):
-    """Acknowledgment of envelope receipt."""
     envelope_id: str
     queued: bool
-    expires_at: int  # when blob will be hard-deleted regardless of delivery
+    expires_at: int
 
 
 # ============================================================================
-# HEALTH
+# HEALTH & ERROR
 # ============================================================================
 
 class HealthResponse(BaseModel):
@@ -112,11 +147,6 @@ class HealthResponse(BaseModel):
     version: str
 
 
-# ============================================================================
-# ERROR
-# ============================================================================
-
 class ErrorResponse(BaseModel):
-    """Standard error response."""
     error: str
     detail: str | None = None

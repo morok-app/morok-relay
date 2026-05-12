@@ -4,7 +4,7 @@ Morok Relay — main FastAPI application.
 This is the entry point. Run with:
     uvicorn morok_relay.main:app --reload
 
-In production, use the included gunicorn config (deploy/gunicorn.conf.py).
+In production, systemd manages it (see /etc/systemd/system/morok-relay.service).
 """
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 
 from . import __version__
+from .api import auth, users
 from .config import get_settings
 from .db import lifespan
 from .schemas import ErrorResponse, HealthResponse
@@ -36,7 +37,6 @@ app = FastAPI(
     ),
     version=__version__,
     lifespan=lifespan,
-    # Disable docs in production — they leak the API surface
     docs_url="/docs" if not settings.is_production else None,
     redoc_url="/redoc" if not settings.is_production else None,
     openapi_url="/openapi.json" if not settings.is_production else None,
@@ -44,26 +44,21 @@ app = FastAPI(
 
 
 # ============================================================================
-# MIDDLEWARE — request logging, headers
+# MIDDLEWARE
 # ============================================================================
 
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next):
-    """
-    Add basic security headers. nginx will add more in production
-    (HSTS, CSP, etc), but these are defaults that always apply.
-    """
     response = await call_next(request)
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "no-referrer"
-    response.headers["Server"] = "morok-relay"  # don't reveal uvicorn version
+    response.headers["Server"] = "morok-relay"
     return response
 
 
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
-    """Log requests minimally. Never log bodies or headers."""
     start = time.monotonic()
     response = await call_next(request)
     elapsed_ms = (time.monotonic() - start) * 1000
@@ -83,23 +78,16 @@ async def log_requests(request: Request, call_next):
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
-    """Standardize error responses."""
     return JSONResponse(
         status_code=exc.status_code,
         content=ErrorResponse(error=exc.detail).model_dump(exclude_none=True),
+        headers=exc.headers,
     )
 
 
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, exc: Exception):
-    """
-    Catch-all for unexpected errors.
-
-    In production we never leak exception details to clients — log internally,
-    return generic message externally.
-    """
     logger.exception("Unhandled exception on %s %s", request.method, request.url.path)
-
     if settings.debug:
         return JSONResponse(
             status_code=500,
@@ -108,7 +96,6 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
                 detail=f"{type(exc).__name__}: {exc}",
             ).model_dump(exclude_none=True),
         )
-
     return JSONResponse(
         status_code=500,
         content=ErrorResponse(error="internal_server_error").model_dump(exclude_none=True),
@@ -116,12 +103,11 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
 
 
 # ============================================================================
-# ROUTES — minimal startup set
+# META ROUTES
 # ============================================================================
 
 @app.get("/health", response_model=HealthResponse, tags=["meta"])
 async def health() -> HealthResponse:
-    """Liveness probe. Used by load balancer / orchestrator."""
     return HealthResponse(
         status="ok",
         relay_name=settings.relay_name,
@@ -131,16 +117,12 @@ async def health() -> HealthResponse:
 
 @app.get("/", tags=["meta"])
 async def root():
-    """Root endpoint. Intentionally minimal — no fingerprinting surface."""
     return {"name": "morok-relay", "version": __version__}
 
 
 # ============================================================================
-# ROUTERS — added incrementally as we build
+# API ROUTERS
 # ============================================================================
-# When ready, register routers here:
-#   from .api import auth, users, messages, federation
-#   app.include_router(auth.router,       prefix="/api/v1/auth")
-#   app.include_router(users.router,      prefix="/api/v1/users")
-#   app.include_router(messages.router,   prefix="/api/v1/messages")
-#   app.include_router(federation.router, prefix="/api/v1/federation")
+
+app.include_router(auth.router, prefix="/api/v1/auth")
+app.include_router(users.router, prefix="/api/v1/users")
