@@ -15,7 +15,7 @@ from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 
 from . import __version__
-from .api import auth, users
+from .api import auth, federation, inbox, messages, users
 from .config import get_settings
 from .db import lifespan
 from .schemas import ErrorResponse, HealthResponse
@@ -126,3 +126,8 @@ async def root():
 
 app.include_router(auth.router, prefix="/api/v1/auth")
 app.include_router(users.router, prefix="/api/v1/users")
+app.include_router(messages.router, prefix="/api/v1/messages")
+app.include_router(federation.router, prefix="/api/v1/federation")
+
+# WebSocket — uses different prefix, not REST
+app.include_router(inbox.router, prefix="/ws/v1")
