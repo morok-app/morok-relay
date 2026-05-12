@@ -1,0 +1,20 @@
+[Unit]
+Description=Run Morok blob reaper hourly
+Requires=morok-reaper.service
+
+[Timer]
+# First run 5 minutes after boot, then every hour
+OnBootSec=5min
+OnUnitActiveSec=1h
+
+# If the system was off when the timer should have fired, run it on boot
+Persistent=true
+
+# Spread out timer execution by up to 5 min to avoid all morok instances
+# (when we have many relays) reaping at the exact same time
+RandomizedDelaySec=5min
+
+Unit=morok-reaper.service
+
+[Install]
+WantedBy=timers.target

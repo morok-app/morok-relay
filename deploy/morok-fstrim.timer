@@ -1,0 +1,14 @@
+[Unit]
+Description=Daily fstrim for SSD secure-delete completeness
+Requires=morok-fstrim.service
+
+[Timer]
+# Run daily at 3:30 AM (low-traffic time)
+OnCalendar=*-*-* 03:30:00
+Persistent=true
+RandomizedDelaySec=10min
+
+Unit=morok-fstrim.service
+
+[Install]
+WantedBy=timers.target

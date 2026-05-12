@@ -1,0 +1,10 @@
+[Unit]
+Description=Run fstrim on Morok blob storage filesystem
+Documentation=man:fstrim(8)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/fstrim -v /
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=morok-fstrim
