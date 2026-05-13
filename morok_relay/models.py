@@ -17,13 +17,13 @@ Design notes:
 """
 from __future__ import annotations
 
+import enum
 import uuid
-from datetime import datetime
-from typing import TYPE_CHECKING
 
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    Enum as SAEnum,
     ForeignKey,
     Index,
     Integer,
@@ -37,8 +37,24 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .db import Base
 
-if TYPE_CHECKING:
-    pass
+
+# ============================================================================
+# USER TIER
+# ============================================================================
+
+class UserTier(str, enum.Enum):
+    """
+    Account tier — controls what username lengths are allowed.
+
+    - free:    5+ char usernames (the default for everyone)
+    - premium: 3+ char usernames (paid upgrade, future monetization)
+    - admin:   any length, including 1-2 chars (server-side only, no API)
+
+    Defined as str+Enum so Pydantic can serialize cleanly to JSON.
+    """
+    FREE = "free"
+    PREMIUM = "premium"
+    ADMIN = "admin"
 
 
 # ============================================================================
@@ -66,6 +82,12 @@ class User(Base):
     username: Mapped[str | None] = mapped_column(
         String(20), nullable=True, unique=True, index=True,
         comment="Optional human-readable handle. Globally unique across federation.",
+    )
+
+    tier: Mapped[UserTier] = mapped_column(
+        SAEnum(UserTier, name="user_tier", values_callable=lambda e: [m.value for m in e]),
+        nullable=False, default=UserTier.FREE, server_default="free", index=True,
+        comment="Account tier: free (5+ char usernames), premium (3+), admin (1+).",
     )
 
     home_relay: Mapped[str] = mapped_column(
@@ -233,21 +255,3 @@ class FederationPeer(Base):
     created_at: Mapped[int] = mapped_column(
         BigInteger, nullable=False, server_default=func.extract("epoch", func.now()),
     )
-
-
-# ============================================================================
-# AUDIT NOTE
-# ============================================================================
-# Things we DELIBERATELY do not store:
-#
-#   - Message content (encrypted or otherwise)         → blobs on filesystem
-#   - Message history                                  → deleted post-delivery
-#   - Per-user contact lists                           → client-side only
-#   - Per-user friend graph                            → client-side only
-#   - IP addresses                                     → nginx logs, 24h rotation
-#   - Push notification tokens                         → encrypted, weekly rotation
-#                                                        (separate table when needed)
-#   - Login history                                    → not retained
-#
-# If you find yourself adding any of the above to this file, STOP and reconsider.
-# ============================================================================

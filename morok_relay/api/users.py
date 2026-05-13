@@ -6,15 +6,17 @@ POST   /api/v1/users/me/username           — claim a @username
 DELETE /api/v1/users/me/username           — release my @username
 GET    /api/v1/users/lookup/{username}     — find user by @username (public)
 
-Username rules
---------------
-- 3-20 chars, lowercase letters/digits/underscores
-- Must not start with digit or underscore
-- Cannot be in RESERVED_USERNAMES
-- After release, the name enters a cooldown (MOROK_USERNAME_COOLDOWN_DAYS, default 30)
-  during which only the original owner can re-claim it. Different pubkey must wait.
+Username rules per tier (see schemas.TIER_MIN_LENGTH):
+- free:    5+ chars
+- premium: 3+ chars
+- admin:   1+ chars (admin tier is server-side only)
 
-This prevents impersonation by squatting on a recently-released handle.
+Common to all tiers:
+- chars: a-z, 0-9, underscore
+- max length: 20
+- cannot start with digit or underscore
+- cannot be in RESERVED_USERNAMES
+- 30-day cooldown after release (only original owner can re-claim)
 """
 from __future__ import annotations
 
@@ -25,13 +27,14 @@ from sqlalchemy import select
 
 from ..config import get_settings
 from ..deps import CurrentSession, DBSession
-from ..models import User, UsernameHistory
+from ..models import User, UsernameHistory, UserTier
 from ..schemas import (
     MeInfo,
     UserInfo,
     UsernameClaim,
     UsernameReleaseResponse,
     normalize_username,
+    validate_username_for_tier,
 )
 
 router = APIRouter(tags=["users"])
@@ -46,12 +49,7 @@ async def _get_or_create_user(
 ) -> User:
     """
     Look up user by pubkey, creating a fresh row if this is their first
-    authenticated request.
-
-    Why lazy creation? Auth happens against just a pubkey — we don't require
-    "signup" as a separate step. The first time someone authenticates, we
-    create their User row. The pubkey alone is their identity; everything
-    else (username, etc) is optional metadata added later.
+    authenticated request. New users default to UserTier.FREE.
     """
     settings = get_settings()
     pubkey_bytes = bytes.fromhex(pubkey_hex)
@@ -61,17 +59,17 @@ async def _get_or_create_user(
     user = result.scalar_one_or_none()
 
     if user is not None:
-        # Touch last_seen — best-effort, no error if it conflicts.
         user.last_seen_at = int(time.time())
         return user
 
     user = User(
         pubkey=pubkey_bytes,
         home_relay=settings.relay_name,
+        tier=UserTier.FREE,
         last_seen_at=int(time.time()),
     )
     db.add(user)
-    await db.flush()  # need the row visible before subsequent queries in same txn
+    await db.flush()
     return user
 
 
@@ -94,6 +92,7 @@ async def get_me(
         pubkey_hex=current.pubkey_hex,
         username=user.username,
         home_relay=user.home_relay,
+        tier=user.tier.value,
         created_at=user.created_at,
     )
 
@@ -109,27 +108,36 @@ async def claim_username(
     db: DBSession,
 ) -> MeInfo:
     """
-    Reserve a @username. The name is normalized (lowercased, @-stripped) and
-    validated by UsernameClaim.
+    Reserve a @username — the requested name must satisfy the caller's tier
+    length minimum.
 
     Errors:
-    - 409 conflict: name currently belongs to someone else
-    - 409 conflict: name is in cooldown after recent release by a different pubkey
-    - 400: validation fails (handled by Pydantic before reaching this handler)
+    - 400 invalid_username  : length violates tier minimum, bad chars, reserved
+    - 409 username_taken    : someone else has it
+    - 409 username_in_cooldown : recently released by different pubkey
     """
     settings = get_settings()
-    username = normalize_username(body.username)
+    user = await _get_or_create_user(db, current.pubkey_hex)
+
+    # Re-validate against this user's tier (Pydantic did only tier-agnostic checks).
+    try:
+        username = validate_username_for_tier(body.username, user.tier.value)
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        )
+
     pubkey_bytes = bytes.fromhex(current.pubkey_hex)
     now = int(time.time())
 
-    user = await _get_or_create_user(db, current.pubkey_hex)
-
-    # If the caller already owns this name — no-op, idempotent.
+    # Idempotent: already owns this name.
     if user.username == username:
         return MeInfo(
             pubkey_hex=current.pubkey_hex,
             username=user.username,
             home_relay=user.home_relay,
+            tier=user.tier.value,
             created_at=user.created_at,
         )
 
@@ -142,8 +150,7 @@ async def claim_username(
             detail="username_taken",
         )
 
-    # Is the name in cooldown after a recent release? Only blocks if the
-    # most-recent releaser was a DIFFERENT pubkey from the current one.
+    # Cooldown check — only blocks different pubkey within cooldown window.
     cooldown_seconds = settings.username_cooldown_days * 86400
     cooldown_cutoff = now - cooldown_seconds
     stmt = (
@@ -160,17 +167,14 @@ async def claim_username(
             detail="username_in_cooldown",
         )
 
-    # If the user already has a different username, that one needs to be
-    # released first. We do this implicitly: record it in history before
-    # overwriting.
+    # If switching usernames, record the old one in history.
     if user.username is not None and user.username != username:
-        history = UsernameHistory(
+        db.add(UsernameHistory(
             username=user.username,
             pubkey=pubkey_bytes,
-            claimed_at=user.created_at,  # best-effort approximation
+            claimed_at=user.created_at,
             released_at=now,
-        )
-        db.add(history)
+        ))
 
     user.username = username
     await db.flush()
@@ -179,6 +183,7 @@ async def claim_username(
         pubkey_hex=current.pubkey_hex,
         username=user.username,
         home_relay=user.home_relay,
+        tier=user.tier.value,
         created_at=user.created_at,
     )
 
@@ -192,10 +197,7 @@ async def release_username(
     current: CurrentSession,
     db: DBSession,
 ) -> UsernameReleaseResponse:
-    """
-    Release the current @username. Goes into cooldown — only this pubkey can
-    re-claim it within the cooldown window.
-    """
+    """Release the current @username. Goes into 30-day cooldown."""
     settings = get_settings()
     pubkey_bytes = bytes.fromhex(current.pubkey_hex)
     now = int(time.time())
@@ -205,14 +207,12 @@ async def release_username(
     if user.username is None:
         return UsernameReleaseResponse(released=False, cooldown_until=0)
 
-    released_name = user.username
-    history = UsernameHistory(
-        username=released_name,
+    db.add(UsernameHistory(
+        username=user.username,
         pubkey=pubkey_bytes,
         claimed_at=user.created_at,
         released_at=now,
-    )
-    db.add(history)
+    ))
 
     user.username = None
     await db.flush()
@@ -232,12 +232,7 @@ async def lookup_username(
     username: str,
     db: DBSession,
 ) -> UserInfo:
-    """
-    Public lookup — no auth required. Returns minimal info needed to start
-    a chat with this user (their pubkey and home_relay).
-
-    404 if the username is not claimed by anyone.
-    """
+    """Public lookup — no auth required."""
     normalized = normalize_username(username)
     stmt = select(User).where(User.username == normalized).where(User.deleted_at.is_(None))
     user = (await db.execute(stmt)).scalar_one_or_none()
