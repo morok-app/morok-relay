@@ -40,7 +40,7 @@ import time
 import uuid
 
 from fastapi import APIRouter, HTTPException, status
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
 from ..deps import CurrentSession, DBSession
@@ -303,20 +303,22 @@ async def get_group(
 
 @router.delete(
     "/{group_id}",
-    status_code=status.HTTP_204_NO_CONTENT,
     summary="Delete a group (creator only)",
 )
 async def delete_group(
     group_id: str,
     current: CurrentSession,
     db: DBSession,
-) -> None:
+) -> dict:
     """
     Soft-deletes the group (sets deleted_at). The reaper will clean up
     associated messages and the row itself within 24 hours.
 
     Only the creator can delete. In v1 there's no concept of multiple
     admins, so creator == sole admin == only one who can delete.
+
+    Returns {"deleted": true, "group_id": ...}. (We don't use 204 because
+    FastAPI does not allow a response body with status 204.)
     """
     gid = _parse_group_id(group_id)
     group = await _load_group(db, gid)
@@ -330,7 +332,7 @@ async def delete_group(
 
     group.deleted_at = int(time.time())
     # Members are CASCADE'd by FK when the row is physically deleted later.
-    return None
+    return {"deleted": True, "group_id": str(group.id)}
 
 
 @router.post(
