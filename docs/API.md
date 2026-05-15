@@ -1,6 +1,6 @@
 # Morok Relay API Reference
 
-Version: 0.5.x
+Version: 0.6.x
 Base URL: `https://relay1.morok.app`
 
 All requests/responses are JSON unless noted. All hex values are lowercase.
@@ -37,12 +37,9 @@ client                                 relay
   |  <-----------------------------     |
 ```
 
-After verify, include `Authorization: Bearer <session_token>` on
-authenticated requests.
-
 ### Signing the challenge
 
-The client signs a canonical JSON object:
+The client signs canonical JSON of:
 
 ```json
 {
@@ -53,328 +50,309 @@ The client signs a canonical JSON object:
 }
 ```
 
-Canonical means: keys sorted ASCII, no whitespace, UTF-8, no NaN/Infinity.
-In Python this is `json.dumps(obj, sort_keys=True, separators=(",", ":"))`.
+Canonical: keys sorted ASCII, no whitespace, UTF-8, no NaN. In Python this
+is `json.dumps(obj, sort_keys=True, separators=(",", ":"))`.
 
-Sign the resulting bytes with your Ed25519 private key → 64-byte signature.
-Send as hex.
+Sign the bytes with your Ed25519 private key → 64-byte signature. Send as hex.
 
 ### Session tokens
 
-- Lifetime: 7 days, sliding (extended on every authenticated request).
-- Stored server-side in Redis. Revocable.
-- Logout from this device: `DELETE /api/v1/auth/session`
-- Logout from all devices (panic): `POST /api/v1/auth/session/revoke-all`
+- Lifetime: 7 days, sliding.
+- Header: `Authorization: Bearer <session_token>`
+- Logout this device: `DELETE /api/v1/auth/session`
+- Panic logout: `POST /api/v1/auth/session/revoke-all`
 
 ---
 
 ## Endpoints
 
 ### `GET /health`
-
-Liveness check. No auth.
-
-```bash
-curl https://relay1.morok.app/health
-```
+No auth.
 
 ```json
-{ "status": "ok", "relay_name": "relay1.morok.app", "version": "0.5.0" }
+{ "status": "ok", "relay_name": "relay1.morok.app", "version": "0.6.0" }
 ```
 
 ### `POST /api/v1/auth/challenge`
-
-Request a challenge to sign.
-
 ```json
 // Request
 { "pubkey_hex": "9f2a...4f" }
-
 // Response
 { "challenge_hex": "...", "expires_at": 1778600000 }
 ```
 
-Challenge is one-time use, expires in 60 seconds.
-
 ### `POST /api/v1/auth/verify`
-
-Submit signed challenge, receive session token.
-
 ```json
 // Request
 {
-  "pubkey_hex": "9f2a...4f",
-  "challenge_hex": "abcd...",
+  "pubkey_hex": "...",
+  "challenge_hex": "...",
   "timestamp": 1778599999,
-  "signature_hex": "...128 hex chars..."
+  "signature_hex": "..."
 }
-
 // Response
-{
-  "session_token": "...64 hex chars...",
-  "expires_at": 1779204999,
-  "pubkey_hex": "9f2a...4f"
-}
+{ "session_token": "...", "expires_at": 1779204999, "pubkey_hex": "..." }
 ```
 
-Errors:
-- `401 challenge_not_found_or_expired`
-- `401 pubkey_mismatch`
-- `401 invalid_signature_or_stale_timestamp`
-
-### `DELETE /api/v1/auth/session`
-
-Revoke the current session token (this device only). Requires auth.
-
-```json
-{ "revoked": true }
-```
-
-### `POST /api/v1/auth/session/revoke-all`
-
-Revoke ALL sessions for this pubkey (panic / lost device). Requires auth.
-
-```json
-{ "revoked": true }
-```
+### `DELETE /api/v1/auth/session` — revoke current token
+### `POST /api/v1/auth/session/revoke-all` — panic
 
 ### `GET /api/v1/users/me`
-
-Profile of the authenticated user. First call lazily creates the row.
+Returns the authenticated user. First call creates the row.
 
 ```json
 {
-  "pubkey_hex": "9f2a...4f",
-  "username": "stas",       // or null
+  "pubkey_hex": "...",
+  "username": "stas" | null,
   "home_relay": "relay1.morok.app",
-  "tier": "free",           // free | premium | admin
+  "tier": "free" | "premium" | "admin",
   "created_at": 1778600000
 }
 ```
 
 ### `POST /api/v1/users/me/username`
+Tier minima: free 5+, premium 3+, admin 1+. Allowed chars: `a-z 0-9 _`.
+Cannot start with digit or underscore. Reserved names rejected.
 
-Claim a username. Length minimum depends on your tier:
+Errors: 400 `invalid_username`, 409 `username_taken`, 409 `username_in_cooldown`.
 
-| Tier    | Min length |
-|---------|------------|
-| free    | 5 chars    |
-| premium | 3 chars    |
-| admin   | 1 char     |
+### `DELETE /api/v1/users/me/username`
+30-day cooldown. Only the original pubkey can re-claim within the window.
 
-Allowed chars: `a-z`, `0-9`, `_`. Must not start with digit or underscore.
-Max 20 chars. Reserved names rejected (admin, root, system, morok, etc).
+### `GET /api/v1/users/lookup/{username}` — public
+Returns `404 username_not_found` if unclaimed.
+
+### `POST /api/v1/messages` — submit envelope
+Envelope fields signed (all fields except `sig` go into canonical JSON):
+- `from`, `to`: 64-hex pubkey
+- `ts`: epoch seconds
+- `ttl`: 1 to 86400 (24h hard cap)
+- `blob`: base64 encrypted, max 256 KB
+- `sig`: 128-hex Ed25519 signature
+
+### `GET /api/v1/messages?limit=50` — list pending
+### `GET /api/v1/messages/{envelope_id}` — fetch blob bytes
+### `DELETE /api/v1/messages/{envelope_id}` — ack delivery
+
+### `WSS /ws/v1/inbox?token=<session_token>` — real-time delivery
+See server frames: `catchup`, `new`, `ping`, `error`.
+Client → server: `{"type":"ack","envelope_id":"..."}`, `{"type":"pong"}`.
+
+---
+
+## Groups and Channels
+
+A group is a closed chat (up to 50/200 members). A channel is a group with
+`is_channel=true`: only admins can post, but membership has no public cap
+(other than tier limits enforced at creation).
+
+In v1, the **creator is the sole admin**. Adding admins / transferring
+ownership comes later.
+
+### Tier limits
+
+| Tier    | Max members | Custom slug |
+|---------|-------------|-------------|
+| Free    | 50          | No          |
+| Premium | 200         | Yes         |
+| Admin   | 200         | Yes         |
+
+`max_members` is set on the group at creation time. If the creator later
+upgrades, existing groups keep their original cap; new groups get the
+upgraded cap.
+
+### Encryption
+
+Members share a `sender-key` distributed client-side. The relay never sees
+the plaintext name, message content, or sender-key. Group display names are
+sent encrypted (`name_encrypted` field, base64-encoded ciphertext).
+
+### Anonymous senders — privacy boundary
+
+A group can be created with `anonymous_senders: true`. In that mode, clients
+SHOULD render messages as "from the group itself" rather than from a specific
+member.
+
+**Important limitation in v1:** this is anonymity *toward other members*, not
+*toward the relay*. The relay still observes which member sent the message
+(it has to, to verify the signature). True sender-anonymity against the relay
+requires ring signatures over group membership and is on the v2 roadmap.
+
+Document this clearly to users — don't mis-sell anonymity that doesn't exist
+yet.
+
+### Expiry
+
+A group with `expires_at` set will be deleted (and all its messages purged)
+after that epoch second. Powers "chats with a predetermined end". Useful
+for protests, single-event coordination, time-bounded operations.
+
+Note: the per-message 24h hard cap still applies. `expires_at` is for the
+GROUP itself; messages within it still vanish individually after their TTL.
+
+### `POST /api/v1/groups`
+
+Create a group or channel. Caller becomes the sole admin.
 
 ```json
 // Request
-{ "username": "stas" }
-
-// Response (200) — full MeInfo
+{
+  "name_encrypted": "<base64 of encrypted name, max 2 KB decoded>",
+  "is_channel": false,
+  "default_ttl_seconds": 86400,
+  "anonymous_senders": false,
+  "expires_at": 1810000000,    // optional, must be < 1 year out
+  "slug": "myteam"             // optional, premium only
+}
 ```
+
+Returns 201 with the full group (including the creator as the only member).
 
 Errors:
-- `400 invalid_username` — length, chars, reserved
-- `409 username_taken`
-- `409 username_in_cooldown` — released by another pubkey within 30 days
+- `400 invalid_slug` — Pydantic-level validation
+- `400 expires_at_must_be_in_future`
+- `400 expires_at_too_far_in_future` — capped at 1 year
+- `403 slug_requires_premium`
+- `409 slug_taken`
 
-### `DELETE /api/v1/users/me/username`
+### `GET /api/v1/groups`
 
-Release current username. Enters 30-day cooldown — only the same pubkey
-can re-claim within that window.
+List groups where the caller is a member. Ordered newest first.
 
 ```json
-{ "released": true, "cooldown_until": 1781192000 }
+[
+  {
+    "group_id": "...",
+    "creator_pubkey_hex": "...",
+    "name_encrypted": "<base64>",
+    "is_channel": false,
+    "default_ttl_seconds": 86400,
+    "anonymous_senders": false,
+    "expires_at": null,
+    "slug": null,
+    "max_members": 50,
+    "created_at": 1778600000,
+    "member_count": 3
+  }
+]
 ```
 
-### `GET /api/v1/users/lookup/{username}`
+### `GET /api/v1/groups/{group_id}`
 
-Public lookup. No auth. Returns the pubkey + home_relay for a known username.
+Full info including member list. Only members can read.
 
+Adds:
 ```json
 {
-  "pubkey_hex": "9f2a...4f",
-  "username": "stas",
-  "home_relay": "relay1.morok.app",
-  "last_seen_at": 1778599000
-}
-```
-
-Returns `404 username_not_found` if unclaimed.
-
-### `POST /api/v1/messages`
-
-Send an encrypted envelope. Auth required.
-
-Envelope format — client signs the canonical JSON of all fields except `sig`:
-
-```json
-{
-  "from":  "<sender_pubkey_hex>",     // must match your authenticated pubkey
-  "to":    "<recipient_pubkey_hex>",
-  "ts":    <current epoch seconds>,
-  "ttl":   <seconds, 1 to 86400>,     // hard cap: 24h
-  "blob":  "<base64 encrypted payload, max 256 KB>",
-  "sig":   "<64-byte signature, hex>"
-}
-```
-
-Response:
-
-```json
-{
-  "envelope_id": "<sha256 of canonical envelope, hex>",
-  "queued": true,
-  "expires_at": 1778603600
-}
-```
-
-If `queued: false` — this envelope (same envelope_id) was already submitted;
-no error, just a no-op.
-
-Errors:
-- `400 envelope_invalid: ...` — signature/timestamp/format
-- `400 blob_not_base64`
-- `403 from_field_must_match_authenticated_pubkey`
-- `413 blob_too_large_max_262144_bytes`
-
-### `GET /api/v1/messages?limit=50`
-
-List envelopes pending for the caller. Auth required. Returns oldest first.
-
-```json
-{
-  "count": 2,
-  "envelopes": [
-    {
-      "envelope_id": "...",
-      "from": "...",
-      "to": "...",
-      "ts": 1778600000,
-      "ttl": 3600,
-      "sig": "...",
-      "expires_at": 1778603600
-    },
+  ...
+  "members": [
+    { "pubkey_hex": "...", "is_admin": true, "joined_at": 1778600000 },
     ...
   ]
 }
 ```
 
-Does NOT include blob bytes — fetch each via `GET /messages/{id}`.
-Does NOT mark as delivered — call `DELETE /messages/{id}` after processing.
+Errors:
+- `400 malformed_group_id`
+- `403 not_a_member`
+- `404 group_not_found`
 
-### `GET /api/v1/messages/{envelope_id}`
+### `DELETE /api/v1/groups/{group_id}`
 
-Fetch the encrypted blob bytes. Auth required. Only the addressee can fetch.
+Soft-delete the group. Only the creator can call this. Returns 204.
+Reaper purges associated messages and physically deletes the row within 24h.
 
-Returns `application/octet-stream` — raw bytes, NOT JSON.
+Errors: `403 only_creator_can_delete`, `404 group_not_found`.
+
+### `POST /api/v1/groups/{group_id}/members`
+
+Admin adds a member by pubkey. Idempotent: adding an existing member returns
+200 with current member_count.
+
+```json
+// Request
+{ "pubkey_hex": "..." }
+// Response
+{
+  "group_id": "...",
+  "member_pubkey_hex": "...",
+  "action": "added",
+  "member_count": 4
+}
+```
 
 Errors:
-- `400 malformed_envelope_id`
-- `404 envelope_not_in_your_inbox` — wrong recipient or expired
-- `404 blob_not_found` — already reaped
+- `403 only_admin_can_add_members`
+- `409 group_full_max_50_members` (or 200 for premium)
 
-### `DELETE /api/v1/messages/{envelope_id}`
+### `DELETE /api/v1/groups/{group_id}/members/{pubkey_hex}`
 
-Acknowledge delivery. Removes envelope from your inbox queue. Idempotent.
+Two modes:
+1. Self-leave: caller pubkey == target → user leaves.
+2. Admin kick: caller is admin → removes the target.
 
-```json
-{ "acknowledged": true }
-```
+The creator cannot leave or be removed via this endpoint. They must
+`DELETE /api/v1/groups/{id}` instead.
 
-The blob is eventually secure-deleted from disk by the hourly reaper.
+Errors:
+- `403 must_be_self_or_admin`
+- `404 not_a_member`
+- `409 creator_cannot_leave_must_delete_group`
 
----
+### `GET /api/v1/groups/by-slug/{slug}`
 
-## WebSocket
+Public lookup of a channel by its slug — no auth, no member list returned.
 
-### `WSS /ws/v1/inbox?token=<session_token>`
+Returns the same `GroupInfo` shape as GET /groups (without members).
 
-Real-time delivery. Send the session token as a query parameter (browsers
-disallow custom headers on WS handshake).
+Errors: `404 slug_not_found`.
 
-#### Server → client frames
+### Group messaging
 
-```json
-// On connect — current inbox
-{ "type": "catchup", "envelopes": [...], "count": N }
-
-// When a new envelope arrives
-{ "type": "new", "envelope": { ... metadata as in /messages list ... } }
-
-// Every 30 seconds
-{ "type": "ping" }
-
-// On error
-{ "type": "error", "detail": "..." }
-```
-
-#### Client → server frames
-
-```json
-// Acknowledge an envelope (equivalent to DELETE /messages/{id})
-{ "type": "ack", "envelope_id": "..." }
-
-// Heartbeat response
-{ "type": "pong" }
-```
-
-After receiving a "new" frame, the client should fetch the blob via
-`GET /messages/{envelope_id}` and then send an ack.
+`POST /api/v1/groups/{group_id}/messages` is NOT implemented in v0.6 — it
+ships in v0.7 (next sub-session). When live, it will accept a single envelope
+addressed to the group_id and fan-out to all members' inboxes via the same
+Redis queue / WebSocket pipeline used for 1-on-1 messages.
 
 ---
 
 ## Federation
 
-These are relay-to-relay endpoints. Regular clients should not call them.
+Relay-to-relay endpoints. Regular clients should not call them.
 
-- `POST /api/v1/federation/handshake` — exchange identity with another relay
-- `POST /api/v1/federation/forward`   — accept a forwarded envelope from peer
-- `GET  /api/v1/federation/users/lookup/{username}` — public lookup, same as user-facing version
+- `POST /api/v1/federation/handshake`
+- `POST /api/v1/federation/forward`
+- `GET  /api/v1/federation/users/lookup/{username}`
 
 ---
 
 ## Error response shape
 
-All error responses (4xx/5xx) follow this shape:
-
 ```json
-{ "error": "snake_case_error_code", "detail": "optional human-readable detail" }
+{ "error": "snake_case_code", "detail": "optional human text" }
 ```
 
-The `error` field is stable — clients can switch on it. The `detail` is
-informational only and may change between versions.
+The `error` field is stable — clients can switch on it.
 
 ---
 
 ## TTL and message lifetime
 
-- **Hard cap: 24 hours.** Regardless of client-requested TTL, the relay
-  physically destroys blobs after 24 hours.
-- **Default: 24 hours** (client may request less in the envelope's `ttl` field).
-- **Reaper runs hourly** to secure-delete (overwrite + unlink) any blob whose
-  TTL has expired or which has been acknowledged.
-- **fstrim runs daily** to ensure SSD-level erasure of secure-deleted blocks.
-
-There is no "burn after reading" feature on the server side. That is a
-client-side responsibility: the client may delete the local copy any time
-after reading, but the server already has its own short TTL working.
+- **Hard cap: 24 hours.** Server destroys any blob after 24h regardless of
+  client-requested TTL.
+- **Default: 24 hours.** Client may request less.
+- Reaper runs hourly; fstrim runs daily to erase deleted SSD blocks.
+- No "burn after reading" on the server side — that's a client-side concern.
 
 ---
 
-## Privacy guarantees
+## Privacy boundaries
 
-What the relay knows:
-- Your public key (= identity)
-- Your optional @username (if you claimed one)
-- The fact that an envelope exists, sender pubkey, recipient pubkey, timestamp, size
-- The encrypted blob itself (cannot decrypt)
+What the relay knows: pubkey identities, optional usernames, group metadata
+(member list, encrypted names, settings), envelope metadata (from, to, ts,
+size).
 
-What the relay does NOT know:
-- Message content (encrypted with X25519 + XSalsa20-Poly1305 client-side)
-- Your contact list (lives only in your client)
-- When you read a message (no read receipts on server side)
-- Your IP address beyond nginx's 24-hour rotating access log
+What the relay does NOT know: message content, contact lists, read state,
+sender-keys, group names in plaintext.
 
-What the relay never stores past TTL:
-- Any blob older than 24 hours
-- Any blob whose recipient ACK'd delivery (cleaned within ~1 hour by reaper)
+What's stored past TTL: nothing. Blobs older than 24h are reaped.
