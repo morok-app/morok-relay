@@ -1,0 +1,15 @@
+[Unit]
+Description=Run Morok Dead Man's Switch reaper hourly
+Requires=morok-dms-reaper.service
+
+[Timer]
+# First run 10 minutes after boot (offset from regular reaper which runs at 5min)
+OnBootSec=10min
+OnUnitActiveSec=1h
+Persistent=true
+RandomizedDelaySec=5min
+
+Unit=morok-dms-reaper.service
+
+[Install]
+WantedBy=timers.target

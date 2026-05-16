@@ -10,7 +10,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from . import __version__
-from .api import auth, federation, groups, inbox, messages, users
+from .api import auth, dms, federation, groups, inbox, messages, users
 from .config import get_settings
 from .db import lifespan
 from .schemas import ErrorResponse, HealthResponse
@@ -32,10 +32,6 @@ app = FastAPI(
     openapi_url="/openapi.json" if not settings.is_production else None,
 )
 
-
-# ============================================================================
-# MIDDLEWARE
-# ============================================================================
 
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next):
@@ -61,10 +57,6 @@ async def log_requests(request: Request, call_next):
     )
     return response
 
-
-# ============================================================================
-# EXCEPTION HANDLERS
-# ============================================================================
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
@@ -92,10 +84,6 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
     )
 
 
-# ============================================================================
-# META ROUTES
-# ============================================================================
-
 @app.get("/health", response_model=HealthResponse, tags=["meta"])
 async def health() -> HealthResponse:
     return HealthResponse(
@@ -118,6 +106,7 @@ app.include_router(auth.router, prefix="/api/v1/auth")
 app.include_router(users.router, prefix="/api/v1/users")
 app.include_router(messages.router, prefix="/api/v1/messages")
 app.include_router(groups.router, prefix="/api/v1/groups")
+app.include_router(dms.router, prefix="/api/v1/dms")
 app.include_router(federation.router, prefix="/api/v1/federation")
 
 # WebSocket

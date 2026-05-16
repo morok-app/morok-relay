@@ -1,0 +1,32 @@
+[Unit]
+Description=Morok Dead Man's Switch reaper (fire armed DMS that have hit trigger time)
+After=morok-relay.service redis-server.service postgresql.service
+Requires=redis-server.service postgresql.service
+
+[Service]
+Type=oneshot
+User=morok
+Group=morok
+WorkingDirectory=/home/morok/morok-relay
+EnvironmentFile=/home/morok/morok-relay/.env
+ExecStart=/home/morok/morok-relay/.venv/bin/python -m morok_relay.scripts.dms_reaper
+
+# Hardening — same as morok-relay
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/morok/morok-relay /var/lib/morok
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=morok-dms-reaper

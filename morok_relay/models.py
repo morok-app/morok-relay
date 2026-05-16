@@ -27,13 +27,19 @@ from .db import Base
 
 
 # ============================================================================
-# USER TIER
+# ENUMS
 # ============================================================================
 
 class UserTier(str, enum.Enum):
     FREE = "free"
     PREMIUM = "premium"
     ADMIN = "admin"
+
+
+class DMSStatus(str, enum.Enum):
+    ARMED = "armed"           # active, will fire on inactivity
+    TRIGGERED = "triggered"   # has fired, payload delivered
+    CANCELLED = "cancelled"   # owner cancelled before trigger
 
 
 # ============================================================================
@@ -85,86 +91,40 @@ class UsernameHistory(Base):
 
 
 # ============================================================================
-# GROUP — closed groups and channels
+# GROUP
 # ============================================================================
 
 class Group(Base):
-    """
-    A closed group chat or one-way channel.
-
-    Membership model
-    ----------------
-    - Creator is the sole admin in v1.
-    - Members join only by being added by the admin (no public join endpoint
-      yet; that comes with invite links later).
-    - Channels (is_channel=True) restrict write access to the admin.
-
-    Encryption model
-    ----------------
-    Members share a sender-key, distributed out-of-band (the client encrypts
-    the sender-key with each member's X25519 key and stores those in messages
-    until everyone receives it). The relay never sees the sender-key.
-
-    Anonymous-sender mode (v1 limitation)
-    -------------------------------------
-    When anonymous_senders=True, OTHER members can't tell who in the group
-    sent a message. The RELAY can — for v1 we trust the relay for that, and
-    document the limitation. Full sender-anonymity would require ring
-    signatures over group membership (v2 feature).
-
-    Expiry
-    ------
-    If expires_at is set, the group and ALL its messages are deleted after
-    that time. Powers "chats with a predetermined end". The reaper enforces.
-    """
     __tablename__ = "groups"
 
     id: Mapped[uuid.UUID] = mapped_column(
         PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
-
     creator_pubkey: Mapped[bytes] = mapped_column(
         LargeBinary(32), nullable=False, index=True,
     )
-
-    # Encrypted display name — relay never sees plaintext.
     name_encrypted: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
-
     is_channel: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False,
-        comment="If True, only admins can post (read-only for members).",
     )
-
     default_ttl_seconds: Mapped[int] = mapped_column(
         Integer, nullable=False, default=86400,
-        comment="Default disappearing-message TTL for this group.",
     )
-
-    # NEW in v0.6
     slug: Mapped[str | None] = mapped_column(
         String(30), nullable=True, unique=True, index=True,
-        comment="Custom URL handle for channels (premium feature).",
     )
-
     expires_at: Mapped[int | None] = mapped_column(
         BigInteger, nullable=True, index=True,
-        comment="If set, group is deleted after this epoch second.",
     )
-
     anonymous_senders: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="false",
-        comment="If True, member messages appear as from the group itself.",
     )
-
     max_members: Mapped[int] = mapped_column(
         Integer, nullable=False, default=50, server_default="50",
-        comment="Member cap (50 free / 200 premium at creation time).",
     )
-
     created_at: Mapped[int] = mapped_column(
         BigInteger, nullable=False, server_default=func.extract("epoch", func.now()),
     )
-
     deleted_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
     members: Mapped[list["GroupMember"]] = relationship(
@@ -178,16 +138,12 @@ class GroupMember(Base):
     id: Mapped[uuid.UUID] = mapped_column(
         PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
-
     group_id: Mapped[uuid.UUID] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("groups.id", ondelete="CASCADE"),
         nullable=False, index=True,
     )
-
     pubkey: Mapped[bytes] = mapped_column(LargeBinary(32), nullable=False, index=True)
-
     is_admin: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-
     joined_at: Mapped[int] = mapped_column(
         BigInteger, nullable=False, server_default=func.extract("epoch", func.now()),
     )
@@ -215,4 +171,92 @@ class FederationPeer(Base):
     last_handshake_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     created_at: Mapped[int] = mapped_column(
         BigInteger, nullable=False, server_default=func.extract("epoch", func.now()),
+    )
+
+
+# ============================================================================
+# DEAD MAN'S SWITCH (NEW in v0.7)
+# ============================================================================
+
+class DeadManSwitch(Base):
+    """
+    A user's pre-armed "if I disappear, send this" mechanism.
+
+    The user creates a DMS with:
+    - a trigger_seconds (1h to 1y) of inactivity that fires it
+    - an encrypted payload (relay never sees plaintext)
+    - 1-20 recipient pubkeys
+
+    On every authenticated request, last_check_in_at is bumped to now. The
+    DMS cron (hourly) finds 'armed' switches where now - last_check_in_at
+    exceeds trigger_seconds, and fires them: delivers the payload as a
+    standard envelope to each recipient.
+
+    After firing, status becomes 'triggered'. A switch can be 'cancelled'
+    by the owner at any time, which prevents future firing without losing
+    history.
+    """
+    __tablename__ = "dead_man_switches"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    creator_pubkey: Mapped[bytes] = mapped_column(
+        LargeBinary(32), nullable=False,
+    )
+    trigger_seconds: Mapped[int] = mapped_column(
+        Integer, nullable=False,
+    )
+    last_check_in_at: Mapped[int] = mapped_column(
+        BigInteger, nullable=False,
+    )
+    payload_encrypted: Mapped[bytes] = mapped_column(
+        LargeBinary, nullable=False,
+    )
+    label: Mapped[str | None] = mapped_column(
+        String(100), nullable=True,
+        comment="User-visible label like 'family' or 'work'. Stored as the user provides it — clients may encrypt it client-side or send plaintext.",
+    )
+    status: Mapped[DMSStatus] = mapped_column(
+        SAEnum(DMSStatus, name="dms_status", values_callable=lambda e: [m.value for m in e]),
+        nullable=False, default=DMSStatus.ARMED, server_default="armed",
+    )
+    created_at: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, server_default=func.extract("epoch", func.now()),
+    )
+    triggered_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    cancelled_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+
+    recipients: Mapped[list["DMSRecipient"]] = relationship(
+        back_populates="dms", cascade="all, delete-orphan"
+    )
+
+    __table_args__ = (
+        Index("ix_dms_creator_status", "creator_pubkey", "status"),
+        Index("ix_dms_status_check_in", "status", "last_check_in_at"),
+    )
+
+
+class DMSRecipient(Base):
+    __tablename__ = "dms_recipients"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    dms_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dead_man_switches.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    recipient_pubkey: Mapped[bytes] = mapped_column(
+        LargeBinary(32), nullable=False,
+    )
+    delivered_at: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True,
+        comment="When the trigger actually delivered to this recipient.",
+    )
+
+    dms: Mapped["DeadManSwitch"] = relationship(back_populates="recipients")
+
+    __table_args__ = (
+        UniqueConstraint("dms_id", "recipient_pubkey", name="uq_dms_recipients"),
     )

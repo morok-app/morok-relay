@@ -162,7 +162,7 @@ def validate_slug(slug: str) -> str:
 
 
 # ============================================================================
-# GROUPS & CHANNELS
+# GROUPS
 # ============================================================================
 
 GROUP_NAME_MAX_BYTES = 2048
@@ -239,7 +239,7 @@ class GroupMembershipChange(BaseModel):
 
 
 # ============================================================================
-# MESSAGE ENVELOPE (1-on-1)
+# MESSAGE ENVELOPE
 # ============================================================================
 
 class EnvelopeIn(BaseModel):
@@ -259,31 +259,9 @@ class EnvelopeAck(BaseModel):
     expires_at: int
 
 
-# ============================================================================
-# GROUP MESSAGE ENVELOPE
-# ============================================================================
-
 class GroupEnvelopeIn(BaseModel):
-    """
-    Envelope for a group message.
-
-    Differs from 1-on-1 EnvelopeIn:
-    - 'to' is the group UUID (string), not a recipient pubkey
-    - Signature is computed over the same canonical envelope (minus 'sig')
-
-    The blob is shared across all recipients — they decrypt it with the
-    shared sender-key.
-
-    For anonymous_senders groups: 'from' is still the real sender pubkey
-    (relay needs it to verify the signature), but clients SHOULD render
-    the message as from the group itself, not the sender. See API.md.
-    """
     from_: str = Field(..., alias="from", pattern=r"^[0-9a-f]{64}$")
-    to: str = Field(
-        ...,
-        description="Group UUID (36 chars including hyphens)",
-        min_length=36, max_length=36,
-    )
+    to: str = Field(..., min_length=36, max_length=36)
     ts: int = Field(..., ge=0)
     ttl: int = Field(..., ge=1, le=86400)
     blob: str
@@ -295,8 +273,106 @@ class GroupEnvelopeIn(BaseModel):
 class GroupEnvelopeAck(BaseModel):
     envelope_id: str
     queued: bool
-    recipient_count: int    # how many members got fan-out'd
+    recipient_count: int
     expires_at: int
+
+
+# ============================================================================
+# DEAD MAN'S SWITCH
+# ============================================================================
+
+DMS_TRIGGER_MIN_SECONDS = 3600          # 1 hour
+DMS_TRIGGER_MAX_SECONDS = 365 * 86400   # 1 year
+DMS_PAYLOAD_MAX_BYTES = 262144          # 256 KB, same as message blob
+DMS_FREE_TIER_MAX_RECIPIENTS = 5
+DMS_PREMIUM_TIER_MAX_RECIPIENTS = 20
+DMS_LABEL_MAX_LEN = 100
+
+
+class DMSCreate(BaseModel):
+    """
+    Create a dead man's switch.
+
+    Fields:
+    - trigger_seconds: inactivity period that fires the switch (1h to 1y)
+    - payload_encrypted: base64 ciphertext to deliver. Relay never decrypts.
+    - recipient_pubkeys_hex: 1 to N pubkey hex strings. N depends on tier.
+    - label: optional user-visible name like "family". Up to 100 chars.
+    """
+    trigger_seconds: int = Field(
+        ..., ge=DMS_TRIGGER_MIN_SECONDS, le=DMS_TRIGGER_MAX_SECONDS,
+    )
+    payload_encrypted: str = Field(..., description="base64 ciphertext")
+    recipient_pubkeys_hex: list[str] = Field(..., min_length=1)
+    label: str | None = Field(default=None, max_length=DMS_LABEL_MAX_LEN)
+
+    @field_validator("payload_encrypted")
+    @classmethod
+    def payload_is_valid_base64(cls, v: str) -> str:
+        try:
+            decoded = base64.b64decode(v, validate=True)
+        except Exception:
+            raise ValueError("payload_encrypted must be valid base64")
+        if len(decoded) == 0:
+            raise ValueError("payload_encrypted is empty")
+        if len(decoded) > DMS_PAYLOAD_MAX_BYTES:
+            raise ValueError(
+                f"payload_encrypted too large (max {DMS_PAYLOAD_MAX_BYTES} bytes)"
+            )
+        return v
+
+    @field_validator("recipient_pubkeys_hex")
+    @classmethod
+    def validate_recipients(cls, v: list[str]) -> list[str]:
+        if not v:
+            raise ValueError("at least one recipient required")
+        seen = set()
+        out = []
+        for pk in v:
+            pk = pk.lower().strip()
+            if not re.match(r"^[0-9a-f]{64}$", pk):
+                raise ValueError(f"recipient pubkey not 64 hex chars: {pk[:16]}...")
+            if pk in seen:
+                raise ValueError("duplicate recipient pubkeys not allowed")
+            seen.add(pk)
+            out.append(pk)
+        # Hard upper bound here at the schema level — endpoint also enforces
+        # tier-specific limits.
+        if len(out) > DMS_PREMIUM_TIER_MAX_RECIPIENTS:
+            raise ValueError(
+                f"too many recipients (max {DMS_PREMIUM_TIER_MAX_RECIPIENTS} even for premium)"
+            )
+        return out
+
+
+class DMSRecipientInfo(BaseModel):
+    recipient_pubkey_hex: str
+    delivered_at: int | None
+
+
+class DMSInfo(BaseModel):
+    """Full DMS info returned to the owner."""
+    dms_id: str
+    trigger_seconds: int
+    last_check_in_at: int
+    fires_at: int            # last_check_in_at + trigger_seconds — when it would fire
+    label: str | None
+    status: str
+    created_at: int
+    triggered_at: int | None
+    cancelled_at: int | None
+    recipients: list[DMSRecipientInfo]
+
+
+class DMSCheckInResponse(BaseModel):
+    dms_id: str
+    last_check_in_at: int
+    fires_at: int
+
+
+class DMSCancelResponse(BaseModel):
+    dms_id: str
+    cancelled: bool
 
 
 # ============================================================================

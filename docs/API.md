@@ -1,6 +1,6 @@
 # Morok Relay API Reference
 
-Version: 0.7.x
+Version: 0.7.x (v0.8 package — DMS added)
 Base URL: `https://relay1.morok.app`
 
 All requests/responses are JSON unless noted. Hex values are lowercase.
@@ -49,6 +49,9 @@ Canonical = keys sorted ASCII, no whitespace, UTF-8, no NaN. Python:
 
 - TTL 7 days, sliding (renewed on each request)
 - Header: `Authorization: Bearer <session_token>`
+- **Side effect**: every authenticated request also bumps `last_check_in_at`
+  on all of the caller's *armed* Dead Man's Switches. This is fire-and-forget,
+  does not slow the response.
 - Logout device: `DELETE /api/v1/auth/session`
 - Panic: `POST /api/v1/auth/session/revoke-all`
 
@@ -57,68 +60,37 @@ Canonical = keys sorted ASCII, no whitespace, UTF-8, no NaN. Python:
 ## Endpoints
 
 ### Meta
-
 - `GET /health` — `{ status, relay_name, version }`
 
 ### Auth
-
 - `POST /api/v1/auth/challenge` → `{ challenge_hex, expires_at }`
 - `POST /api/v1/auth/verify` → `{ session_token, expires_at, pubkey_hex }`
 - `DELETE /api/v1/auth/session` → `{ revoked }`
 - `POST /api/v1/auth/session/revoke-all` → `{ revoked }`
 
 ### Users
-
-- `GET /api/v1/users/me` → MeInfo (creates row on first call)
+- `GET /api/v1/users/me` → MeInfo
 - `POST /api/v1/users/me/username` body `{ username }` → MeInfo
   - tier minima: free 5+, premium 3+, admin 1+
-  - chars: `a-z 0-9 _`, no leading digit/underscore, max 20
-  - errors: 400 `invalid_username`, 409 `username_taken`, 409 `username_in_cooldown`
-- `DELETE /api/v1/users/me/username` → `{ released, cooldown_until }` (30-day cooldown)
-- `GET /api/v1/users/lookup/{username}` → UserInfo or 404 (public)
+- `DELETE /api/v1/users/me/username` → `{ released, cooldown_until }`
+- `GET /api/v1/users/lookup/{username}` → UserInfo or 404
 
 ### 1-on-1 Messages
-
-Envelope is signed: canonical JSON of all fields except `sig`, then Ed25519.
-
-```json
-{
-  "from": "<sender pubkey hex>",
-  "to":   "<recipient pubkey hex>",
-  "ts":   <epoch s>,
-  "ttl":  <1 to 86400, 24h hard cap>,
-  "blob": "<base64 encrypted, max 256 KB>",
-  "sig":  "<128 hex>"
-}
-```
-
 - `POST /api/v1/messages` → `{ envelope_id, queued, expires_at }`
 - `GET /api/v1/messages?limit=50` → `{ envelopes, count }`
-- `GET /api/v1/messages/{envelope_id}` → raw bytes (`application/octet-stream`)
+- `GET /api/v1/messages/{envelope_id}` → raw bytes
 - `DELETE /api/v1/messages/{envelope_id}` → `{ acknowledged }`
 
 ### WebSocket
-
-`WSS /ws/v1/inbox?token=<session_token>`
-
-Server frames:
-- `{"type":"catchup","envelopes":[...],"count":N}` on connect
-- `{"type":"new","envelope":{...}}` per new envelope
-- `{"type":"ping"}` every 30s
-- `{"type":"error","detail":"..."}`
-
-Client frames:
-- `{"type":"ack","envelope_id":"..."}` (= DELETE /messages/{id})
-- `{"type":"pong"}`
+`WSS /ws/v1/inbox?token=<session_token>` — `catchup`, `new`, `ping`, `error`.
+Client: `{"type":"ack","envelope_id":"..."}` / `{"type":"pong"}`.
 
 ---
 
 ## Groups and Channels
 
 A group is a closed chat (≤50 free, ≤200 premium). A channel is a group
-with `is_channel=true`: only admins post, no special read cap.
-
-### Tier limits
+with `is_channel=true`: only admins post.
 
 | Tier    | Max members | Custom slug |
 |---------|-------------|-------------|
@@ -126,108 +98,188 @@ with `is_channel=true`: only admins post, no special read cap.
 | Premium | 200         | Yes         |
 | Admin   | 200         | Yes         |
 
-`max_members` is fixed at creation. Future tier upgrades don't change
-existing groups.
+### Endpoints
 
-### Encryption model
+- `POST /api/v1/groups` body `{ name_encrypted, is_channel, default_ttl_seconds, anonymous_senders, expires_at?, slug? }` → 201 GroupInfoDetailed
+- `GET /api/v1/groups` → `[GroupInfo]`
+- `GET /api/v1/groups/{group_id}` → GroupInfoDetailed (members only)
+- `DELETE /api/v1/groups/{group_id}` → `{ deleted, group_id }` (creator only)
+- `POST /api/v1/groups/{group_id}/members` body `{ pubkey_hex }` → GroupMembershipChange
+- `DELETE /api/v1/groups/{group_id}/members/{pubkey_hex}` → GroupMembershipChange
+- `GET /api/v1/groups/by-slug/{slug}` → GroupInfo (public, no member list)
+- `POST /api/v1/groups/{group_id}/messages` → `{ envelope_id, queued, recipient_count, expires_at }`
+  - `to` field in envelope = group UUID (not pubkey)
+  - Relay fans out to all members (sender included for multi-device sync)
 
-Members share a sender-key, distributed client-side. The relay never sees
-plaintext, sender-keys, or display names (which travel as `name_encrypted`
-base64 ciphertext).
+---
 
-### Anonymous senders
+## Dead Man's Switch
 
-If `anonymous_senders=true`, clients SHOULD render messages as from the
-group itself. The relay still observes who sent each message (it must, to
-verify signatures) — this is anonymity *toward other members*, not
-*toward the relay*. v2 will add ring signatures for the latter.
+**The "if I disappear, send this" mechanism.**
 
-### Expiry
+A user pre-arms a switch with:
+- a **trigger period** (1 hour to 1 year of inactivity)
+- a **pre-encrypted payload** (relay never sees plaintext)
+- 1-N **trusted recipients** (their pubkeys)
 
-`expires_at` is the epoch second after which the whole group (and all its
-messages) is destroyed. Per-message 24h hard cap still applies inside.
-Useful for protests, single-event coordination, time-bounded operations.
+The relay tracks `last_check_in_at`. Every authenticated request bumps it.
+A separate hourly cron (the *DMS reaper*) finds any 'armed' switch where
+`now - last_check_in_at > trigger_seconds` and **fires** it: delivers the
+payload to each recipient as a regular envelope, then marks the switch
+'triggered'.
+
+### Tier limits
+
+| Tier    | Max recipients per DMS |
+|---------|------------------------|
+| Free    | 5                      |
+| Premium | 20                     |
+
+No hard limit on number of switches per user. Users can have multiple
+(one for family, one for work, etc).
+
+### Privacy guarantees
+
+- The relay **does not see the payload** — it's encrypted client-side
+  with whatever key(s) the recipients hold.
+- The relay **does see**: who created each DMS, who the recipients are,
+  what the trigger period is, when last_check_in_at happens.
+- The triggered envelope is **signed by the relay** (not by the creator)
+  because the relay can't have the creator's private key. Clients see
+  this through a `kind: "dms_trigger"` marker plus `dms_creator_pubkey`
+  and `dms_id` fields in the envelope metadata. Clients should render
+  this differently from a regular message — e.g. "Dead-man-switch from
+  @creator (delivered via relay)".
+
+### Trigger period bounds
+
+- Minimum: **1 hour** (3600 seconds)
+- Maximum: **1 year** (31536000 seconds)
+
+Why 1 hour minimum: protects against accidentally arming a switch that
+fires before you can check in. Why 1 year maximum: server resource limit;
+also forces users to re-confirm intent annually.
 
 ### Endpoints
 
-- `POST /api/v1/groups` body:
-  ```json
-  {
-    "name_encrypted": "<base64, max 2KB decoded>",
-    "is_channel": false,
-    "default_ttl_seconds": 86400,
-    "anonymous_senders": false,
-    "expires_at": 1810000000,   // optional, <1 year out
-    "slug": "myteam"            // premium only
-  }
-  ```
-  → 201 GroupInfoDetailed (caller is sole admin)
-  - 400 `invalid_slug`, `expires_at_must_be_in_future`, `expires_at_too_far_in_future`
-  - 403 `slug_requires_premium`
-  - 409 `slug_taken`
+#### `POST /api/v1/dms`
 
-- `GET /api/v1/groups` → `[GroupInfo]` (groups I'm in, newest first)
-
-- `GET /api/v1/groups/{group_id}` → GroupInfoDetailed (members only)
-  - 400 `malformed_group_id`, 403 `not_a_member`, 404 `group_not_found`
-
-- `DELETE /api/v1/groups/{group_id}` → `{ deleted, group_id }` (creator only)
-  - Reaper purges associated messages and physically deletes the row within 24h.
-  - Returns 200 with body (not 204 because FastAPI rejects body+204).
-
-- `POST /api/v1/groups/{group_id}/members` body `{ pubkey_hex }` → GroupMembershipChange
-  - Admin adds. Idempotent.
-  - 403 `only_admin_can_add_members`, 409 `group_full_max_N_members`
-
-- `DELETE /api/v1/groups/{group_id}/members/{pubkey_hex}` → GroupMembershipChange
-  - Self-leave OR admin kicks.
-  - 403 `must_be_self_or_admin`, 404 `not_a_member`,
-    409 `creator_cannot_leave_must_delete_group`
-
-- `GET /api/v1/groups/by-slug/{slug}` → GroupInfo (no auth, no member list)
-  - 404 `slug_not_found`
-
-### Group messaging
-
-Group envelope is structurally similar to 1-on-1, but `to` is the **group
-UUID** (36 chars including hyphens), not a pubkey:
+Create a DMS. Returns 201 with the full DMSInfo including assigned `dms_id`.
 
 ```json
+// Request
 {
-  "from": "<sender pubkey hex>",
-  "to":   "<group UUID>",
-  "ts":   <epoch s>,
-  "ttl":  <1 to 86400>,
-  "blob": "<base64 encrypted, max 256 KB>",
-  "sig":  "<128 hex>"
+  "trigger_seconds": 86400,
+  "payload_encrypted": "<base64 ciphertext, max 256 KB>",
+  "recipient_pubkeys_hex": ["abc...", "def..."],
+  "label": "family"            // optional, max 100 chars
+}
+
+// Response (201)
+{
+  "dms_id": "...",
+  "trigger_seconds": 86400,
+  "last_check_in_at": 1781000000,
+  "fires_at": 1781086400,
+  "label": "family",
+  "status": "armed",
+  "created_at": 1781000000,
+  "triggered_at": null,
+  "cancelled_at": null,
+  "recipients": [
+    { "recipient_pubkey_hex": "abc...", "delivered_at": null },
+    ...
+  ]
 }
 ```
 
-- `POST /api/v1/groups/{group_id}/messages` → `{ envelope_id, queued, recipient_count, expires_at }`
+Errors:
+- 400 `recipient_pubkey_not_64_hex_chars`
+- 400 trigger_seconds below 1h or above 1y → Pydantic validation
+- 400 `payload_encrypted_empty` / `payload_encrypted_too_large_max_262144_bytes`
+- 400 `duplicate_recipient_pubkeys_not_allowed`
+- 403 `too_many_recipients_for_tier_max_5` (or 20 for premium)
 
-Server validates:
-- URL `group_id` matches envelope `to`
-- `from` matches authenticated session
-- Caller is a member
-- If channel: caller is the admin
-- Signature valid over canonical envelope (sans `sig`)
-- Timestamp within window (-5min … +1min)
-- Blob ≤ 256 KB
+#### `GET /api/v1/dms`
 
-On success:
-- Blob written ONCE to disk
-- Fan-out: queued in every member's inbox (including sender — for multi-
-  device sync)
-- Real-time pushed via WebSocket to anyone with an active connection
+List all of the caller's DMS (any status — armed, triggered, cancelled).
 
-Recipients see the message in `GET /api/v1/messages` with metadata showing
-`group_id` set (so clients can route it to the group thread rather than
-to a 1-on-1 conversation).
+```json
+[
+  { "dms_id": "...", ... },
+  ...
+]
+```
+
+#### `GET /api/v1/dms/{dms_id}`
+
+Get one DMS's full details. Only the owner can read.
 
 Errors:
-- 400 `envelope_to_must_match_url_group_id`, `signature_invalid`, `envelope_too_old`, `envelope_from_the_future`, `blob_not_base64`
-- 403 `from_field_must_match_authenticated_pubkey`, `not_a_member`, `channel_admin_only_post`
-- 413 `blob_too_large_max_262144_bytes`
+- 400 `malformed_dms_id`
+- 404 `dms_not_found` (also returned when caller is not owner — no leak)
+
+#### `POST /api/v1/dms/{dms_id}/check-in`
+
+Explicit check-in. Sets `last_check_in_at = now`. Returns the new value
+and the recomputed `fires_at`.
+
+Note: any authenticated request from the owner also bumps check-in
+automatically (fire-and-forget). This explicit endpoint exists so the
+client can do a deliberate "I'm still here" with no other side effects,
+and so users have a visible button to press.
+
+Errors:
+- 409 `dms_not_armed_status_triggered` / `dms_not_armed_status_cancelled`
+- 404 `dms_not_found`
+
+#### `DELETE /api/v1/dms/{dms_id}`
+
+Cancel a DMS. Transitions 'armed' → 'cancelled' to prevent firing.
+Idempotent (already-cancelled returns 200 with `cancelled: true`).
+For 'triggered' (already fired), returns `cancelled: false` — can't
+un-fire history.
+
+```json
+{ "dms_id": "...", "cancelled": true }
+```
+
+### DMS-triggered envelope shape
+
+When the reaper fires a DMS, each recipient receives a regular envelope
+in their inbox. Metadata (returned by `GET /messages`) contains:
+
+```json
+{
+  "envelope_id": "...",
+  "from": "<relay's pubkey hex>",   // NOT the creator
+  "to": "<recipient pubkey hex>",
+  "ts": 1781086400,
+  "ttl": 86400,
+  "sig": "<relay's signature>",
+  "kind": "dms_trigger",
+  "dms_creator_pubkey": "<creator hex>",
+  "dms_id": "<original dms uuid>",
+  "expires_at": 1781172800
+}
+```
+
+Clients should:
+1. Verify the signature against the **relay's** Ed25519 public key
+   (known via DNS TXT records or federation handshake).
+2. Recognize `kind: "dms_trigger"` and display the message distinctly
+   ("Dead-man-switch from @<creator>" rather than "Message from @relay").
+3. Decrypt the blob with whatever key the creator provisioned out-of-band
+   (e.g. recipient's pubkey — the creator should have encrypted with X25519
+   to each recipient's pubkey before storing).
+
+### Cron schedule
+
+- `morok-dms-reaper.timer`: runs hourly (`OnUnitActiveSec=1h`), first run
+  10 minutes after boot.
+- Idempotent: a 'triggered' switch is never re-fired. If the process
+  crashes mid-fan-out, the DMS stays 'armed' until ALL recipients are
+  delivered; on retry, recipients with `delivered_at != null` are skipped.
 
 ---
 
@@ -247,27 +299,24 @@ Relay-to-relay endpoints. Regular clients should not call them.
 { "error": "snake_case_code", "detail": "optional human text" }
 ```
 
-`error` is stable; `detail` may change.
-
 ---
 
 ## TTL and message lifetime
 
-- **Hard cap: 24 hours.** Reaper destroys any blob older than this.
-- **Default: 24 hours.** Clients may request less per message.
-- **Reaper hourly.** **fstrim daily.**
-- No server-side "burn after reading" — clients handle that locally.
+- **Hard cap: 24 hours.** Reaper destroys blobs after this.
+- **Reaper hourly. DMS reaper hourly. fstrim daily.**
+- No server-side "burn after reading" — clients handle that.
 
 ---
 
 ## Privacy boundaries
 
-What the relay knows: pubkey identities, optional usernames, group metadata
-(membership, encrypted names, settings), envelope metadata (from, to, ts,
-size).
+What the relay knows: pubkey identities, optional usernames, group metadata,
+DMS metadata (recipients, trigger time, payload size), envelope metadata.
 
-What the relay does NOT know: message content, contact lists, read state,
-sender-keys, group display names in plaintext.
+What the relay does NOT know: message content, contact lists outside DMS
+recipients, read state, group display names plaintext, DMS payload plaintext.
 
-What's stored past TTL: nothing. Blobs older than 24h are reaped, fstrim
-erases the underlying SSD blocks daily.
+What's stored past TTL: nothing for messages. DMS rows stay (audit trail)
+but their payloads are deleted after triggering or cancellation. fstrim
+erases SSD blocks daily.
