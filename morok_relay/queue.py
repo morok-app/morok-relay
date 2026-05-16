@@ -13,8 +13,7 @@ Keys
 ----
     morok:inbox:{recipient_pubkey_hex}     — SORTED SET of envelope_ids
                                              score = expires_at
-    morok:envelope:{envelope_id}           — HASH of envelope metadata
-                                             (sender, recipient, ts, ttl, sig)
+    morok:envelope:{envelope_id}           — JSON of envelope metadata
                                              TTL = hard ceiling
 
     morok:inbox:channel:{recipient_pubkey} — Redis PUB/SUB channel
@@ -74,19 +73,77 @@ async def enqueue_envelope(
     }
 
     async with redis.pipeline(transaction=True) as pipe:
-        # Store metadata as JSON; TTL on the key itself for auto-cleanup
         pipe.set(
             _envelope_meta_key(envelope_id),
             json.dumps(meta).encode("utf-8"),
             ex=expires_at - now,
         )
-        # Add to recipient's sorted-set inbox with expiry as score
         pipe.zadd(_inbox_key(recipient_pubkey_hex), {envelope_id: expires_at})
-        # Notify any active inbox WebSocket subscribers
         pipe.publish(_inbox_channel(recipient_pubkey_hex), envelope_id)
         await pipe.execute()
 
     return expires_at
+
+
+async def enqueue_envelope_for_recipients(
+    redis: redis_async.Redis,
+    envelope_id: str,
+    sender_pubkey_hex: str,
+    recipient_pubkeys_hex: list[str],
+    timestamp: int,
+    ttl_seconds: int,
+    signature_hex: str,
+    hard_ceiling_seconds: int,
+    group_id: str | None = None,
+) -> tuple[int, int]:
+    """
+    Fan-out: deliver the same envelope to multiple recipients.
+
+    Used by group messages — one blob is queued in N inboxes. The same
+    envelope_id is reused for all of them (each inbox row points to the
+    same blob on disk).
+
+    Returns (expires_at, recipient_count).
+
+    The metadata is stored ONCE with a 'to' of either the group_id (if
+    given) or the comma-joined recipients (for tracability). This means
+    /messages GET returns the same metadata to every recipient — they
+    all see the message addressed to the group, not to themselves
+    individually. That's what we want for group UX.
+    """
+    now = int(time.time())
+    requested_expires = timestamp + ttl_seconds
+    ceiling = now + hard_ceiling_seconds
+    expires_at = min(requested_expires, ceiling)
+
+    # 'to' field in metadata: group_id makes it clear this was a broadcast
+    to_value = group_id if group_id else "broadcast"
+
+    meta = {
+        "envelope_id": envelope_id,
+        "from": sender_pubkey_hex,
+        "to": to_value,
+        "ts": timestamp,
+        "ttl": ttl_seconds,
+        "sig": signature_hex,
+        "expires_at": expires_at,
+        "group_id": group_id,
+    }
+
+    async with redis.pipeline(transaction=True) as pipe:
+        # Single metadata record (shared by all recipients)
+        pipe.set(
+            _envelope_meta_key(envelope_id),
+            json.dumps(meta).encode("utf-8"),
+            ex=expires_at - now,
+        )
+        # Add to each recipient's inbox + publish notification
+        for recipient in recipient_pubkeys_hex:
+            pipe.zadd(_inbox_key(recipient), {envelope_id: expires_at})
+            pipe.publish(_inbox_channel(recipient), envelope_id)
+        await pipe.execute()
+
+    return expires_at, len(recipient_pubkeys_hex)
 
 
 async def list_inbox(
@@ -102,7 +159,6 @@ async def list_inbox(
     """
     now = int(time.time())
 
-    # First, prune any expired entries (score <= now)
     await redis.zremrangebyscore(_inbox_key(recipient_pubkey_hex), 0, now)
 
     envelope_ids_raw = await redis.zrange(
@@ -113,7 +169,6 @@ async def list_inbox(
     if not envelope_ids:
         return []
 
-    # Batch-fetch metadata
     async with redis.pipeline(transaction=False) as pipe:
         for eid in envelope_ids:
             pipe.get(_envelope_meta_key(eid))
@@ -122,7 +177,7 @@ async def list_inbox(
     out = []
     for raw in metas_raw:
         if raw is None:
-            continue  # metadata expired but inbox entry survived; will be cleaned
+            continue
         try:
             out.append(json.loads(raw))
         except json.JSONDecodeError:
@@ -136,13 +191,12 @@ async def acknowledge_envelope(
     envelope_id: str,
 ) -> bool:
     """
-    Mark envelope as delivered: remove from recipient's inbox.
+    Mark envelope as delivered for THIS recipient: remove from inbox.
 
-    Note: this does NOT delete the blob from disk. The relay's reaper job
-    (separate worker) is responsible for that — but ack is the signal that
-    delivery succeeded, so blob can be reaped sooner.
-
-    Returns True if the envelope was in the inbox and got removed.
+    For group messages, this only removes from the current recipient's
+    inbox — other group members still see the message until they ack
+    individually. The blob is not deleted until the reaper sees that NO
+    recipient still has it queued (or it ages out).
     """
     removed = await redis.zrem(_inbox_key(recipient_pubkey_hex), envelope_id)
     return removed > 0

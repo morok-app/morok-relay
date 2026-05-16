@@ -8,30 +8,28 @@ DELETE  /api/v1/groups/{group_id}                        — delete (creator onl
 POST    /api/v1/groups/{group_id}/members                — admin adds a member
 DELETE  /api/v1/groups/{group_id}/members/{pubkey_hex}   — leave self or admin kicks
 GET     /api/v1/groups/by-slug/{slug}                    — public lookup for channels
-
-Not yet (sub-session B): POST /api/v1/groups/{group_id}/messages — broadcast.
+POST    /api/v1/groups/{group_id}/messages               — broadcast message to group
 
 Tier limits
 -----------
 - Free creator:    50 members max, slug not allowed
 - Premium creator: 200 members max, slug allowed
 
-Limits are recorded on the Group row at creation time and don't change if
-the creator's tier changes later. This means a free user who later goes
-premium keeps their existing 50-member groups, but new groups they create
-get the 200 cap.
-
 Admin model in v1
 -----------------
-Creator is the sole admin. No way to promote/demote yet. To "transfer
-ownership", the creator deletes the group and a new one is created.
+Creator is the sole admin. No way to promote/demote yet.
+
+Channels (is_channel=True)
+--------------------------
+Only the admin can post messages. Members can read.
 
 Anonymous senders
 -----------------
-If anonymous_senders=True at creation, member messages to the group will
-be presented (by clients) as from the group itself, not the sender. The
-RELAY still sees who sent it — this is anonymity *toward other members*,
-not *toward the relay*. Documented in API.md.
+If anonymous_senders=True, the relay still sees who sent each message
+(it verifies the signature). Clients SHOULD render anonymous-group
+messages as from the group itself. This is "anonymity toward other
+members", not "toward the relay". v2 will add ring signatures for the
+latter.
 """
 from __future__ import annotations
 
@@ -43,11 +41,16 @@ from fastapi import APIRouter, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
-from ..deps import CurrentSession, DBSession
+from .. import blob_storage, crypto
+from ..config import get_settings
+from ..deps import CurrentSession, DBSession, RedisClient
 from ..models import Group, GroupMember, User, UserTier
+from ..queue import enqueue_envelope_for_recipients, envelope_exists
 from ..schemas import (
     GroupAddMemberRequest,
     GroupCreate,
+    GroupEnvelopeAck,
+    GroupEnvelopeIn,
     GroupInfo,
     GroupInfoDetailed,
     GroupMemberInfo,
@@ -56,7 +59,6 @@ from ..schemas import (
 
 router = APIRouter(tags=["groups"])
 
-# Tier-based caps for new groups
 FREE_TIER_MAX_MEMBERS = 50
 PREMIUM_TIER_MAX_MEMBERS = 200
 
@@ -66,13 +68,10 @@ PREMIUM_TIER_MAX_MEMBERS = 200
 # ============================================================================
 
 async def _get_current_user(db, pubkey_hex: str) -> User:
-    """Load the authenticated user. Must exist — they hit auth already."""
     pubkey = bytes.fromhex(pubkey_hex)
     stmt = select(User).where(User.pubkey == pubkey)
     user = (await db.execute(stmt)).scalar_one_or_none()
     if user is None:
-        # Lazy-create the user row, matching what users.py does
-        from ..config import get_settings
         settings = get_settings()
         user = User(
             pubkey=pubkey,
@@ -168,16 +167,9 @@ async def create_group(
     current: CurrentSession,
     db: DBSession,
 ) -> GroupInfoDetailed:
-    """
-    Create a group. The caller becomes the sole admin.
-
-    Free users get max_members=50 and cannot set a slug.
-    Premium users get max_members=200 and may set a slug (3-20 chars).
-    """
     user = await _get_current_user(db, current.pubkey_hex)
     now = int(time.time())
 
-    # Tier-based gating
     if user.tier == UserTier.PREMIUM or user.tier == UserTier.ADMIN:
         max_members = PREMIUM_TIER_MAX_MEMBERS
     else:
@@ -189,7 +181,6 @@ async def create_group(
             detail="slug_requires_premium",
         )
 
-    # Slug uniqueness check
     if body.slug is not None:
         stmt = select(Group).where(
             Group.slug == body.slug,
@@ -202,9 +193,6 @@ async def create_group(
                 detail="slug_taken",
             )
 
-    # expires_at sanity — must be in the future, and not absurdly far out
-    # (cap at 1 year so people can't game it; reaper still enforces 24h
-    # per-message hard cap regardless)
     if body.expires_at is not None:
         if body.expires_at <= now:
             raise HTTPException(
@@ -217,9 +205,7 @@ async def create_group(
                 detail="expires_at_too_far_in_future",
             )
 
-    # Decode encrypted name (Pydantic already validated it's valid b64+size)
     name_bytes = base64.b64decode(body.name_encrypted, validate=True)
-
     creator_pubkey = bytes.fromhex(current.pubkey_hex)
 
     group = Group(
@@ -233,9 +219,8 @@ async def create_group(
         max_members=max_members,
     )
     db.add(group)
-    await db.flush()  # need group.id for FK below
+    await db.flush()
 
-    # Creator joins as admin
     db.add(GroupMember(
         group_id=group.id,
         pubkey=creator_pubkey,
@@ -257,13 +242,7 @@ async def list_my_groups(
     current: CurrentSession,
     db: DBSession,
 ) -> list[GroupInfo]:
-    """
-    Returns groups where the authenticated user is a member.
-
-    No pagination yet (max ~200 groups per user expected at this scale).
-    """
     pubkey = bytes.fromhex(current.pubkey_hex)
-
     stmt = (
         select(Group)
         .join(GroupMember, GroupMember.group_id == Group.id)
@@ -273,7 +252,6 @@ async def list_my_groups(
         .order_by(Group.created_at.desc())
     )
     groups = (await db.execute(stmt)).scalars().all()
-
     return [_to_group_info(g) for g in groups]
 
 
@@ -287,7 +265,6 @@ async def get_group(
     current: CurrentSession,
     db: DBSession,
 ) -> GroupInfoDetailed:
-    """Full info including members. Only members can see this."""
     gid = _parse_group_id(group_id)
     group = await _load_group(db, gid)
 
@@ -311,14 +288,10 @@ async def delete_group(
     db: DBSession,
 ) -> dict:
     """
-    Soft-deletes the group (sets deleted_at). The reaper will clean up
-    associated messages and the row itself within 24 hours.
+    Soft-deletes the group. Reaper cleans up messages and the row later.
 
-    Only the creator can delete. In v1 there's no concept of multiple
-    admins, so creator == sole admin == only one who can delete.
-
-    Returns {"deleted": true, "group_id": ...}. (We don't use 204 because
-    FastAPI does not allow a response body with status 204.)
+    Returns {"deleted": true, "group_id": ...}.
+    (Not 204 because FastAPI doesn't allow a body with 204.)
     """
     gid = _parse_group_id(group_id)
     group = await _load_group(db, gid)
@@ -331,7 +304,6 @@ async def delete_group(
         )
 
     group.deleted_at = int(time.time())
-    # Members are CASCADE'd by FK when the row is physically deleted later.
     return {"deleted": True, "group_id": str(group.id)}
 
 
@@ -346,12 +318,6 @@ async def add_member(
     current: CurrentSession,
     db: DBSession,
 ) -> GroupMembershipChange:
-    """
-    Only an admin can add a new member. In v1, admin = creator.
-
-    Idempotent: adding an existing member is a no-op (returns 200 with
-    current member_count).
-    """
     gid = _parse_group_id(group_id)
     group = await _load_group(db, gid)
 
@@ -365,7 +331,6 @@ async def add_member(
 
     new_member_pubkey = bytes.fromhex(body.pubkey_hex)
 
-    # Idempotent check
     if _is_member(group, new_member_pubkey):
         return GroupMembershipChange(
             group_id=str(group.id),
@@ -408,14 +373,6 @@ async def remove_member(
     current: CurrentSession,
     db: DBSession,
 ) -> GroupMembershipChange:
-    """
-    Either the user leaves themselves (caller pubkey == target), or the
-    admin kicks (caller is admin).
-
-    The creator cannot leave or be kicked. They must delete the group
-    instead. This prevents an admin-less zombie state in v1 (where we
-    have no admin promotion).
-    """
     gid = _parse_group_id(group_id)
     group = await _load_group(db, gid)
 
@@ -428,7 +385,6 @@ async def remove_member(
     caller = bytes.fromhex(current.pubkey_hex)
     target = bytes.fromhex(pubkey_hex)
 
-    # Auth: caller is either themselves (leaving) or the admin (kicking)
     is_self = caller == target
     admin_member = _find_admin(group)
     is_admin = admin_member is not None and admin_member.pubkey == caller
@@ -438,14 +394,12 @@ async def remove_member(
             detail="must_be_self_or_admin",
         )
 
-    # Creator can't be removed via this endpoint
     if target == group.creator_pubkey:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="creator_cannot_leave_must_delete_group",
         )
 
-    # Find and remove
     target_member = next((m for m in group.members if m.pubkey == target), None)
     if target_member is None:
         raise HTTPException(
@@ -474,12 +428,6 @@ async def lookup_by_slug(
     slug: str,
     db: DBSession,
 ) -> GroupInfo:
-    """
-    Public lookup — no auth. Used to find a channel by its custom URL.
-
-    Returns the same info as the authenticated GET /groups/{id}, but
-    without the member list (privacy).
-    """
     from ..schemas import normalize_slug
 
     normalized = normalize_slug(slug)
@@ -499,3 +447,162 @@ async def lookup_by_slug(
         )
 
     return _to_group_info(group)
+
+
+# ============================================================================
+# GROUP MESSAGING — broadcast to all members
+# ============================================================================
+
+@router.post(
+    "/{group_id}/messages",
+    response_model=GroupEnvelopeAck,
+    summary="Broadcast a message to all members of a group",
+)
+async def send_group_message(
+    group_id: str,
+    body: GroupEnvelopeIn,
+    current: CurrentSession,
+    db: DBSession,
+    redis: RedisClient,
+) -> GroupEnvelopeAck:
+    """
+    Send an encrypted envelope to all members of the group.
+
+    Authorization:
+    - Caller must be authenticated as body.from_ (sender pubkey check)
+    - Caller must be a member of the group
+    - If the group is a channel (is_channel=True), only the admin can post
+    - body.to must equal the group_id in the URL
+
+    Encryption: the blob is shared (sender-key model), so the same bytes
+    are queued in every member's inbox.
+    """
+    settings = get_settings()
+    gid = _parse_group_id(group_id)
+    group = await _load_group(db, gid)
+
+    # 1. URL group_id and envelope.to must agree
+    if body.to != str(group.id):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="envelope_to_must_match_url_group_id",
+        )
+
+    # 2. Caller must be the sender pubkey in the envelope
+    if body.from_ != current.pubkey_hex:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="from_field_must_match_authenticated_pubkey",
+        )
+
+    # 3. Caller must be a member
+    sender_pubkey = bytes.fromhex(current.pubkey_hex)
+    if not _is_member(group, sender_pubkey):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="not_a_member",
+        )
+
+    # 4. Channels: only admin can post
+    if group.is_channel:
+        admin_member = _find_admin(group)
+        if admin_member is None or admin_member.pubkey != sender_pubkey:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="channel_admin_only_post",
+            )
+
+    # 5. Verify the envelope signature.
+    #    Canonical form of envelope (sans 'sig') is what was signed.
+    envelope_dict = {
+        "from": body.from_,
+        "to": body.to,
+        "ts": body.ts,
+        "ttl": body.ttl,
+        "blob": body.blob,
+    }
+    canonical = crypto.canonical_json({**envelope_dict})
+    try:
+        sig_bytes = bytes.fromhex(body.sig)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="malformed_sig_hex",
+        )
+    if not crypto.ed25519_verify(canonical, sig_bytes, sender_pubkey):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="signature_invalid",
+        )
+
+    # Time window check (same as 1-on-1)
+    now = int(time.time())
+    if body.ts < now - 300:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="envelope_too_old",
+        )
+    if body.ts > now + 60:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="envelope_from_the_future",
+        )
+
+    # 6. Decode blob, enforce size
+    try:
+        blob_bytes = base64.b64decode(body.blob, validate=True)
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="blob_not_base64",
+        )
+    if len(blob_bytes) > settings.max_blob_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"blob_too_large_max_{settings.max_blob_bytes}_bytes",
+        )
+
+    # 7. Build envelope_id. For groups we hash (sender, group_id, ts, blob_hash)
+    # so the same exact message resubmitted is deduplicated.
+    import hashlib
+    h = hashlib.sha256()
+    h.update(sender_pubkey)
+    h.update(group.id.bytes)
+    h.update(body.ts.to_bytes(8, "big"))
+    h.update(hashlib.sha256(blob_bytes).digest())
+    envelope_id = h.hexdigest()
+
+    # Dedup
+    if await envelope_exists(redis, envelope_id):
+        return GroupEnvelopeAck(
+            envelope_id=envelope_id,
+            queued=False,
+            recipient_count=0,
+            expires_at=0,
+        )
+
+    # 8. Write blob ONCE (shared by all recipients)
+    await blob_storage.write_blob(envelope_id, blob_bytes)
+
+    # 9. Fan-out to every group member (including sender — so they see their
+    #    own message in their inbox, which lets multi-device clients sync).
+    recipient_pubkeys = [m.pubkey.hex() for m in group.members]
+
+    expires_at, recipient_count = await enqueue_envelope_for_recipients(
+        redis=redis,
+        envelope_id=envelope_id,
+        sender_pubkey_hex=body.from_,
+        recipient_pubkeys_hex=recipient_pubkeys,
+        timestamp=body.ts,
+        ttl_seconds=body.ttl,
+        signature_hex=body.sig,
+        hard_ceiling_seconds=settings.message_ttl_hard_seconds,
+        group_id=str(group.id),
+    )
+
+    return GroupEnvelopeAck(
+        envelope_id=envelope_id,
+        queued=True,
+        recipient_count=recipient_count,
+        expires_at=expires_at,
+    )

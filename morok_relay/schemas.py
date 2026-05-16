@@ -125,11 +125,8 @@ class UsernameReleaseResponse(BaseModel):
 
 
 # ============================================================================
-# GROUP SLUGS (custom URLs for channels)
+# GROUP SLUGS
 # ============================================================================
-# Slugs use the same character class as usernames, but a separate namespace.
-# 3-20 chars, premium-only at creation. Reserved list is different from
-# usernames — these would conflict with future top-level routes.
 
 SLUG_CHAR_PATTERN = re.compile(r"^[a-z0-9_]+$")
 SLUG_MIN_LEN = 3
@@ -148,11 +145,6 @@ def normalize_slug(raw: str) -> str:
 
 
 def validate_slug(slug: str) -> str:
-    """
-    Validate a channel slug. Returns normalized form; raises ValueError.
-
-    Caller is responsible for the tier check (slug is premium-only at create).
-    """
     s = normalize_slug(slug)
     if not SLUG_CHAR_PATTERN.match(s):
         raise ValueError(
@@ -173,32 +165,20 @@ def validate_slug(slug: str) -> str:
 # GROUPS & CHANNELS
 # ============================================================================
 
-GROUP_NAME_MAX_BYTES = 2048  # plenty for an encrypted display name
+GROUP_NAME_MAX_BYTES = 2048
 GROUP_DEFAULT_TTL_MIN = 60
-GROUP_DEFAULT_TTL_MAX = 86400  # 24h, matches message hard cap
+GROUP_DEFAULT_TTL_MAX = 86400
 
 
 class GroupCreate(BaseModel):
-    """
-    Create a group or channel.
-
-    name_encrypted is opaque to the relay — encrypted client-side with the
-    group's sender-key. Base64 on the wire.
-    """
     name_encrypted: str = Field(..., description="base64-encoded encrypted name")
     is_channel: bool = False
     default_ttl_seconds: int = Field(
         default=86400, ge=GROUP_DEFAULT_TTL_MIN, le=GROUP_DEFAULT_TTL_MAX,
     )
     anonymous_senders: bool = False
-    expires_at: int | None = Field(
-        default=None, ge=0,
-        description="Optional: epoch seconds when group self-destructs",
-    )
-    slug: str | None = Field(
-        default=None,
-        description="Custom URL (premium only). 3-20 chars, lowercase.",
-    )
+    expires_at: int | None = Field(default=None, ge=0)
+    slug: str | None = None
 
     @field_validator("name_encrypted")
     @classmethod
@@ -230,10 +210,9 @@ class GroupMemberInfo(BaseModel):
 
 
 class GroupInfo(BaseModel):
-    """Group metadata returned from list/get endpoints."""
     group_id: str
     creator_pubkey_hex: str
-    name_encrypted: str            # base64
+    name_encrypted: str
     is_channel: bool
     default_ttl_seconds: int
     anonymous_senders: bool
@@ -245,25 +224,22 @@ class GroupInfo(BaseModel):
 
 
 class GroupInfoDetailed(GroupInfo):
-    """Full group view including member list — only for members."""
     members: list[GroupMemberInfo]
 
 
 class GroupAddMemberRequest(BaseModel):
-    """Admin adds a member to the group by their pubkey."""
     pubkey_hex: str = Field(..., pattern=r"^[0-9a-f]{64}$")
 
 
 class GroupMembershipChange(BaseModel):
-    """Response for join/leave/kick operations."""
     group_id: str
     member_pubkey_hex: str
-    action: str  # "added" | "removed"
+    action: str
     member_count: int
 
 
 # ============================================================================
-# MESSAGE ENVELOPE
+# MESSAGE ENVELOPE (1-on-1)
 # ============================================================================
 
 class EnvelopeIn(BaseModel):
@@ -280,6 +256,46 @@ class EnvelopeIn(BaseModel):
 class EnvelopeAck(BaseModel):
     envelope_id: str
     queued: bool
+    expires_at: int
+
+
+# ============================================================================
+# GROUP MESSAGE ENVELOPE
+# ============================================================================
+
+class GroupEnvelopeIn(BaseModel):
+    """
+    Envelope for a group message.
+
+    Differs from 1-on-1 EnvelopeIn:
+    - 'to' is the group UUID (string), not a recipient pubkey
+    - Signature is computed over the same canonical envelope (minus 'sig')
+
+    The blob is shared across all recipients — they decrypt it with the
+    shared sender-key.
+
+    For anonymous_senders groups: 'from' is still the real sender pubkey
+    (relay needs it to verify the signature), but clients SHOULD render
+    the message as from the group itself, not the sender. See API.md.
+    """
+    from_: str = Field(..., alias="from", pattern=r"^[0-9a-f]{64}$")
+    to: str = Field(
+        ...,
+        description="Group UUID (36 chars including hyphens)",
+        min_length=36, max_length=36,
+    )
+    ts: int = Field(..., ge=0)
+    ttl: int = Field(..., ge=1, le=86400)
+    blob: str
+    sig: str = Field(..., pattern=r"^[0-9a-f]{128}$")
+
+    model_config = {"populate_by_name": True}
+
+
+class GroupEnvelopeAck(BaseModel):
+    envelope_id: str
+    queued: bool
+    recipient_count: int    # how many members got fan-out'd
     expires_at: int
 
 
