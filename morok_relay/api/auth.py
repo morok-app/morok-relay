@@ -11,7 +11,6 @@ import secrets
 import time
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from redis.asyncio import Redis
 
 from ..config import get_settings
 from ..crypto import canonical_json, ed25519_verify
@@ -25,20 +24,16 @@ from ..schemas import (
     LogoutResponse,
 )
 from ..sessions import (
-    create_session_token,
-    revoke_all_sessions_for_pubkey,
-    revoke_session_token,
+    consume_challenge,
+    create_session,
+    revoke_all_sessions,
+    revoke_session,
+    store_challenge,
 )
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["auth"])
-
-CHALLENGE_TTL_SECONDS = 60
-
-
-def _challenge_key(challenge_hex: str) -> str:
-    return f"morok:challenge:{challenge_hex}"
 
 
 # ============================================================================
@@ -51,7 +46,6 @@ def _challenge_key(challenge_hex: str) -> str:
     summary="Request a challenge to sign",
     dependencies=[Depends(rate_limit_by_ip(
         "auth_challenge",
-        # Use settings value at decoration time — uvicorn reloads on .env change
         get_settings().rate_limit_auth_per_minute,
     ))],
 )
@@ -62,13 +56,9 @@ async def request_challenge(
     """Issue a one-time challenge. Client signs and POSTs to /verify."""
     challenge = secrets.token_bytes(32)
     challenge_hex = challenge.hex()
-    expires_at = int(time.time()) + CHALLENGE_TTL_SECONDS
+    expires_at = int(time.time()) + 60  # CHALLENGE_TTL is 60s in sessions.py
 
-    await redis.setex(
-        _challenge_key(challenge_hex),
-        CHALLENGE_TTL_SECONDS,
-        body.pubkey_hex,
-    )
+    await store_challenge(redis, challenge_hex, body.pubkey_hex)
 
     return ChallengeResponse(challenge_hex=challenge_hex, expires_at=expires_at)
 
@@ -92,14 +82,14 @@ async def verify_challenge(
     The signature is over canonical JSON of:
         { morok_auth, challenge, pubkey, timestamp }
     """
-    expected_pubkey_raw = await redis.get(_challenge_key(body.challenge_hex))
-    if expected_pubkey_raw is None:
+    # Atomically read+burn the challenge — prevents replay
+    expected_pubkey_hex = await consume_challenge(redis, body.challenge_hex)
+    if expected_pubkey_hex is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="challenge_not_found_or_expired",
         )
 
-    expected_pubkey_hex = expected_pubkey_raw.decode("utf-8")
     if expected_pubkey_hex != body.pubkey_hex:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -129,16 +119,13 @@ async def verify_challenge(
             detail="invalid_signature_or_stale_timestamp",
         )
 
-    # Burn the challenge so it can't be reused
-    await redis.delete(_challenge_key(body.challenge_hex))
-
-    # Issue session token
-    token, expires_at = await create_session_token(redis, body.pubkey_hex)
+    # Issue session — returns a Session(token, pubkey_hex, expires_at)
+    session = await create_session(redis, body.pubkey_hex)
 
     return AuthResponse(
-        session_token=token,
-        expires_at=expires_at,
-        pubkey_hex=body.pubkey_hex,
+        session_token=session.token,
+        expires_at=session.expires_at,
+        pubkey_hex=session.pubkey_hex,
     )
 
 
@@ -151,7 +138,7 @@ async def logout(
     current: CurrentSession,
     redis: RedisClient,
 ) -> LogoutResponse:
-    revoked = await revoke_session_token(redis, current.token)
+    revoked = await revoke_session(redis, current.token)
     return LogoutResponse(revoked=revoked)
 
 
@@ -164,7 +151,7 @@ async def revoke_all(
     current: CurrentSession,
     redis: RedisClient,
 ) -> LogoutResponse:
-    count = await revoke_all_sessions_for_pubkey(redis, current.pubkey_hex)
+    count = await revoke_all_sessions(redis, current.pubkey_hex)
     logger.info(
         "Revoked %d session(s) for pubkey %s",
         count, current.pubkey_hex[:16],
