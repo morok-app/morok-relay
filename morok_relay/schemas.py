@@ -383,6 +383,8 @@ class HealthResponse(BaseModel):
     status: str
     relay_name: str
     version: str
+    onion: str | None = None
+    onion_supported: bool = False
 
 
 class ErrorResponse(BaseModel):

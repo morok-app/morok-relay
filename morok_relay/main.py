@@ -86,10 +86,13 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
 
 @app.get("/health", response_model=HealthResponse, tags=["meta"])
 async def health() -> HealthResponse:
+    onion = settings.tor_onion_address or None
     return HealthResponse(
         status="ok",
         relay_name=settings.relay_name,
         version=__version__,
+        onion=onion,
+        onion_supported=bool(onion),
     )
 
 

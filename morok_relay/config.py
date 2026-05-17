@@ -22,6 +22,12 @@ class Settings(BaseSettings):
     relay_name: str = Field(default="relay1.morok.app")
     relay_pubkey_hex: str = Field(default="")
     relay_privkey_hex: str = Field(default="")
+    tor_onion_address: str = Field(
+        default="",
+        description="The .onion hostname for this relay (without scheme). "
+                    "Set via MOROK_TOR_ONION_ADDRESS in .env. Surfaced via "
+                    "/health so clients can opt into Tor.",
+    )
 
     # ----- Storage -----
     blob_dir: Path = Field(default=Path("/var/lib/morok/blobs"))
@@ -42,36 +48,14 @@ class Settings(BaseSettings):
     is_production: bool = Field(default=True)
     debug: bool = Field(default=False)
 
-    # ----- Rate limiting (NEW in v0.8) -----
-    rate_limit_enabled: bool = Field(
-        default=True,
-        description="Master toggle. Set false to disable all rate limiting "
-                    "(useful for local dev / running the e2e test client).",
-    )
-    rate_limit_auth_per_minute: int = Field(
-        default=10,
-        description="Per-IP limit on /auth/challenge and /auth/verify.",
-    )
-    rate_limit_messages_per_minute: int = Field(
-        default=60,
-        description="Per-pubkey limit on POST /api/v1/messages.",
-    )
-    rate_limit_group_create_per_minute: int = Field(
-        default=5,
-        description="Per-pubkey limit on POST /api/v1/groups (create new).",
-    )
-    rate_limit_group_messages_per_minute: int = Field(
-        default=30,
-        description="Per-pubkey limit on POST /api/v1/groups/{id}/messages.",
-    )
-    rate_limit_dms_create_per_minute: int = Field(
-        default=5,
-        description="Per-pubkey limit on POST /api/v1/dms.",
-    )
-    rate_limit_ws_connections_per_pubkey: int = Field(
-        default=5,
-        description="Max concurrent WebSocket connections per pubkey.",
-    )
+    # ----- Rate limiting -----
+    rate_limit_enabled: bool = Field(default=True)
+    rate_limit_auth_per_minute: int = Field(default=10)
+    rate_limit_messages_per_minute: int = Field(default=60)
+    rate_limit_group_create_per_minute: int = Field(default=5)
+    rate_limit_group_messages_per_minute: int = Field(default=30)
+    rate_limit_dms_create_per_minute: int = Field(default=5)
+    rate_limit_ws_connections_per_pubkey: int = Field(default=5)
 
 
 @lru_cache
