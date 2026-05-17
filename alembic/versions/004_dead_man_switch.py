@@ -18,7 +18,14 @@ Adds two new tables:
   - cancelled_at: when the user manually cancelled
 
 - dms_recipients: many-to-many. Each switch has 1-20 recipients.
-  Stored as a separate table (not array) so we can index and query.
+
+Note on the enum
+----------------
+We create the `dms_status` enum type via op.execute(CREATE TYPE), and reference
+it from the table column with postgresql.ENUM(..., create_type=False) so that
+SQLAlchemy's before_create hook does NOT try to recreate the type a second
+time (which would fail with DuplicateObject). This is the standard alembic
++ postgres enum pattern.
 """
 from typing import Sequence, Union
 
@@ -32,18 +39,25 @@ branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
 
-dms_status_enum = sa.Enum("armed", "triggered", "cancelled", name="dms_status")
-
-
 def upgrade() -> None:
-    dms_status_enum.create(op.get_bind(), checkfirst=True)
+    # Create the enum TYPE explicitly. create_type=False on the column
+    # below ensures SQLAlchemy won't try to create it again.
+    op.execute(
+        "CREATE TYPE dms_status AS ENUM ('armed', 'triggered', 'cancelled')"
+    )
+
+    dms_status_enum = postgresql.ENUM(
+        "armed", "triggered", "cancelled",
+        name="dms_status",
+        create_type=False,   # prevents re-creation when used in columns
+    )
 
     op.create_table(
         "dead_man_switches",
         sa.Column("id", postgresql.UUID(as_uuid=True), nullable=False),
         sa.Column(
             "creator_pubkey", sa.LargeBinary(length=32), nullable=False,
-            comment="Owner of the DMS. Updates flow via session's pubkey.",
+            comment="Owner of the DMS.",
         ),
         sa.Column(
             "trigger_seconds", sa.Integer(), nullable=False,
@@ -51,15 +65,15 @@ def upgrade() -> None:
         ),
         sa.Column(
             "last_check_in_at", sa.BigInteger(), nullable=False,
-            comment="Epoch seconds of last activity. Updated on each authenticated request.",
+            comment="Epoch seconds of last activity.",
         ),
         sa.Column(
             "payload_encrypted", sa.LargeBinary(), nullable=False,
-            comment="Ciphertext to deliver to each recipient on trigger. Max 256 KB.",
+            comment="Ciphertext to deliver on trigger. Max 256 KB.",
         ),
         sa.Column(
             "label", sa.String(length=100), nullable=True,
-            comment="User-visible label like 'family' or 'work'. Encrypted client-side OR plaintext for indexing — caller's choice.",
+            comment="User-visible label like 'family' or 'work'.",
         ),
         sa.Column(
             "status", dms_status_enum, nullable=False, server_default="armed",
@@ -75,7 +89,6 @@ def upgrade() -> None:
     op.create_index(
         "ix_dms_creator_status", "dead_man_switches", ["creator_pubkey", "status"],
     )
-    # Critical for the cron: find armed switches that should fire.
     op.create_index(
         "ix_dms_status_check_in", "dead_man_switches", ["status", "last_check_in_at"],
     )
@@ -90,11 +103,10 @@ def upgrade() -> None:
         ),
         sa.Column(
             "recipient_pubkey", sa.LargeBinary(length=32), nullable=False,
-            comment="Whom to deliver the payload to on trigger.",
         ),
         sa.Column(
             "delivered_at", sa.BigInteger(), nullable=True,
-            comment="Epoch second when the trigger actually delivered to this recipient.",
+            comment="Epoch second when trigger delivered to this recipient.",
         ),
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("dms_id", "recipient_pubkey", name="uq_dms_recipients"),
@@ -110,4 +122,4 @@ def downgrade() -> None:
     op.drop_index("ix_dms_status_check_in", table_name="dead_man_switches")
     op.drop_index("ix_dms_creator_status", table_name="dead_man_switches")
     op.drop_table("dead_man_switches")
-    dms_status_enum.drop(op.get_bind(), checkfirst=True)
+    op.execute("DROP TYPE dms_status")
