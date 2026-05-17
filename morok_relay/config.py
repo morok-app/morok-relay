@@ -1,90 +1,76 @@
 """
-Centralized configuration loaded from environment variables.
-
-All config flows through this module. Never read os.environ directly
-elsewhere — that breaks testability and makes it hard to find what's
-configurable.
+Application settings, loaded from environment variables (.env file).
 """
+from __future__ import annotations
+
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal
 
-from pydantic import Field, field_validator
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
-        env_prefix="MOROK_",
         env_file_encoding="utf-8",
+        env_prefix="MOROK_",
         extra="ignore",
     )
 
-    # === Application ===
-    env: Literal["development", "production"] = "development"
-    debug: bool = False
-    host: str = "0.0.0.0"
-    port: int = 8000
-    relay_name: str = "relay-local.morok.app"
-    log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
+    # ----- Relay identity -----
+    relay_name: str = Field(default="relay1.morok.app")
+    relay_pubkey_hex: str = Field(default="")
+    relay_privkey_hex: str = Field(default="")
 
-    # === Database ===
-    db_dsn: str
-    db_pool_size: int = 10
-    db_max_overflow: int = 20
+    # ----- Storage -----
+    blob_dir: Path = Field(default=Path("/var/lib/morok/blobs"))
 
-    # === Redis ===
-    redis_url: str = "redis://localhost:6379/0"
-    redis_pool_size: int = 10
+    # ----- TTL / lifecycle -----
+    message_ttl_hard_seconds: int = Field(default=86400)
+    max_blob_bytes: int = Field(default=262144)
+    username_cooldown_days: int = Field(default=30)
 
-    # === Storage ===
-    blob_dir: Path = Path("/var/lib/morok/blobs")
+    # ----- DB / Redis -----
+    db_dsn: str = Field(default="postgresql+asyncpg://morok@localhost/morok_relay")
+    redis_url: str = Field(default="redis://localhost:6379/0")
 
-    # === Message TTL ===
-    message_ttl_hard_seconds: int = Field(default=172800, ge=3600, le=604800)
+    # ----- Mode -----
+    is_production: bool = Field(default=True)
+    debug: bool = Field(default=False)
 
-    # === Federation ===
-    relay_pubkey_hex: str = ""
-    relay_privkey_hex: str = ""
-    known_relays: str = ""
-
-    # === Security ===
-    max_blob_bytes: int = Field(default=262144, ge=1024, le=10_485_760)
-    rate_limit_per_min: int = 60
-    rate_limit_burst: int = 10
-
-    # === Username ===
-    username_min_len: int = 3
-    username_max_len: int = 20
-    username_cooldown_days: int = 30
-
-    @field_validator("relay_privkey_hex")
-    @classmethod
-    def validate_privkey(cls, v: str, info) -> str:
-        """In production, relay must have a keypair configured."""
-        env = info.data.get("env", "development")
-        if env == "production" and not v:
-            raise ValueError(
-                "MOROK_RELAY_PRIVKEY_HEX must be set in production. "
-                "Generate with: python -m morok_relay.scripts.generate_relay_keypair"
-            )
-        return v
-
-    @property
-    def known_relays_list(self) -> list[str]:
-        """Parsed list of known relay hostnames."""
-        return [r.strip() for r in self.known_relays.split(",") if r.strip()]
-
-    @property
-    def is_production(self) -> bool:
-        return self.env == "production"
+    # ----- Rate limiting (NEW in v0.8) -----
+    rate_limit_enabled: bool = Field(
+        default=True,
+        description="Master toggle. Set false to disable all rate limiting "
+                    "(useful for local dev / running the e2e test client).",
+    )
+    rate_limit_auth_per_minute: int = Field(
+        default=10,
+        description="Per-IP limit on /auth/challenge and /auth/verify.",
+    )
+    rate_limit_messages_per_minute: int = Field(
+        default=60,
+        description="Per-pubkey limit on POST /api/v1/messages.",
+    )
+    rate_limit_group_create_per_minute: int = Field(
+        default=5,
+        description="Per-pubkey limit on POST /api/v1/groups (create new).",
+    )
+    rate_limit_group_messages_per_minute: int = Field(
+        default=30,
+        description="Per-pubkey limit on POST /api/v1/groups/{id}/messages.",
+    )
+    rate_limit_dms_create_per_minute: int = Field(
+        default=5,
+        description="Per-pubkey limit on POST /api/v1/dms.",
+    )
+    rate_limit_ws_connections_per_pubkey: int = Field(
+        default=5,
+        description="Max concurrent WebSocket connections per pubkey.",
+    )
 
 
-@lru_cache(maxsize=1)
+@lru_cache
 def get_settings() -> Settings:
-    """
-    Cached settings instance. Use this everywhere instead of instantiating
-    Settings() directly — that way tests can override via dependency injection.
-    """
-    return Settings()  # type: ignore[call-arg]
+    return Settings()

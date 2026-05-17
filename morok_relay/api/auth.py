@@ -1,33 +1,22 @@
 """
-Auth endpoints — Ed25519 challenge-response.
+Authentication endpoints: challenge-response Ed25519 flow.
 
-Flow
-----
-1. Client: POST /api/v1/auth/challenge { pubkey_hex }
-   Server: returns { challenge_hex, expires_at }
-
-2. Client: signs (challenge, pubkey, timestamp) locally, sends back:
-   POST /api/v1/auth/verify { pubkey_hex, challenge_hex, timestamp, signature_hex }
-   Server: verifies signature, returns { session_token, expires_at, pubkey_hex }
-
-3. Client uses session_token in Authorization: Bearer <token> for protected endpoints.
-
-4. Logout: DELETE /api/v1/auth/session — revokes current session token.
-   POST /api/v1/auth/session/revoke-all — revokes all sessions for this pubkey.
-
-Why challenge-response and not just "send signed payload":
-- Random challenge from server makes it impossible to pre-compute or replay.
-- Challenges are one-time-use (consumed on verify).
-- Short TTL (60s) limits damage from any leak.
+Rate-limited per IP because these endpoints are accessible without auth
+(brute-forcing requires no session).
 """
 from __future__ import annotations
 
+import logging
+import secrets
 import time
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
+from redis.asyncio import Redis
 
-from .. import crypto
+from ..config import get_settings
+from ..crypto import canonical_json, ed25519_verify
 from ..deps import CurrentSession, RedisClient
+from ..rate_limit import rate_limit_by_ip
 from ..schemas import (
     AuthRequest,
     AuthResponse,
@@ -36,105 +25,120 @@ from ..schemas import (
     LogoutResponse,
 )
 from ..sessions import (
-    CHALLENGE_TTL_SECONDS,
-    consume_challenge,
-    create_session,
-    revoke_all_sessions,
-    revoke_session,
-    store_challenge,
+    create_session_token,
+    revoke_all_sessions_for_pubkey,
+    revoke_session_token,
 )
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["auth"])
 
+CHALLENGE_TTL_SECONDS = 60
+
+
+def _challenge_key(challenge_hex: str) -> str:
+    return f"morok:challenge:{challenge_hex}"
+
+
+# ============================================================================
+# Endpoints (rate-limited per IP)
+# ============================================================================
 
 @router.post(
     "/challenge",
     response_model=ChallengeResponse,
-    summary="Request an authentication challenge",
+    summary="Request a challenge to sign",
+    dependencies=[Depends(rate_limit_by_ip(
+        "auth_challenge",
+        # Use settings value at decoration time — uvicorn reloads on .env change
+        get_settings().rate_limit_auth_per_minute,
+    ))],
 )
 async def request_challenge(
     body: ChallengeRequest,
     redis: RedisClient,
 ) -> ChallengeResponse:
-    """
-    Get a fresh challenge to sign with your Ed25519 private key.
-
-    The challenge is bound to your pubkey and expires in 60 seconds. Use it
-    exactly once via /verify.
-    """
-    challenge = crypto.generate_challenge()
+    """Issue a one-time challenge. Client signs and POSTs to /verify."""
+    challenge = secrets.token_bytes(32)
     challenge_hex = challenge.hex()
+    expires_at = int(time.time()) + CHALLENGE_TTL_SECONDS
 
-    await store_challenge(redis, challenge_hex, body.pubkey_hex)
-
-    return ChallengeResponse(
-        challenge_hex=challenge_hex,
-        expires_at=int(time.time()) + CHALLENGE_TTL_SECONDS,
+    await redis.setex(
+        _challenge_key(challenge_hex),
+        CHALLENGE_TTL_SECONDS,
+        body.pubkey_hex,
     )
+
+    return ChallengeResponse(challenge_hex=challenge_hex, expires_at=expires_at)
 
 
 @router.post(
     "/verify",
     response_model=AuthResponse,
-    summary="Verify challenge signature and get a session token",
+    summary="Verify a signed challenge, receive session token",
+    dependencies=[Depends(rate_limit_by_ip(
+        "auth_verify",
+        get_settings().rate_limit_auth_per_minute,
+    ))],
 )
 async def verify_challenge(
     body: AuthRequest,
     redis: RedisClient,
 ) -> AuthResponse:
     """
-    Submit a signature over (challenge, pubkey, timestamp) to receive a session
-    token.
+    Verify the signed challenge, issue session token on success.
 
-    Returns 401 if anything is wrong: missing challenge, replay attempt,
-    wrong signature, stale timestamp.
+    The signature is over canonical JSON of:
+        { morok_auth, challenge, pubkey, timestamp }
     """
-    # 1. Look up + consume the challenge (atomic delete prevents reuse).
-    expected_pubkey_hex = await consume_challenge(redis, body.challenge_hex)
-    if expected_pubkey_hex is None:
+    expected_pubkey_raw = await redis.get(_challenge_key(body.challenge_hex))
+    if expected_pubkey_raw is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="challenge_not_found_or_expired",
         )
 
-    # 2. The pubkey requesting verification must match the one that requested
-    # the challenge. Without this, anyone could intercept a challenge and try
-    # to use it for a different pubkey.
+    expected_pubkey_hex = expected_pubkey_raw.decode("utf-8")
     if expected_pubkey_hex != body.pubkey_hex:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="pubkey_mismatch",
         )
 
-    # 3. Verify the signature.
-    try:
-        challenge_bytes = bytes.fromhex(body.challenge_hex)
-        pubkey_bytes = bytes.fromhex(body.pubkey_hex)
-        signature_bytes = bytes.fromhex(body.signature_hex)
-    except ValueError:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="malformed_hex",
-        )
-
-    if not crypto.verify_auth_response(
-        challenge=challenge_bytes,
-        pubkey=pubkey_bytes,
-        timestamp=body.timestamp,
-        signature=signature_bytes,
-    ):
+    # Verify timestamp window — prevents replay even if challenge was fresh.
+    now = int(time.time())
+    if abs(now - body.timestamp) > 120:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="invalid_signature_or_stale_timestamp",
         )
 
-    # 4. Mint session token.
-    session = await create_session(redis, body.pubkey_hex)
+    # Verify signature
+    msg = canonical_json({
+        "morok_auth": "v1",
+        "challenge": body.challenge_hex,
+        "pubkey": body.pubkey_hex,
+        "timestamp": body.timestamp,
+    })
+    pubkey_bytes = bytes.fromhex(body.pubkey_hex)
+    sig_bytes = bytes.fromhex(body.signature_hex)
+    if not ed25519_verify(msg, sig_bytes, pubkey_bytes):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="invalid_signature_or_stale_timestamp",
+        )
+
+    # Burn the challenge so it can't be reused
+    await redis.delete(_challenge_key(body.challenge_hex))
+
+    # Issue session token
+    token, expires_at = await create_session_token(redis, body.pubkey_hex)
 
     return AuthResponse(
-        session_token=session.token,
-        expires_at=session.expires_at,
-        pubkey_hex=session.pubkey_hex,
+        session_token=token,
+        expires_at=expires_at,
+        pubkey_hex=body.pubkey_hex,
     )
 
 
@@ -147,25 +151,22 @@ async def logout(
     current: CurrentSession,
     redis: RedisClient,
 ) -> LogoutResponse:
-    """Log out from this device only. Other sessions remain valid."""
-    revoked = await revoke_session(redis, current.token)
+    revoked = await revoke_session_token(redis, current.token)
     return LogoutResponse(revoked=revoked)
 
 
 @router.post(
     "/session/revoke-all",
     response_model=LogoutResponse,
-    summary="Revoke all sessions for the current user",
+    summary="Revoke ALL sessions for this pubkey (panic)",
 )
-async def logout_everywhere(
+async def revoke_all(
     current: CurrentSession,
     redis: RedisClient,
 ) -> LogoutResponse:
-    """
-    Revoke every session for this pubkey, including the one used for this
-    request.
-
-    Used for: panic-wipe, lost device, suspected compromise.
-    """
-    count = await revoke_all_sessions(redis, current.pubkey_hex)
+    count = await revoke_all_sessions_for_pubkey(redis, current.pubkey_hex)
+    logger.info(
+        "Revoked %d session(s) for pubkey %s",
+        count, current.pubkey_hex[:16],
+    )
     return LogoutResponse(revoked=count > 0)
