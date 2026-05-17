@@ -33,7 +33,10 @@ class Settings(BaseSettings):
 
     # ----- DB / Redis -----
     db_dsn: str = Field(default="postgresql+asyncpg://morok@localhost/morok_relay")
+    db_pool_size: int = Field(default=10)
+    db_max_overflow: int = Field(default=5)
     redis_url: str = Field(default="redis://localhost:6379/0")
+    redis_pool_size: int = Field(default=20)
 
     # ----- Mode -----
     is_production: bool = Field(default=True)
