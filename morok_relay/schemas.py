@@ -336,8 +336,6 @@ class DMSCreate(BaseModel):
                 raise ValueError("duplicate recipient pubkeys not allowed")
             seen.add(pk)
             out.append(pk)
-        # Hard upper bound here at the schema level — endpoint also enforces
-        # tier-specific limits.
         if len(out) > DMS_PREMIUM_TIER_MAX_RECIPIENTS:
             raise ValueError(
                 f"too many recipients (max {DMS_PREMIUM_TIER_MAX_RECIPIENTS} even for premium)"
@@ -355,7 +353,7 @@ class DMSInfo(BaseModel):
     dms_id: str
     trigger_seconds: int
     last_check_in_at: int
-    fires_at: int            # last_check_in_at + trigger_seconds — when it would fire
+    fires_at: int
     label: str | None
     status: str
     created_at: int
@@ -373,6 +371,66 @@ class DMSCheckInResponse(BaseModel):
 class DMSCancelResponse(BaseModel):
     dms_id: str
     cancelled: bool
+
+
+# ============================================================================
+# ENCRYPTED BACKUP
+# ============================================================================
+
+BACKUP_MAX_BYTES = 1024
+BACKUP_KDF_SALT_BYTES = 16
+
+
+class BackupCreateRequest(BaseModel):
+    encrypted_seed_b64: str = Field(...)
+    kdf_salt_b64: str = Field(...)
+    kdf_params: dict = Field(default_factory=dict)
+    schema_version: int = Field(default=1, ge=1, le=10)
+
+    @field_validator("encrypted_seed_b64")
+    @classmethod
+    def _enc_size(cls, v: str) -> str:
+        try:
+            decoded = base64.b64decode(v, validate=True)
+        except Exception:
+            raise ValueError("encrypted_seed_b64 must be valid base64")
+        if len(decoded) == 0:
+            raise ValueError("encrypted_seed is empty")
+        if len(decoded) > BACKUP_MAX_BYTES:
+            raise ValueError(f"encrypted_seed too large (max {BACKUP_MAX_BYTES} bytes)")
+        return v
+
+    @field_validator("kdf_salt_b64")
+    @classmethod
+    def _salt_size(cls, v: str) -> str:
+        try:
+            decoded = base64.b64decode(v, validate=True)
+        except Exception:
+            raise ValueError("kdf_salt_b64 must be valid base64")
+        if len(decoded) != BACKUP_KDF_SALT_BYTES:
+            raise ValueError(f"kdf_salt must be {BACKUP_KDF_SALT_BYTES} bytes")
+        return v
+
+
+class BackupInfo(BaseModel):
+    encrypted_seed_b64: str
+    kdf_salt_b64: str
+    kdf_params: dict
+    schema_version: int
+    created_at: int
+    updated_at: int
+
+
+class BackupRestoreResponse(BaseModel):
+    encrypted_seed_b64: str
+    kdf_salt_b64: str
+    kdf_params: dict
+    schema_version: int
+    username_at_backup: str | None
+
+
+class BackupDeleted(BaseModel):
+    deleted: bool
 
 
 # ============================================================================
