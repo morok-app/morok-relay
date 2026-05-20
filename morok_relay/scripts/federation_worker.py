@@ -30,7 +30,10 @@ import time
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..db import _session_factory, close_db, init_db
+# IMPORTANT: import the module, not the variable. init_db() rebinds
+# _session_factory at module level — if we did `from ..db import
+# _session_factory`, we'd have our own local copy that stays None forever.
+from .. import db as db_module
 from ..federation_client import remote_forward
 from ..models import FedQueueStatus, FederationOutboundQueue
 
@@ -64,7 +67,6 @@ def backoff_seconds(attempts: int) -> int:
     """Return seconds to wait before the next attempt, given current count."""
     if attempts in BACKOFF_SCHEDULE:
         return BACKOFF_SCHEDULE[attempts]
-    # attempts >= MAX_ATTEMPTS handled by caller (dead_letter)
     return BACKOFF_SCHEDULE[max(BACKOFF_SCHEDULE.keys())]
 
 
@@ -148,7 +150,7 @@ async def mark_retry_or_dead(
             .values(
                 status=FedQueueStatus.DEAD_LETTER,
                 attempts=new_attempts,
-                last_error=error[:500],  # cap error length
+                last_error=error[:500],
             )
         )
         await db.execute(stmt)
@@ -181,7 +183,6 @@ async def mark_retry_or_dead(
 async def process_row(db: AsyncSession, row: FederationOutboundQueue) -> None:
     """Attempt to forward one envelope. Update status accordingly."""
     if not await mark_in_flight(db, row):
-        # Someone else got it
         return
 
     try:
@@ -191,7 +192,6 @@ async def process_row(db: AsyncSession, row: FederationOutboundQueue) -> None:
         return
 
     if result is None:
-        # remote_forward returned None — network/HTTP error
         await mark_retry_or_dead(db, row, "remote_forward_returned_none")
         return
 
@@ -200,7 +200,6 @@ async def process_row(db: AsyncSession, row: FederationOutboundQueue) -> None:
         await mark_retry_or_dead(db, row, f"rejected: {reason}")
         return
 
-    # Success
     await mark_succeeded(db, row)
     logger.info(
         "Delivered envelope %s to %s",
@@ -210,24 +209,25 @@ async def process_row(db: AsyncSession, row: FederationOutboundQueue) -> None:
 
 async def run_once() -> dict:
     """One pass: recover stuck, fetch batch, process each. Returns stats."""
-    if _session_factory is None:
-        await init_db()
+    if db_module._session_factory is None:
+        await db_module.init_db()
+
+    factory = db_module._session_factory
+    if factory is None:
+        raise RuntimeError("Database session factory not initialized")
 
     stats = {"recovered": 0, "processed": 0, "succeeded": 0, "failed": 0}
 
-    async with _session_factory() as db:
+    async with factory() as db:
         stats["recovered"] = await recover_stuck_in_flight(db)
         batch = await fetch_pending_batch(db)
 
     for row in batch:
         stats["processed"] += 1
-        async with _session_factory() as db:
+        async with factory() as db:
             try:
                 await process_row(db, row)
-                # We don't know here if it was succeeded or retry — both
-                # are valid outcomes. Count as success only if status is
-                # now succeeded.
-                async with _session_factory() as check_db:
+                async with factory() as check_db:
                     refreshed = await check_db.get(
                         FederationOutboundQueue, row.id
                     )
@@ -262,7 +262,7 @@ async def main() -> int:
         return 1
     finally:
         try:
-            await close_db()
+            await db_module.close_db()
         except Exception:
             pass
 
