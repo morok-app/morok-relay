@@ -1,7 +1,5 @@
 """
 Database models.
-
-See the audit note at the bottom for what we deliberately don't store.
 """
 from __future__ import annotations
 
@@ -38,16 +36,16 @@ class UserTier(str, enum.Enum):
 
 
 class DMSStatus(str, enum.Enum):
-    ARMED = "armed"           # active, will fire on inactivity
-    TRIGGERED = "triggered"   # has fired, payload delivered
-    CANCELLED = "cancelled"   # owner cancelled before trigger
+    ARMED = "armed"
+    TRIGGERED = "triggered"
+    CANCELLED = "cancelled"
 
 
 class FedQueueStatus(str, enum.Enum):
-    PENDING = "pending"           # awaiting next_attempt_at
-    IN_FLIGHT = "in_flight"       # worker is currently sending
-    SUCCEEDED = "succeeded"       # delivered, kept for diagnostic for 7d
-    DEAD_LETTER = "dead_letter"   # exceeded max attempts, kept forever for diag
+    PENDING = "pending"
+    IN_FLIGHT = "in_flight"
+    SUCCEEDED = "succeeded"
+    DEAD_LETTER = "dead_letter"
 
 
 # ============================================================================
@@ -112,9 +110,7 @@ class Group(Base):
         LargeBinary(32), nullable=False, index=True,
     )
     name_encrypted: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
-    is_channel: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=False,
-    )
+    is_channel: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     default_ttl_seconds: Mapped[int] = mapped_column(
         Integer, nullable=False, default=86400,
     )
@@ -164,7 +160,7 @@ class GroupMember(Base):
 
 
 # ============================================================================
-# FEDERATION PEER
+# FEDERATION
 # ============================================================================
 
 class FederationPeer(Base):
@@ -182,22 +178,7 @@ class FederationPeer(Base):
     )
 
 
-# ============================================================================
-# FEDERATION OUTBOUND QUEUE (NEW in v0.9)
-# ============================================================================
-
 class FederationOutboundQueue(Base):
-    """
-    Durable retry queue for envelopes that must be forwarded to another relay.
-
-    When this relay's user sends a message to a recipient who lives on a
-    different relay, we don't enqueue locally — we put the full envelope
-    here and a background worker forwards it via remote_forward().
-
-    The worker uses exponential backoff and gives up after ~11 attempts
-    (about 16 hours total). Dead-letter rows are kept forever for
-    diagnostic. Successful rows are kept for 7 days then reaped.
-    """
     __tablename__ = "federation_outbound_queue"
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -227,48 +208,74 @@ class FederationOutboundQueue(Base):
 
 
 # ============================================================================
+# ENCRYPTED BACKUP (NEW in v1.0)
+# ============================================================================
+
+class EncryptedBackup(Base):
+    """
+    Zero-knowledge encrypted seed backup for premium users.
+
+    Client encrypts their seed locally with a PIN-derived key (PBKDF2/scrypt
+    over a 16-byte salt we generate), then uploads the ciphertext. We store
+    bytes — never see the seed in plaintext.
+
+    To restore on a new device, client:
+      1. Hits GET /api/v1/backup/by-username/{u} with their username
+         (unauthenticated — they don't have a session yet)
+      2. We return encrypted_seed + kdf_salt + kdf_params
+      3. Client derives key from PIN+salt, decrypts, gets seed, derives pubkey,
+         and they're back in.
+
+    Rate limits on the by-username endpoint prevent online brute-force.
+    The PIN's offline strength is the client's responsibility — clients
+    should enforce 12+ char passphrases (this is in docs, not API).
+
+    One backup per pubkey. Re-POST overwrites.
+    """
+    __tablename__ = "encrypted_backups"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    pubkey: Mapped[bytes] = mapped_column(
+        LargeBinary(32), nullable=False, unique=True, index=True,
+    )
+    username_at_backup: Mapped[str | None] = mapped_column(
+        String(20), nullable=True, index=True,
+        comment="Snapshot of username at backup time. Used for restore lookup "
+                "even if user changed username later.",
+    )
+    encrypted_seed: Mapped[bytes] = mapped_column(
+        LargeBinary, nullable=False,
+        comment="Client-encrypted seed bytes. Relay never decrypts.",
+    )
+    kdf_salt: Mapped[bytes] = mapped_column(LargeBinary(16), nullable=False)
+    kdf_params: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, server_default="{}",
+        comment="Client-defined KDF parameters: algorithm, iterations, etc.",
+    )
+    schema_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1",
+    )
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+
+# ============================================================================
 # DEAD MAN'S SWITCH
 # ============================================================================
 
 class DeadManSwitch(Base):
-    """
-    A user's pre-armed "if I disappear, send this" mechanism.
-
-    The user creates a DMS with:
-    - a trigger_seconds (1h to 1y) of inactivity that fires it
-    - an encrypted payload (relay never sees plaintext)
-    - 1-20 recipient pubkeys
-
-    On every authenticated request, last_check_in_at is bumped to now. The
-    DMS cron (hourly) finds 'armed' switches where now - last_check_in_at
-    exceeds trigger_seconds, and fires them: delivers the payload as a
-    standard envelope to each recipient.
-
-    After firing, status becomes 'triggered'. A switch can be 'cancelled'
-    by the owner at any time, which prevents future firing without losing
-    history.
-    """
     __tablename__ = "dead_man_switches"
 
     id: Mapped[uuid.UUID] = mapped_column(
         PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
-    creator_pubkey: Mapped[bytes] = mapped_column(
-        LargeBinary(32), nullable=False,
-    )
-    trigger_seconds: Mapped[int] = mapped_column(
-        Integer, nullable=False,
-    )
-    last_check_in_at: Mapped[int] = mapped_column(
-        BigInteger, nullable=False,
-    )
-    payload_encrypted: Mapped[bytes] = mapped_column(
-        LargeBinary, nullable=False,
-    )
-    label: Mapped[str | None] = mapped_column(
-        String(100), nullable=True,
-        comment="User-visible label like 'family' or 'work'. Stored as the user provides it — clients may encrypt it client-side or send plaintext.",
-    )
+    creator_pubkey: Mapped[bytes] = mapped_column(LargeBinary(32), nullable=False)
+    trigger_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    last_check_in_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    payload_encrypted: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    label: Mapped[str | None] = mapped_column(String(100), nullable=True)
     status: Mapped[DMSStatus] = mapped_column(
         SAEnum(DMSStatus, name="dms_status", values_callable=lambda e: [m.value for m in e]),
         nullable=False, default=DMSStatus.ARMED, server_default="armed",
@@ -299,13 +306,8 @@ class DMSRecipient(Base):
         PG_UUID(as_uuid=True), ForeignKey("dead_man_switches.id", ondelete="CASCADE"),
         nullable=False, index=True,
     )
-    recipient_pubkey: Mapped[bytes] = mapped_column(
-        LargeBinary(32), nullable=False,
-    )
-    delivered_at: Mapped[int | None] = mapped_column(
-        BigInteger, nullable=True,
-        comment="When the trigger actually delivered to this recipient.",
-    )
+    recipient_pubkey: Mapped[bytes] = mapped_column(LargeBinary(32), nullable=False)
+    delivered_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
     dms: Mapped["DeadManSwitch"] = relationship(back_populates="recipients")
 
