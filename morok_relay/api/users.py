@@ -5,6 +5,8 @@ GET    /api/v1/users/me                    — get my profile
 POST   /api/v1/users/me/username           — claim a @username
 DELETE /api/v1/users/me/username           — release my @username
 GET    /api/v1/users/lookup/{username}     — find user by @username (public)
+       optional ?relay=hostname            — falls back to federation lookup
+                                             and caches the result locally
 
 Username rules per tier (see schemas.TIER_MIN_LENGTH):
 - free:    5+ chars
@@ -20,13 +22,16 @@ Common to all tiers:
 """
 from __future__ import annotations
 
+import logging
 import time
 
 from fastapi import APIRouter, HTTPException, status
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from ..config import get_settings
 from ..deps import CurrentSession, DBSession
+from ..federation_client import remote_lookup
 from ..models import User, UsernameHistory, UserTier
 from ..schemas import (
     MeInfo,
@@ -36,6 +41,8 @@ from ..schemas import (
     normalize_username,
     validate_username_for_tier,
 )
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["users"])
 
@@ -70,6 +77,43 @@ async def _get_or_create_user(
     )
     db.add(user)
     await db.flush()
+    return user
+
+
+async def _cache_remote_user(
+    db: DBSession,
+    pubkey_hex: str,
+    username: str,
+    home_relay: str,
+) -> User | None:
+    """
+    Idempotently create a local User row caching a user we learned about
+    from a remote relay. If a row with this pubkey already exists, we
+    don't touch it (its local state takes precedence).
+    """
+    pubkey_bytes = bytes.fromhex(pubkey_hex)
+
+    stmt = select(User).where(User.pubkey == pubkey_bytes)
+    existing = (await db.execute(stmt)).scalar_one_or_none()
+    if existing is not None:
+        # Don't clobber local state
+        return existing
+
+    user = User(
+        pubkey=pubkey_bytes,
+        username=username,
+        home_relay=home_relay,
+        tier=UserTier.FREE,  # We don't know remote tier; default
+        last_seen_at=None,
+    )
+    db.add(user)
+    try:
+        await db.flush()
+    except IntegrityError:
+        # Race: username taken, or pubkey collided. Roll back and just
+        # return whatever's there now.
+        await db.rollback()
+        return (await db.execute(stmt)).scalar_one_or_none()
     return user
 
 
@@ -119,7 +163,6 @@ async def claim_username(
     settings = get_settings()
     user = await _get_or_create_user(db, current.pubkey_hex)
 
-    # Re-validate against this user's tier (Pydantic did only tier-agnostic checks).
     try:
         username = validate_username_for_tier(body.username, user.tier.value)
     except ValueError as e:
@@ -131,7 +174,6 @@ async def claim_username(
     pubkey_bytes = bytes.fromhex(current.pubkey_hex)
     now = int(time.time())
 
-    # Idempotent: already owns this name.
     if user.username == username:
         return MeInfo(
             pubkey_hex=current.pubkey_hex,
@@ -141,7 +183,6 @@ async def claim_username(
             created_at=user.created_at,
         )
 
-    # Is the name currently claimed by someone else?
     stmt = select(User).where(User.username == username)
     other = (await db.execute(stmt)).scalar_one_or_none()
     if other is not None and other.pubkey != pubkey_bytes:
@@ -150,7 +191,6 @@ async def claim_username(
             detail="username_taken",
         )
 
-    # Cooldown check — only blocks different pubkey within cooldown window.
     cooldown_seconds = settings.username_cooldown_days * 86400
     cooldown_cutoff = now - cooldown_seconds
     stmt = (
@@ -167,7 +207,6 @@ async def claim_username(
             detail="username_in_cooldown",
         )
 
-    # If switching usernames, record the old one in history.
     if user.username is not None and user.username != username:
         db.add(UsernameHistory(
             username=user.username,
@@ -226,26 +265,72 @@ async def release_username(
 @router.get(
     "/lookup/{username}",
     response_model=UserInfo,
-    summary="Find a user by @username",
+    summary="Find a user by @username — with optional federation fallback",
 )
 async def lookup_username(
     username: str,
     db: DBSession,
+    relay: str | None = None,
 ) -> UserInfo:
-    """Public lookup — no auth required."""
-    normalized = normalize_username(username)
-    stmt = select(User).where(User.username == normalized).where(User.deleted_at.is_(None))
-    user = (await db.execute(stmt)).scalar_one_or_none()
+    """
+    Public lookup — no auth required.
 
-    if user is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="username_not_found",
+    Resolution order:
+      1. Local lookup by username (always tried first).
+      2. If not found locally AND ?relay=hostname is provided AND it isn't
+         this relay, perform a federation lookup against that hostname.
+         On success, cache the result as a local User row with
+         home_relay = <remote>.
+      3. Otherwise 404.
+
+    The cache means subsequent send_envelope calls can route correctly
+    without re-querying the remote relay every time.
+    """
+    settings = get_settings()
+    normalized = normalize_username(username)
+
+    # 1. Local lookup
+    stmt = (
+        select(User)
+        .where(User.username == normalized)
+        .where(User.deleted_at.is_(None))
+    )
+    user = (await db.execute(stmt)).scalar_one_or_none()
+    if user is not None:
+        return UserInfo(
+            pubkey_hex=user.pubkey.hex(),
+            username=user.username,
+            home_relay=user.home_relay,
+            last_seen_at=user.last_seen_at,
         )
 
-    return UserInfo(
-        pubkey_hex=user.pubkey.hex(),
-        username=user.username,
-        home_relay=user.home_relay,
-        last_seen_at=user.last_seen_at,
+    # 2. Federation fallback only if caller hints which relay
+    if relay is not None and relay != settings.relay_name:
+        logger.info("Federation lookup: %s on %s", normalized, relay)
+        result = await remote_lookup(relay, normalized)
+        if result is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="username_not_found_on_remote_relay",
+            )
+
+        # Cache locally for future send_envelope routing
+        cached = await _cache_remote_user(
+            db,
+            pubkey_hex=result["pubkey_hex"],
+            username=result["username"],
+            home_relay=result["home_relay"],
+        )
+
+        return UserInfo(
+            pubkey_hex=result["pubkey_hex"],
+            username=result["username"],
+            home_relay=result["home_relay"],
+            last_seen_at=cached.last_seen_at if cached else None,
+        )
+
+    # 3. Nothing found, no relay hint
+    raise HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail="username_not_found",
     )

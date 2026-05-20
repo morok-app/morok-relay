@@ -1,0 +1,31 @@
+[Unit]
+Description=Morok federation outbound worker — process retry queue
+After=network.target postgresql.service morok-relay.service
+Wants=morok-relay.service
+
+[Service]
+Type=oneshot
+User=morok
+Group=morok
+WorkingDirectory=/home/morok/morok-relay
+EnvironmentFile=/home/morok/morok-relay/.env
+ExecStart=/home/morok/morok-relay/.venv/bin/python -m morok_relay.scripts.federation_worker
+
+# Hardening (same profile as morok-relay)
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/morok/morok-relay /var/lib/morok
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=morok-fed-worker

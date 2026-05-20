@@ -17,10 +17,11 @@ from sqlalchemy import (
     Integer,
     LargeBinary,
     String,
+    Text,
     UniqueConstraint,
     func,
 )
-from sqlalchemy.dialects.postgresql import UUID as PG_UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .db import Base
@@ -40,6 +41,13 @@ class DMSStatus(str, enum.Enum):
     ARMED = "armed"           # active, will fire on inactivity
     TRIGGERED = "triggered"   # has fired, payload delivered
     CANCELLED = "cancelled"   # owner cancelled before trigger
+
+
+class FedQueueStatus(str, enum.Enum):
+    PENDING = "pending"           # awaiting next_attempt_at
+    IN_FLIGHT = "in_flight"       # worker is currently sending
+    SUCCEEDED = "succeeded"       # delivered, kept for diagnostic for 7d
+    DEAD_LETTER = "dead_letter"   # exceeded max attempts, kept forever for diag
 
 
 # ============================================================================
@@ -175,7 +183,51 @@ class FederationPeer(Base):
 
 
 # ============================================================================
-# DEAD MAN'S SWITCH (NEW in v0.7)
+# FEDERATION OUTBOUND QUEUE (NEW in v0.9)
+# ============================================================================
+
+class FederationOutboundQueue(Base):
+    """
+    Durable retry queue for envelopes that must be forwarded to another relay.
+
+    When this relay's user sends a message to a recipient who lives on a
+    different relay, we don't enqueue locally — we put the full envelope
+    here and a background worker forwards it via remote_forward().
+
+    The worker uses exponential backoff and gives up after ~11 attempts
+    (about 16 hours total). Dead-letter rows are kept forever for
+    diagnostic. Successful rows are kept for 7 days then reaped.
+    """
+    __tablename__ = "federation_outbound_queue"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    envelope_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    envelope_data: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    target_relay: Mapped[str] = mapped_column(String(255), nullable=False)
+    status: Mapped[FedQueueStatus] = mapped_column(
+        SAEnum(
+            FedQueueStatus,
+            name="fed_queue_status",
+            values_callable=lambda e: [m.value for m in e],
+        ),
+        nullable=False, default=FedQueueStatus.PENDING, server_default="pending",
+    )
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    next_attempt_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    delivered_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+
+    __table_args__ = (
+        Index("ix_fed_queue_status_next_attempt", "status", "next_attempt_at"),
+        Index("ix_fed_queue_target_status", "target_relay", "status"),
+    )
+
+
+# ============================================================================
+# DEAD MAN'S SWITCH
 # ============================================================================
 
 class DeadManSwitch(Base):

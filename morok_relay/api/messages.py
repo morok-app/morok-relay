@@ -3,6 +3,12 @@ Direct (1-on-1) message endpoints.
 
 Rate-limited per pubkey on the POST endpoint to prevent message-spam attacks.
 GET/DELETE are not limited — they only touch caller's own inbox.
+
+Federation routing:
+- If the recipient User row has home_relay = settings.relay_name → local enqueue
+- If home_relay points to a different relay → outbound federation queue
+- If the recipient is not in our users table at all → 404
+  (clients must call /users/lookup with ?relay= first to cache the user)
 """
 from __future__ import annotations
 
@@ -12,10 +18,12 @@ import logging
 import time
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
+from sqlalchemy import select
 
 from .. import blob_storage, crypto
 from ..config import get_settings
-from ..deps import CurrentSession, RedisClient
+from ..deps import CurrentSession, DBSession, RedisClient
+from ..models import FederationOutboundQueue, FedQueueStatus, User
 from ..queue import (
     acknowledge_envelope,
     enqueue_envelope,
@@ -33,7 +41,7 @@ router = APIRouter(tags=["messages"])
 @router.post(
     "",
     response_model=EnvelopeAck,
-    summary="Submit an encrypted envelope for delivery",
+    summary="Submit an encrypted envelope for delivery (local or federated)",
     dependencies=[Depends(rate_limit_by_pubkey(
         "messages_send",
         get_settings().rate_limit_messages_per_minute,
@@ -42,6 +50,7 @@ router = APIRouter(tags=["messages"])
 async def send_envelope(
     body: EnvelopeIn,
     current: CurrentSession,
+    db: DBSession,
     redis: RedisClient,
 ) -> EnvelopeAck:
     settings = get_settings()
@@ -99,6 +108,7 @@ async def send_envelope(
             detail=f"blob_too_large_max_{settings.max_blob_bytes}_bytes",
         )
 
+    # Compute envelope_id (deterministic — used for dedup)
     h = hashlib.sha256()
     h.update(sender_pubkey)
     h.update(recipient_pubkey)
@@ -106,21 +116,87 @@ async def send_envelope(
     h.update(hashlib.sha256(blob_bytes).digest())
     envelope_id = h.hexdigest()
 
-    if await envelope_exists(redis, envelope_id):
+    # Look up recipient — we need home_relay to decide routing
+    stmt = (
+        select(User)
+        .where(User.pubkey == recipient_pubkey)
+        .where(User.deleted_at.is_(None))
+    )
+    recipient = (await db.execute(stmt)).scalar_one_or_none()
+
+    if recipient is None:
+        # We don't know this pubkey. Client must lookup first
+        # (so we learn the home_relay and cache it).
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="recipient_unknown_call_lookup_first",
+        )
+
+    # ---- LOCAL DELIVERY ----
+    if recipient.home_relay == settings.relay_name:
+        if await envelope_exists(redis, envelope_id):
+            return EnvelopeAck(envelope_id=envelope_id, queued=False, expires_at=0)
+
+        await blob_storage.write_blob(envelope_id, blob_bytes)
+        expires_at = await enqueue_envelope(
+            redis=redis,
+            envelope_id=envelope_id,
+            sender_pubkey_hex=body.from_,
+            recipient_pubkey_hex=body.to,
+            timestamp=body.ts,
+            ttl_seconds=body.ttl,
+            signature_hex=body.sig,
+            hard_ceiling_seconds=settings.message_ttl_hard_seconds,
+        )
+        return EnvelopeAck(
+            envelope_id=envelope_id, queued=True, expires_at=expires_at,
+        )
+
+    # ---- FEDERATION DELIVERY ----
+    # Dedup against the outbound queue too
+    stmt = (
+        select(FederationOutboundQueue)
+        .where(FederationOutboundQueue.envelope_id == envelope_id)
+        .limit(1)
+    )
+    existing = (await db.execute(stmt)).scalar_one_or_none()
+    if existing is not None:
         return EnvelopeAck(envelope_id=envelope_id, queued=False, expires_at=0)
 
-    await blob_storage.write_blob(envelope_id, blob_bytes)
-    expires_at = await enqueue_envelope(
-        redis=redis,
+    envelope_dict = {
+        "from": body.from_,
+        "to": body.to,
+        "ts": body.ts,
+        "ttl": body.ttl,
+        "blob": body.blob,
+        "sig": body.sig,
+    }
+
+    # Cap expiry at the hard ceiling (worker will refuse to send if expired)
+    requested_expires = body.ts + body.ttl
+    ceiling = now + settings.message_ttl_hard_seconds
+    expires_at = min(requested_expires, ceiling)
+
+    queue_row = FederationOutboundQueue(
         envelope_id=envelope_id,
-        sender_pubkey_hex=body.from_,
-        recipient_pubkey_hex=body.to,
-        timestamp=body.ts,
-        ttl_seconds=body.ttl,
-        signature_hex=body.sig,
-        hard_ceiling_seconds=settings.message_ttl_hard_seconds,
+        envelope_data=envelope_dict,
+        target_relay=recipient.home_relay,
+        status=FedQueueStatus.PENDING,
+        attempts=0,
+        next_attempt_at=now,   # try immediately on next worker tick
+        created_at=now,
     )
-    return EnvelopeAck(envelope_id=envelope_id, queued=True, expires_at=expires_at)
+    db.add(queue_row)
+    await db.flush()
+
+    logger.info(
+        "Queued federation envelope %s for %s (recipient %s)",
+        envelope_id, recipient.home_relay, body.to[:16],
+    )
+
+    return EnvelopeAck(
+        envelope_id=envelope_id, queued=True, expires_at=expires_at,
+    )
 
 
 @router.get(
