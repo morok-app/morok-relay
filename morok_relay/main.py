@@ -10,7 +10,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from . import __version__
-from .api import auth, dms, federation, groups, inbox, messages, users
+from .api import auth, backup, dms, federation, groups, inbox, messages, users
 from .config import get_settings
 from .db import lifespan
 from .schemas import ErrorResponse, HealthResponse
@@ -111,6 +111,7 @@ app.include_router(messages.router, prefix="/api/v1/messages")
 app.include_router(groups.router, prefix="/api/v1/groups")
 app.include_router(dms.router, prefix="/api/v1/dms")
 app.include_router(federation.router, prefix="/api/v1/federation")
+app.include_router(backup.router, prefix="/api/v1/backup")
 
 # WebSocket
 app.include_router(inbox.router, prefix="/ws/v1")
