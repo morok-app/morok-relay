@@ -116,6 +116,15 @@ async def send_envelope(
     h.update(hashlib.sha256(blob_bytes).digest())
     envelope_id = h.hexdigest()
 
+    # Look up sender — for username snapshot
+    sender_stmt = (
+        select(User)
+        .where(User.pubkey == sender_pubkey)
+        .where(User.deleted_at.is_(None))
+    )
+    sender_user = (await db.execute(sender_stmt)).scalar_one_or_none()
+    sender_username = sender_user.username if sender_user else None
+
     # Look up recipient — we need home_relay to decide routing
     stmt = (
         select(User)
@@ -147,6 +156,7 @@ async def send_envelope(
             ttl_seconds=body.ttl,
             signature_hex=body.sig,
             hard_ceiling_seconds=settings.message_ttl_hard_seconds,
+            sender_username=sender_username,
         )
         return EnvelopeAck(
             envelope_id=envelope_id, queued=True, expires_at=expires_at,
@@ -170,9 +180,11 @@ async def send_envelope(
         "ttl": body.ttl,
         "blob": body.blob,
         "sig": body.sig,
+        # Hint to the receiving relay so it can pre-populate username
+        # in the inbox metadata.
+        "from_username": sender_username,
     }
 
-    # Cap expiry at the hard ceiling (worker will refuse to send if expired)
     requested_expires = body.ts + body.ttl
     ceiling = now + settings.message_ttl_hard_seconds
     expires_at = min(requested_expires, ceiling)
@@ -183,7 +195,7 @@ async def send_envelope(
         target_relay=recipient.home_relay,
         status=FedQueueStatus.PENDING,
         attempts=0,
-        next_attempt_at=now,   # try immediately on next worker tick
+        next_attempt_at=now,
         created_at=now,
     )
     db.add(queue_row)

@@ -51,9 +51,14 @@ async def enqueue_envelope(
     ttl_seconds: int,
     signature_hex: str,
     hard_ceiling_seconds: int,
+    sender_username: str | None = None,
 ) -> int:
     """
     Add an envelope to the recipient's inbox queue and publish a notification.
+
+    `sender_username` is the username of the sender AT SEND TIME — included
+    in the metadata so the recipient's client can display "@bob" instead of
+    a raw pubkey prefix without doing a separate lookup.
 
     Returns the expires_at timestamp (capped at hard ceiling).
     """
@@ -65,6 +70,7 @@ async def enqueue_envelope(
     meta = {
         "envelope_id": envelope_id,
         "from": sender_pubkey_hex,
+        "from_username": sender_username,
         "to": recipient_pubkey_hex,
         "ts": timestamp,
         "ttl": ttl_seconds,
@@ -95,6 +101,7 @@ async def enqueue_envelope_for_recipients(
     signature_hex: str,
     hard_ceiling_seconds: int,
     group_id: str | None = None,
+    sender_username: str | None = None,
 ) -> tuple[int, int]:
     """
     Fan-out: deliver the same envelope to multiple recipients.
@@ -106,22 +113,22 @@ async def enqueue_envelope_for_recipients(
     Returns (expires_at, recipient_count).
 
     The metadata is stored ONCE with a 'to' of either the group_id (if
-    given) or the comma-joined recipients (for tracability). This means
-    /messages GET returns the same metadata to every recipient — they
-    all see the message addressed to the group, not to themselves
-    individually. That's what we want for group UX.
+    given) or "broadcast" otherwise. This means /messages GET returns the
+    same metadata to every recipient — they all see the message addressed
+    to the group, not to themselves individually. That's what we want for
+    group UX.
     """
     now = int(time.time())
     requested_expires = timestamp + ttl_seconds
     ceiling = now + hard_ceiling_seconds
     expires_at = min(requested_expires, ceiling)
 
-    # 'to' field in metadata: group_id makes it clear this was a broadcast
     to_value = group_id if group_id else "broadcast"
 
     meta = {
         "envelope_id": envelope_id,
         "from": sender_pubkey_hex,
+        "from_username": sender_username,
         "to": to_value,
         "ts": timestamp,
         "ttl": ttl_seconds,
@@ -131,13 +138,11 @@ async def enqueue_envelope_for_recipients(
     }
 
     async with redis.pipeline(transaction=True) as pipe:
-        # Single metadata record (shared by all recipients)
         pipe.set(
             _envelope_meta_key(envelope_id),
             json.dumps(meta).encode("utf-8"),
             ex=expires_at - now,
         )
-        # Add to each recipient's inbox + publish notification
         for recipient in recipient_pubkeys_hex:
             pipe.zadd(_inbox_key(recipient), {envelope_id: expires_at})
             pipe.publish(_inbox_channel(recipient), envelope_id)

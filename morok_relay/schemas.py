@@ -239,6 +239,37 @@ class GroupMembershipChange(BaseModel):
 
 
 # ============================================================================
+# GROUP INVITE TOKENS (Day 6)
+# ============================================================================
+
+INVITE_TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_-]{20,40}$")
+
+
+class InviteTokenCreate(BaseModel):
+    """Admin creates a new invite token for their group."""
+    # Optional override of TTL; server clamps to [1h .. 30d], default 7d.
+    ttl_seconds: int | None = Field(default=None, ge=3600, le=30 * 86400)
+
+
+class InviteTokenInfo(BaseModel):
+    token: str
+    group_id: str
+    created_by_pubkey_hex: str
+    created_at: int
+    expires_at: int
+
+
+class InviteTokenList(BaseModel):
+    tokens: list[InviteTokenInfo]
+
+
+class JoinViaTokenResponse(BaseModel):
+    group_id: str
+    joined: bool
+    member_count: int
+
+
+# ============================================================================
 # MESSAGE ENVELOPE
 # ============================================================================
 

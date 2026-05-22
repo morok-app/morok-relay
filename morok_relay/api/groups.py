@@ -4,20 +4,23 @@ Group and channel endpoints.
 Rate limits:
 - POST /api/v1/groups               — 5/min per pubkey (creates new group)
 - POST /api/v1/groups/{id}/messages — 30/min per pubkey (broadcasts to N)
+- POST /api/v1/groups/{id}/invites  — 10/min per pubkey (create invite tokens)
+- POST /api/v1/groups/join          — 5/min per pubkey (anti-abuse on token guess)
 Other endpoints are not rate-limited at this layer (no DB writes or only
 single-row updates).
 """
 from __future__ import annotations
 
 import base64
+import logging
 import time
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
-from .. import blob_storage, crypto
+from .. import blob_storage, crypto, invite_tokens
 from ..config import get_settings
 from ..deps import CurrentSession, DBSession, RedisClient
 from ..models import Group, GroupMember, User, UserTier
@@ -32,7 +35,14 @@ from ..schemas import (
     GroupInfoDetailed,
     GroupMemberInfo,
     GroupMembershipChange,
+    InviteTokenCreate,
+    InviteTokenInfo,
+    InviteTokenList,
+    JoinViaTokenResponse,
+    INVITE_TOKEN_PATTERN,
 )
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["groups"])
 
@@ -467,6 +477,19 @@ async def send_group_message(
             expires_at=0,
         )
 
+    # Snapshot sender username for the recipient client UI
+    sender_stmt = (
+        select(User)
+        .where(User.pubkey == sender_pubkey)
+        .where(User.deleted_at.is_(None))
+    )
+    sender_user = (await db.execute(sender_stmt)).scalar_one_or_none()
+    sender_username = (
+        sender_user.username
+        if sender_user and not group.anonymous_senders
+        else None
+    )
+
     await blob_storage.write_blob(envelope_id, blob_bytes)
     recipient_pubkeys = [m.pubkey.hex() for m in group.members]
     expires_at, recipient_count = await enqueue_envelope_for_recipients(
@@ -479,10 +502,203 @@ async def send_group_message(
         signature_hex=body.sig,
         hard_ceiling_seconds=settings.message_ttl_hard_seconds,
         group_id=str(group.id),
+        sender_username=sender_username,
     )
     return GroupEnvelopeAck(
         envelope_id=envelope_id,
         queued=True,
         recipient_count=recipient_count,
         expires_at=expires_at,
+    )
+
+
+# ============================================================================
+# INVITE TOKENS (Day 6 — variant B)
+# ============================================================================
+
+@router.post(
+    "/{group_id}/invites",
+    response_model=InviteTokenInfo,
+    status_code=status.HTTP_201_CREATED,
+    summary="Admin creates a one-time invite token for the group",
+    dependencies=[Depends(rate_limit_by_pubkey(
+        "group_invite_create",
+        10,
+    ))],
+)
+async def create_invite_token(
+    group_id: str,
+    body: InviteTokenCreate,
+    current: CurrentSession,
+    db: DBSession,
+    redis: RedisClient,
+) -> InviteTokenInfo:
+    gid = _parse_group_id(group_id)
+    group = await _load_group(db, gid)
+    caller = bytes.fromhex(current.pubkey_hex)
+    admin_member = _find_admin(group)
+    if admin_member is None or admin_member.pubkey != caller:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="only_admin_can_create_invites",
+        )
+
+    active = await invite_tokens.count_active_tokens(redis, str(group.id))
+    if active >= invite_tokens.MAX_ACTIVE_TOKENS_PER_GROUP:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"too_many_active_invites_max_{invite_tokens.MAX_ACTIVE_TOKENS_PER_GROUP}",
+        )
+
+    ttl = body.ttl_seconds or invite_tokens.DEFAULT_TTL_SECONDS
+    info = await invite_tokens.create_token(
+        redis=redis,
+        group_id=str(group.id),
+        created_by_pubkey_hex=current.pubkey_hex,
+        ttl_seconds=ttl,
+    )
+    return InviteTokenInfo(
+        token=info["token"],
+        group_id=str(group.id),
+        created_by_pubkey_hex=current.pubkey_hex,
+        created_at=info["created_at"],
+        expires_at=info["expires_at"],
+    )
+
+
+@router.get(
+    "/{group_id}/invites",
+    response_model=InviteTokenList,
+    summary="List active invite tokens for a group (admin only)",
+)
+async def list_invite_tokens(
+    group_id: str,
+    current: CurrentSession,
+    db: DBSession,
+    redis: RedisClient,
+) -> InviteTokenList:
+    gid = _parse_group_id(group_id)
+    group = await _load_group(db, gid)
+    caller = bytes.fromhex(current.pubkey_hex)
+    admin_member = _find_admin(group)
+    if admin_member is None or admin_member.pubkey != caller:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="only_admin_can_list_invites",
+        )
+
+    raw_tokens = await invite_tokens.list_tokens(redis, str(group.id))
+    tokens = [
+        InviteTokenInfo(
+            token=t["token"],
+            group_id=t["group_id"],
+            created_by_pubkey_hex=t["created_by"],
+            created_at=t["created_at"],
+            expires_at=t["expires_at"],
+        )
+        for t in raw_tokens
+    ]
+    return InviteTokenList(tokens=tokens)
+
+
+@router.delete(
+    "/{group_id}/invites/{token}",
+    summary="Revoke an invite token",
+)
+async def revoke_invite_token(
+    group_id: str,
+    token: str,
+    current: CurrentSession,
+    db: DBSession,
+    redis: RedisClient,
+) -> dict:
+    if not INVITE_TOKEN_PATTERN.match(token):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="malformed_token",
+        )
+    gid = _parse_group_id(group_id)
+    group = await _load_group(db, gid)
+    caller = bytes.fromhex(current.pubkey_hex)
+    admin_member = _find_admin(group)
+    if admin_member is None or admin_member.pubkey != caller:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="only_admin_can_revoke_invites",
+        )
+    revoked = await invite_tokens.revoke_token(redis, str(group.id), token)
+    return {"revoked": revoked}
+
+
+@router.post(
+    "/join",
+    response_model=JoinViaTokenResponse,
+    summary="Join a group via invite token (one-time-use)",
+    dependencies=[Depends(rate_limit_by_pubkey(
+        "group_join_via_token",
+        5,
+    ))],
+)
+async def join_via_token(
+    current: CurrentSession,
+    db: DBSession,
+    redis: RedisClient,
+    token: str = Query(..., min_length=20, max_length=40),
+) -> JoinViaTokenResponse:
+    """
+    Public endpoint (requires session, but caller doesn't need to be a
+    member or admin of the group). Consumes the token, adds the caller as
+    a regular (non-admin) member, and returns the group's id + new size.
+    """
+    if not INVITE_TOKEN_PATTERN.match(token):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="malformed_token",
+        )
+
+    meta = await invite_tokens.consume_token(redis, token)
+    if meta is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="invite_token_invalid_or_expired",
+        )
+
+    group_id_str = meta["group_id"]
+    gid = _parse_group_id(group_id_str)
+    group = await _load_group(db, gid)
+
+    caller = bytes.fromhex(current.pubkey_hex)
+
+    # Already a member? — just return success
+    if _is_member(group, caller):
+        return JoinViaTokenResponse(
+            group_id=group_id_str,
+            joined=True,
+            member_count=len(group.members),
+        )
+
+    if len(group.members) >= group.max_members:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"group_full_max_{group.max_members}_members",
+        )
+
+    db.add(GroupMember(
+        group_id=group.id,
+        pubkey=caller,
+        is_admin=False,
+        joined_at=int(time.time()),
+    ))
+    await db.flush()
+    await db.refresh(group, attribute_names=["members"])
+
+    logger.info(
+        "User %s... joined group %s via invite token",
+        current.pubkey_hex[:8], group_id_str,
+    )
+
+    return JoinViaTokenResponse(
+        group_id=group_id_str,
+        joined=True,
+        member_count=len(group.members),
     )
