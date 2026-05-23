@@ -3,21 +3,45 @@ Morok Relay — main FastAPI application.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from . import __version__
 from .api import auth, backup, dms, federation, groups, inbox, messages, users
+from .cleanup import cleanup_task_loop
 from .config import get_settings
-from .db import lifespan
+from .db import lifespan as db_lifespan
 from .schemas import ErrorResponse, HealthResponse
 
 logger = logging.getLogger(__name__)
 
 settings = get_settings()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Combined lifespan: bring up DB+Redis (via db_lifespan), then start
+    the background cleanup task. Cancel it on shutdown.
+    """
+    async with db_lifespan(app):
+        cleanup_task = asyncio.create_task(cleanup_task_loop())
+        logger.info("Background cleanup task started")
+        try:
+            yield
+        finally:
+            cleanup_task.cancel()
+            try:
+                await cleanup_task
+            except asyncio.CancelledError:
+                pass
+            logger.info("Background cleanup task stopped")
+
 
 app = FastAPI(
     title="Morok Relay",
