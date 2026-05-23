@@ -12,7 +12,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from . import __version__
-from .api import auth, backup, dms, federation, groups, inbox, messages, users
+from .api import auth, backup, burner, dms, federation, groups, inbox, messages, users
 from .cleanup import cleanup_task_loop
 from .config import get_settings
 from .db import lifespan as db_lifespan
@@ -134,6 +134,7 @@ app.include_router(users.router, prefix="/api/v1/users")
 app.include_router(messages.router, prefix="/api/v1/messages")
 app.include_router(groups.router, prefix="/api/v1/groups")
 app.include_router(dms.router, prefix="/api/v1/dms")
+app.include_router(burner.router, prefix="/api/v1/burner")
 app.include_router(federation.router, prefix="/api/v1/federation")
 app.include_router(backup.router, prefix="/api/v1/backup")
 
