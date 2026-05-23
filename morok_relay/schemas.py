@@ -205,6 +205,7 @@ class GroupCreate(BaseModel):
 
 class GroupMemberInfo(BaseModel):
     pubkey_hex: str
+    username: str | None = None
     is_admin: bool
     joined_at: int
 

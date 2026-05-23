@@ -120,13 +120,34 @@ def _to_group_info(group: Group) -> GroupInfo:
     )
 
 
-def _to_group_info_detailed(group: Group) -> GroupInfoDetailed:
+async def _to_group_info_detailed(group: Group, db) -> GroupInfoDetailed:
+    """
+    Build the detailed group response, including each member's username
+    (looked up from the users table). Members whose pubkey isn't in
+    users yet (e.g. an outside relay's user that was added by pubkey
+    only) get username=None — clients render them as @anon_<prefix>.
+    """
     base = _to_group_info(group)
+
+    # Bulk-lookup usernames for all member pubkeys in one query
+    member_pubkeys = [m.pubkey for m in group.members]
+    username_by_pubkey: dict[bytes, str | None] = {}
+    if member_pubkeys:
+        stmt = (
+            select(User.pubkey, User.username)
+            .where(User.pubkey.in_(member_pubkeys))
+            .where(User.deleted_at.is_(None))
+        )
+        rows = (await db.execute(stmt)).all()
+        for pk, uname in rows:
+            username_by_pubkey[bytes(pk)] = uname
+
     return GroupInfoDetailed(
         **base.model_dump(),
         members=[
             GroupMemberInfo(
                 pubkey_hex=m.pubkey.hex(),
+                username=username_by_pubkey.get(bytes(m.pubkey)),
                 is_admin=m.is_admin,
                 joined_at=m.joined_at,
             )
@@ -213,7 +234,7 @@ async def create_group(
     await db.flush()
     await db.refresh(group, attribute_names=["members"])
 
-    return _to_group_info_detailed(group)
+    return await _to_group_info_detailed(group, db)
 
 
 @router.get("", response_model=list[GroupInfo])
@@ -243,7 +264,7 @@ async def get_group(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="not_a_member",
         )
-    return _to_group_info_detailed(group)
+    return await _to_group_info_detailed(group, db)
 
 
 @router.delete("/{group_id}")
