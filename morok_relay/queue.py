@@ -7,7 +7,14 @@ are awaiting delivery. The score is the message's hard expiry timestamp
 prune expired entries.
 
 We also publish on a per-recipient channel for real-time delivery via
-the WebSocket inbox endpoint.
+the WebSocket inbox endpoint. As of the delete-feature pass, channel
+payloads are JSON events of the form:
+    {"kind": "new", "envelope_id": "..."}
+    {"kind": "deleted", "envelope_id": "...", "by": "<pubkey_hex>",
+     "group_id": "<uuid>"|null}
+
+The WS reader has a backward-compat path that treats a bare envelope_id
+string as a "new" event, so a half-rolled deploy doesn't drop messages.
 
 Keys
 ----
@@ -17,7 +24,7 @@ Keys
                                              TTL = hard ceiling
 
     morok:inbox:channel:{recipient_pubkey} — Redis PUB/SUB channel
-                                             message = envelope_id
+                                             message = JSON event
 """
 from __future__ import annotations
 
@@ -40,6 +47,23 @@ def _envelope_meta_key(envelope_id: str) -> str:
 
 def _inbox_channel(recipient_pubkey_hex: str) -> str:
     return f"morok:inbox:channel:{recipient_pubkey_hex}"
+
+
+def _new_event(envelope_id: str) -> str:
+    return json.dumps({"kind": "new", "envelope_id": envelope_id})
+
+
+def _deleted_event(
+    envelope_id: str,
+    deleted_by_pubkey_hex: str,
+    group_id: str | None = None,
+) -> str:
+    return json.dumps({
+        "kind": "deleted",
+        "envelope_id": envelope_id,
+        "by": deleted_by_pubkey_hex,
+        "group_id": group_id,
+    })
 
 
 async def enqueue_envelope(
@@ -85,7 +109,7 @@ async def enqueue_envelope(
             ex=expires_at - now,
         )
         pipe.zadd(_inbox_key(recipient_pubkey_hex), {envelope_id: expires_at})
-        pipe.publish(_inbox_channel(recipient_pubkey_hex), envelope_id)
+        pipe.publish(_inbox_channel(recipient_pubkey_hex), _new_event(envelope_id))
         await pipe.execute()
 
     return expires_at
@@ -137,6 +161,8 @@ async def enqueue_envelope_for_recipients(
         "group_id": group_id,
     }
 
+    new_event = _new_event(envelope_id)
+
     async with redis.pipeline(transaction=True) as pipe:
         pipe.set(
             _envelope_meta_key(envelope_id),
@@ -145,7 +171,7 @@ async def enqueue_envelope_for_recipients(
         )
         for recipient in recipient_pubkeys_hex:
             pipe.zadd(_inbox_key(recipient), {envelope_id: expires_at})
-            pipe.publish(_inbox_channel(recipient), envelope_id)
+            pipe.publish(_inbox_channel(recipient), new_event)
         await pipe.execute()
 
     return expires_at, len(recipient_pubkeys_hex)
@@ -190,6 +216,26 @@ async def list_inbox(
     return out
 
 
+async def get_envelope_meta(
+    redis: redis_async.Redis,
+    envelope_id: str,
+) -> dict | None:
+    """
+    Fetch envelope metadata directly by id.
+
+    Returns None if the envelope has expired or been deleted. Used by
+    the WS reader to look up metadata for a single notification without
+    re-scanning the whole inbox.
+    """
+    raw = await redis.get(_envelope_meta_key(envelope_id))
+    if raw is None:
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+
+
 async def acknowledge_envelope(
     redis: redis_async.Redis,
     recipient_pubkey_hex: str,
@@ -210,3 +256,119 @@ async def acknowledge_envelope(
 async def envelope_exists(redis: redis_async.Redis, envelope_id: str) -> bool:
     """Check if an envelope is known to this relay (for dedup)."""
     return bool(await redis.exists(_envelope_meta_key(envelope_id)))
+
+
+async def delete_envelope_by_sender(
+    redis: redis_async.Redis,
+    envelope_id: str,
+    caller_pubkey_hex: str,
+    recipient_pubkey_hex: str,
+) -> dict:
+    """
+    Sender removes their DM envelope from the recipient's inbox.
+
+    If metadata is still in Redis we authorize via meta.from. If it has
+    already expired or been acked by the recipient, we accept the
+    caller's claim and publish a delete event into the recipient's
+    channel anyway — the recipient client is expected to sanity-check
+    that the envelope_id really belongs to a chat with `caller`.
+
+    The blob file is left for the reaper to clean up once no inbox row
+    references it.
+
+    Returns
+    -------
+    dict with keys:
+        ok: bool                  — operation accepted
+        deleted_from_queue: bool  — envelope row was actually present
+        meta_existed: bool        — recipient had not yet acked
+        error: str | None         — "not_sender" | "group_message"
+                                  | "recipient_mismatch" | None
+    """
+    meta_raw = await redis.get(_envelope_meta_key(envelope_id))
+    meta_existed = meta_raw is not None
+
+    if meta_existed:
+        try:
+            meta = json.loads(meta_raw)
+        except json.JSONDecodeError:
+            meta = {}
+
+        if meta.get("group_id"):
+            return {
+                "ok": False, "deleted_from_queue": False,
+                "meta_existed": True, "error": "group_message",
+            }
+        if meta.get("from") != caller_pubkey_hex:
+            return {
+                "ok": False, "deleted_from_queue": False,
+                "meta_existed": True, "error": "not_sender",
+            }
+        if meta.get("to") != recipient_pubkey_hex:
+            return {
+                "ok": False, "deleted_from_queue": False,
+                "meta_existed": True, "error": "recipient_mismatch",
+            }
+
+    event_payload = _deleted_event(envelope_id, caller_pubkey_hex)
+
+    async with redis.pipeline(transaction=True) as pipe:
+        pipe.zrem(_inbox_key(recipient_pubkey_hex), envelope_id)
+        pipe.delete(_envelope_meta_key(envelope_id))
+        pipe.publish(_inbox_channel(recipient_pubkey_hex), event_payload)
+        results = await pipe.execute()
+
+    return {
+        "ok": True,
+        "deleted_from_queue": bool(results[0]),
+        "meta_existed": meta_existed,
+        "error": None,
+    }
+
+
+async def delete_envelope_for_group(
+    redis: redis_async.Redis,
+    envelope_id: str,
+    group_id: str,
+    recipient_pubkeys_hex: list[str],
+    deleted_by_pubkey_hex: str,
+) -> dict:
+    """
+    Remove a group envelope from every member's inbox and push a delete
+    event onto each member's channel.
+
+    Authorization (sender-or-admin) is enforced in the router because
+    it requires a DB lookup against the group membership table.
+
+    Returns
+    -------
+    dict with keys:
+        deleted_from_count: int   — how many member inboxes still had it
+        meta_existed: bool        — metadata was still in Redis
+        broadcast_to: int         — channels we published the event on
+    """
+    meta_key = _envelope_meta_key(envelope_id)
+    meta_existed = bool(await redis.exists(meta_key))
+
+    event_payload = _deleted_event(
+        envelope_id, deleted_by_pubkey_hex, group_id=group_id,
+    )
+
+    async with redis.pipeline(transaction=True) as pipe:
+        pipe.delete(meta_key)
+        for r in recipient_pubkeys_hex:
+            pipe.zrem(_inbox_key(r), envelope_id)
+            pipe.publish(_inbox_channel(r), event_payload)
+        results = await pipe.execute()
+
+    # Layout: [delete_meta, zrem_0, publish_0, zrem_1, publish_1, ...]
+    # zrem results live at indices 1, 3, 5, ...
+    deleted_from_count = sum(
+        1 for i in range(1, len(results), 2) if results[i]
+    )
+
+    return {
+        "deleted_from_count": deleted_from_count,
+        "meta_existed": meta_existed,
+        "broadcast_to": len(recipient_pubkeys_hex),
+    }

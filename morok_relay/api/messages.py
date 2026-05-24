@@ -26,12 +26,15 @@ from ..deps import CurrentSession, DBSession, RedisClient
 from ..models import FederationOutboundQueue, FedQueueStatus, User
 from ..queue import (
     acknowledge_envelope,
+    delete_envelope_by_sender,
     enqueue_envelope,
     envelope_exists,
     list_inbox,
 )
 from ..rate_limit import rate_limit_by_pubkey
 from ..schemas import EnvelopeAck, EnvelopeIn
+
+from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
@@ -278,3 +281,78 @@ async def ack_envelope(
         )
     await acknowledge_envelope(redis, current.pubkey_hex, envelope_id)
     return {"acknowledged": True}
+
+
+class DMDeleteRequest(BaseModel):
+    recipient_pubkey_hex: str = Field(
+        ..., min_length=64, max_length=64,
+        pattern=r"^[0-9a-fA-F]{64}$",
+    )
+
+
+@router.post(
+    "/{envelope_id}/delete-for-recipient",
+    summary="Sender deletes their DM message from the recipient's inbox",
+)
+async def delete_dm_message(
+    envelope_id: str,
+    body: DMDeleteRequest,
+    current: CurrentSession,
+    redis: RedisClient,
+) -> dict:
+    """
+    Sender-initiated server-side delete of a DM.
+
+    If the envelope is still in the recipient's queue, it's removed and a
+    "deleted" event is pushed onto their WS channel. If the recipient has
+    already acked it off the queue, the queue removal is a no-op but the
+    WS event still goes out (so an online recipient client can also drop
+    the message from its local store).
+
+    Recipient-side sanity: the client must verify that `envelope_id` was
+    indeed part of its chat with `by` (the sender) before deleting locally.
+    """
+    if len(envelope_id) != 64 or not all(
+        c in "0123456789abcdef" for c in envelope_id
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="malformed_envelope_id",
+        )
+
+    result = await delete_envelope_by_sender(
+        redis=redis,
+        envelope_id=envelope_id,
+        caller_pubkey_hex=current.pubkey_hex,
+        recipient_pubkey_hex=body.recipient_pubkey_hex,
+    )
+
+    err = result.get("error")
+    if err == "not_sender":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="not_message_sender",
+        )
+    if err == "group_message":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="use_group_delete_endpoint",
+        )
+    if err == "recipient_mismatch":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="recipient_mismatch",
+        )
+
+    logger.info(
+        "DM %s... deleted by sender %s... (queue_hit=%s, meta_existed=%s)",
+        envelope_id[:8], current.pubkey_hex[:8],
+        result["deleted_from_queue"], result["meta_existed"],
+    )
+
+    return {
+        "deleted": True,
+        "envelope_id": envelope_id,
+        "deleted_from_queue": result["deleted_from_queue"],
+        "recipient_already_acked": not result["meta_existed"],
+    }

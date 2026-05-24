@@ -24,7 +24,12 @@ from .. import blob_storage, crypto, invite_tokens
 from ..config import get_settings
 from ..deps import CurrentSession, DBSession, RedisClient
 from ..models import Group, GroupMember, User, UserTier
-from ..queue import enqueue_envelope_for_recipients, envelope_exists
+from ..queue import (
+    delete_envelope_for_group,
+    enqueue_envelope_for_recipients,
+    envelope_exists,
+    get_envelope_meta,
+)
 from ..rate_limit import rate_limit_by_pubkey
 from ..schemas import (
     GroupAddMemberRequest,
@@ -531,6 +536,99 @@ async def send_group_message(
         recipient_count=recipient_count,
         expires_at=expires_at,
     )
+
+
+@router.post(
+    "/{group_id}/messages/{envelope_id}/delete",
+    summary="Delete a group message (sender or group admin)",
+)
+async def delete_group_message(
+    group_id: str,
+    envelope_id: str,
+    current: CurrentSession,
+    db: DBSession,
+    redis: RedisClient,
+) -> dict:
+    """
+    Remove a group message from every member's inbox and push a delete
+    event on each member's WS channel.
+
+    Authorization
+    -------------
+    Caller must be a member of the group AND either:
+      - the original sender (verified via envelope metadata while it
+        still lives in Redis), or
+      - the group's admin.
+
+    If the envelope metadata has already expired or been acked off the
+    queue, the original sender cannot be re-derived — in that case only
+    a group admin may invoke this endpoint.
+    """
+    if len(envelope_id) != 64 or not all(
+        c in "0123456789abcdef" for c in envelope_id
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="malformed_envelope_id",
+        )
+
+    gid = _parse_group_id(group_id)
+    group = await _load_group(db, gid)
+    caller = bytes.fromhex(current.pubkey_hex)
+
+    if not _is_member(group, caller):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="not_a_member",
+        )
+
+    meta = await get_envelope_meta(redis, envelope_id)
+
+    sender_pubkey_hex: str | None = None
+    if meta is not None:
+        if meta.get("group_id") != str(group.id):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="envelope_not_in_this_group",
+            )
+        sender_pubkey_hex = meta.get("from")
+
+    is_sender = (
+        sender_pubkey_hex is not None
+        and sender_pubkey_hex == current.pubkey_hex
+    )
+    admin_member = _find_admin(group)
+    is_admin = admin_member is not None and admin_member.pubkey == caller
+
+    if not (is_sender or is_admin):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="must_be_sender_or_admin",
+        )
+
+    recipient_pubkeys_hex = [m.pubkey.hex() for m in group.members]
+
+    result = await delete_envelope_for_group(
+        redis=redis,
+        envelope_id=envelope_id,
+        group_id=str(group.id),
+        recipient_pubkeys_hex=recipient_pubkeys_hex,
+        deleted_by_pubkey_hex=current.pubkey_hex,
+    )
+
+    logger.info(
+        "Group %s msg %s... deleted by %s... (sender=%s, admin=%s)",
+        group_id, envelope_id[:8], current.pubkey_hex[:8],
+        is_sender, is_admin,
+    )
+
+    return {
+        "deleted": True,
+        "envelope_id": envelope_id,
+        "deleted_from_count": result["deleted_from_count"],
+        "broadcast_to": result["broadcast_to"],
+        "meta_existed": result["meta_existed"],
+    }
 
 
 # ============================================================================

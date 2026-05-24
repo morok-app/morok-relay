@@ -14,11 +14,15 @@ What the server pushes
 ----------------------
 On connection: catch-up frame with all pending envelopes.
 After that: one frame per new envelope as it arrives, via Redis pub/sub.
+Server also forwards "deleted" frames when an envelope is removed by
+the sender (DM) or by a sender/admin in a group.
 
 Frame format
 ------------
     { "type": "catchup", "envelopes": [ {envelope metadata}, ... ] }
     { "type": "new", "envelope": { envelope metadata } }
+    { "type": "deleted", "envelope_id": "...", "by": "<pubkey_hex>",
+      "group_id": "<uuid>"|null }
     { "type": "ping" }   — server heartbeat every 30s
     { "type": "error", "detail": "..." }
 
@@ -36,7 +40,7 @@ import logging
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, status
 
 from ..deps import get_redis
-from ..queue import acknowledge_envelope, list_inbox
+from ..queue import acknowledge_envelope, get_envelope_meta, list_inbox
 from ..sessions import verify_session_token
 
 logger = logging.getLogger(__name__)
@@ -101,19 +105,43 @@ async def inbox_socket(
     #    - pinger: send periodic ping
 
     async def reader_task() -> None:
-        """Listen to Redis pub/sub and forward to client."""
+        """Listen to Redis pub/sub and forward typed frames to client."""
         try:
             async for message in pubsub.listen():
                 if message.get("type") != "message":
                     continue
-                envelope_id = message["data"].decode("utf-8")
-                # Look up the metadata
-                envs = await list_inbox(redis, pubkey_hex, limit=200)
-                env = next(
-                    (e for e in envs if e["envelope_id"] == envelope_id), None
-                )
-                if env is not None:
-                    await websocket.send_json({"type": "new", "envelope": env})
+                raw = message["data"]
+                if isinstance(raw, bytes):
+                    raw = raw.decode("utf-8")
+
+                # New JSON format: {"kind": "new"|"deleted", ...}
+                # Backward compat: bare envelope_id string → "new" event.
+                try:
+                    event = json.loads(raw)
+                    if not isinstance(event, dict):
+                        raise ValueError("not a dict")
+                except (json.JSONDecodeError, ValueError, TypeError):
+                    event = {"kind": "new", "envelope_id": raw}
+
+                kind = event.get("kind")
+                envelope_id = event.get("envelope_id")
+                if not envelope_id:
+                    continue
+
+                if kind == "new":
+                    env = await get_envelope_meta(redis, envelope_id)
+                    if env is not None:
+                        await websocket.send_json(
+                            {"type": "new", "envelope": env}
+                        )
+                elif kind == "deleted":
+                    await websocket.send_json({
+                        "type": "deleted",
+                        "envelope_id": envelope_id,
+                        "by": event.get("by"),
+                        "group_id": event.get("group_id"),
+                    })
+                # Unknown kind → drop silently
         except asyncio.CancelledError:
             raise
         except Exception as e:
