@@ -23,7 +23,7 @@ from sqlalchemy.orm import selectinload
 from .. import blob_storage, crypto, invite_tokens
 from ..config import get_settings
 from ..deps import CurrentSession, DBSession, RedisClient
-from ..models import Group, GroupMember, User, UserTier
+from ..models import FederationOutboundQueue, FedQueueStatus, Group, GroupMember, User, UserTier
 from ..queue import (
     delete_envelope_for_group,
     enqueue_envelope_for_recipients,
@@ -226,6 +226,7 @@ async def create_group(
         expires_at=body.expires_at,
         anonymous_senders=body.anonymous_senders,
         max_members=max_members,
+        home_relay=get_settings().relay_name,
     )
     db.add(group)
     await db.flush()
@@ -397,6 +398,138 @@ async def lookup_by_slug(slug: str, db: DBSession) -> GroupInfo:
     return _to_group_info(group)
 
 
+def _group_home_relay(group: Group) -> str:
+    """
+    Return the relay that owns this group, falling back to settings if
+    the column is NULL (legacy rows pre-migration 007).
+    """
+    return group.home_relay or get_settings().relay_name
+
+
+def compute_group_envelope_id(
+    sender_pubkey: bytes,
+    group_id_bytes: bytes,
+    timestamp: int,
+    blob_bytes: bytes,
+) -> str:
+    """
+    Deterministic envelope_id for a group message — same calculation in
+    send_group_message and the federation /forward handler, so dedup
+    works across the federation hop.
+    """
+    import hashlib
+    h = hashlib.sha256()
+    h.update(sender_pubkey)
+    h.update(group_id_bytes)
+    h.update(timestamp.to_bytes(8, "big"))
+    h.update(hashlib.sha256(blob_bytes).digest())
+    return h.hexdigest()
+
+
+async def do_group_fanout(
+    group: Group,
+    envelope: dict,
+    envelope_id: str,
+    db,
+    redis,
+) -> tuple[int, int]:
+    """
+    Host-side fan-out: deliver an envelope to every member.
+
+    Local members → Redis inbox queue (immediate WS push).
+    Remote members → federation_outbound_queue row per target relay,
+                     with a "deliver" mode payload listing those members.
+
+    Caller must have ALREADY:
+      - validated/dedup'd the envelope
+      - persisted the blob via blob_storage.write_blob
+      - verified that this relay IS the group's home
+
+    Returns (local_count, remote_relay_count) for the ack.
+    """
+    settings = get_settings()
+
+    sender_pubkey = bytes.fromhex(envelope["from"])
+    recipient_pubkeys_bytes = [
+        m.pubkey for m in group.members if m.pubkey != sender_pubkey
+    ]
+    recipient_pubkeys_hex = [p.hex() for p in recipient_pubkeys_bytes]
+
+    home_by_pubkey_hex: dict[str, str | None] = {}
+    if recipient_pubkeys_bytes:
+        stmt = (
+            select(User.pubkey, User.home_relay)
+            .where(User.pubkey.in_(recipient_pubkeys_bytes))
+            .where(User.deleted_at.is_(None))
+        )
+        rows = (await db.execute(stmt)).all()
+        for pk, hr in rows:
+            home_by_pubkey_hex[bytes(pk).hex()] = hr
+
+    local_recipients: list[str] = []
+    remote_by_relay: dict[str, list[str]] = {}
+
+    for pk_hex in recipient_pubkeys_hex:
+        home = home_by_pubkey_hex.get(pk_hex)
+        # Unknown user (no User row) → treat as local. The /users/lookup
+        # path is what populates User rows from federation; if we don't
+        # have one, we can't route remotely anyway.
+        if home is None or home == settings.relay_name:
+            local_recipients.append(pk_hex)
+        else:
+            remote_by_relay.setdefault(home, []).append(pk_hex)
+
+    if local_recipients:
+        await enqueue_envelope_for_recipients(
+            redis=redis,
+            envelope_id=envelope_id,
+            sender_pubkey_hex=envelope["from"],
+            recipient_pubkeys_hex=local_recipients,
+            timestamp=int(envelope["ts"]),
+            ttl_seconds=int(envelope["ttl"]),
+            signature_hex=envelope["sig"],
+            hard_ceiling_seconds=settings.message_ttl_hard_seconds,
+            group_id=str(group.id),
+            sender_username=envelope.get("from_username"),
+        )
+
+    now = int(time.time())
+    for target_relay, members_on_relay in remote_by_relay.items():
+        deliver_envelope = {
+            "from": envelope["from"],
+            "to": envelope["to"],
+            "ts": int(envelope["ts"]),
+            "ttl": int(envelope["ttl"]),
+            "blob": envelope["blob"],
+            "sig": envelope["sig"],
+            "from_username": envelope.get("from_username"),
+            "group_id": str(group.id),
+            "group_forward_mode": "deliver",
+            "deliver_to_pubkeys": members_on_relay,
+        }
+        dup_stmt = (
+            select(FederationOutboundQueue)
+            .where(FederationOutboundQueue.envelope_id == envelope_id)
+            .where(FederationOutboundQueue.target_relay == target_relay)
+            .limit(1)
+        )
+        existing = (await db.execute(dup_stmt)).scalar_one_or_none()
+        if existing is None:
+            db.add(FederationOutboundQueue(
+                envelope_id=envelope_id,
+                envelope_data=deliver_envelope,
+                target_relay=target_relay,
+                status=FedQueueStatus.PENDING,
+                attempts=0,
+                next_attempt_at=now,
+                created_at=now,
+            ))
+    if remote_by_relay:
+        await db.flush()
+
+    return len(local_recipients), len(remote_by_relay)
+
+
 @router.post(
     "/{group_id}/messages",
     response_model=GroupEnvelopeAck,
@@ -487,13 +620,10 @@ async def send_group_message(
             detail=f"blob_too_large_max_{settings.max_blob_bytes}_bytes",
         )
 
-    import hashlib
-    h = hashlib.sha256()
-    h.update(sender_pubkey)
-    h.update(group.id.bytes)
-    h.update(body.ts.to_bytes(8, "big"))
-    h.update(hashlib.sha256(blob_bytes).digest())
-    envelope_id = h.hexdigest()
+    import hashlib  # keep import-local for parity with earlier code
+    envelope_id = compute_group_envelope_id(
+        sender_pubkey, group.id.bytes, body.ts, blob_bytes,
+    )
 
     if await envelope_exists(redis, envelope_id):
         return GroupEnvelopeAck(
@@ -516,24 +646,83 @@ async def send_group_message(
         else None
     )
 
+    home = _group_home_relay(group)
+    expires_at = body.ts + body.ttl
+    now = int(time.time())
+
+    # ------------------------------------------------------------------
+    # CASE 1: I'm NOT the host → hand off to host via federation.
+    # We don't store the blob or enqueue locally — the host will do that.
+    # ------------------------------------------------------------------
+    if home != settings.relay_name:
+        dup_stmt = (
+            select(FederationOutboundQueue)
+            .where(FederationOutboundQueue.envelope_id == envelope_id)
+            .where(FederationOutboundQueue.target_relay == home)
+            .limit(1)
+        )
+        existing = (await db.execute(dup_stmt)).scalar_one_or_none()
+        if existing is None:
+            forward_envelope = {
+                "from": body.from_,
+                "to": body.to,
+                "ts": body.ts,
+                "ttl": body.ttl,
+                "blob": body.blob,
+                "sig": body.sig,
+                "from_username": sender_username,
+                "group_id": str(group.id),
+                "group_forward_mode": "to_host",
+            }
+            db.add(FederationOutboundQueue(
+                envelope_id=envelope_id,
+                envelope_data=forward_envelope,
+                target_relay=home,
+                status=FedQueueStatus.PENDING,
+                attempts=0,
+                next_attempt_at=now,
+                created_at=now,
+            ))
+            await db.flush()
+        logger.info(
+            "Forwarding group message %s... to host relay %s",
+            envelope_id[:8], home,
+        )
+        return GroupEnvelopeAck(
+            envelope_id=envelope_id,
+            queued=True,
+            recipient_count=max(0, len(group.members) - 1),
+            expires_at=expires_at,
+        )
+
+    # ------------------------------------------------------------------
+    # CASE 2: I AM the host → store blob, fan out (local + federation).
+    # ------------------------------------------------------------------
     await blob_storage.write_blob(envelope_id, blob_bytes)
-    recipient_pubkeys = [m.pubkey.hex() for m in group.members]
-    expires_at, recipient_count = await enqueue_envelope_for_recipients(
-        redis=redis,
+
+    envelope_for_fanout = {
+        "from": body.from_,
+        "to": body.to,
+        "ts": body.ts,
+        "ttl": body.ttl,
+        "blob": body.blob,
+        "sig": body.sig,
+        "from_username": sender_username,
+    }
+    local_count, remote_relay_count = await do_group_fanout(
+        group=group,
+        envelope=envelope_for_fanout,
         envelope_id=envelope_id,
-        sender_pubkey_hex=body.from_,
-        recipient_pubkeys_hex=recipient_pubkeys,
-        timestamp=body.ts,
-        ttl_seconds=body.ttl,
-        signature_hex=body.sig,
-        hard_ceiling_seconds=settings.message_ttl_hard_seconds,
-        group_id=str(group.id),
-        sender_username=sender_username,
+        db=db,
+        redis=redis,
     )
+
     return GroupEnvelopeAck(
         envelope_id=envelope_id,
         queued=True,
-        recipient_count=recipient_count,
+        # Approximation: members minus sender. (Some remote relays may
+        # have multiple members behind one outbound row.)
+        recipient_count=max(0, len(group.members) - 1),
         expires_at=expires_at,
     )
 

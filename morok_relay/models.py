@@ -126,6 +126,12 @@ class Group(Base):
     max_members: Mapped[int] = mapped_column(
         Integer, nullable=False, default=50, server_default="50",
     )
+    home_relay: Mapped[str | None] = mapped_column(
+        String(255), nullable=True, index=True,
+        comment="Relay hostname that owns this group in its DB. Members "
+                "on other relays route their sends through federation. "
+                "NULL = legacy row, treated as the current relay.",
+    )
     created_at: Mapped[int] = mapped_column(
         BigInteger, nullable=False, server_default=func.extract("epoch", func.now()),
     )

@@ -8,6 +8,15 @@ When User A on relay1 wants to message User B on relay2, the flow is:
   relay1   → relay2: POST /api/v1/federation/forward  (signed forward)
   relay2 enqueues for user_B; user_B receives via their inbox WS
 
+For GROUP messages the envelope carries `group_id` and a routing hint
+`group_forward_mode`:
+
+  "to_host"  — sender's home relay forwards the original envelope to the
+               group's host relay; host then does the real fan-out.
+  "deliver"  — host relay tells a peer relay to enqueue the same
+               envelope for a specific list of local members
+               (`deliver_to_pubkeys`).
+
 Authentication
 --------------
 Federation requests are signed by the originating relay using its
@@ -16,7 +25,7 @@ public key in its federation_peers table and verifies the signature.
 
 For v0.3 we keep federation minimal:
 - /handshake — exchange pubkeys + greeting; verifies peer identity
-- /forward   — accept an envelope from another relay for our local user
+- /forward   — accept an envelope from another relay (DM or group)
 - /lookup    — public username lookup (no signing required)
 """
 from __future__ import annotations
@@ -24,16 +33,18 @@ from __future__ import annotations
 import base64
 import logging
 import time
+import uuid
 
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 
 from .. import blob_storage, crypto
 from ..config import get_settings
 from ..deps import DBSession, RedisClient
-from ..models import FederationPeer, User
-from ..queue import enqueue_envelope, envelope_exists
+from ..models import FederationPeer, Group, GroupMember, User
+from ..queue import enqueue_envelope, enqueue_envelope_for_recipients, envelope_exists
 
 logger = logging.getLogger(__name__)
 
@@ -250,6 +261,21 @@ async def forward(
             detail=f"inner_envelope_invalid: {err}",
         )
 
+    # ========================================================================
+    # GROUP MESSAGE HANDLING
+    # ========================================================================
+    group_id_str = body.envelope.get("group_id")
+    if group_id_str:
+        return await _handle_group_forward(
+            envelope=body.envelope,
+            db=db,
+            redis=redis,
+            settings=settings,
+        )
+
+    # ========================================================================
+    # DM HANDLING (existing path)
+    # ========================================================================
     # 4. Recipient must be on this relay — look up by pubkey
     try:
         recipient_pubkey = bytes.fromhex(body.envelope["to"])
@@ -311,6 +337,205 @@ async def forward(
         hard_ceiling_seconds=settings.message_ttl_hard_seconds,
     )
 
+    return ForwardResponse(accepted=True, envelope_id=envelope_id)
+
+
+async def _handle_group_forward(
+    envelope: dict,
+    db,
+    redis,
+    settings,
+) -> "ForwardResponse":
+    """
+    Group message arrived via federation. Two sub-modes:
+
+      to_host:  sender's relay shipping the original signed envelope to
+                us because we host this group. We do the real fan-out.
+
+      deliver:  group host telling us to enqueue this envelope for a
+                specific subset of members that live on this relay.
+
+    Any other / missing mode → 400.
+    """
+    # Late import to avoid circular: groups.py imports from queue,
+    # and we already import enqueue helpers from queue here.
+    from .groups import compute_group_envelope_id, do_group_fanout, _is_member
+
+    mode = envelope.get("group_forward_mode")
+    group_id_str = envelope.get("group_id")
+
+    if mode not in ("to_host", "deliver"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="unknown_or_missing_group_forward_mode",
+        )
+
+    try:
+        gid = uuid.UUID(group_id_str)
+    except (ValueError, TypeError):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="malformed_group_id",
+        )
+
+    try:
+        sender_pubkey = bytes.fromhex(envelope["from"])
+    except (ValueError, KeyError):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="malformed_envelope_from",
+        )
+
+    try:
+        ts = int(envelope["ts"])
+        ttl = int(envelope["ttl"])
+        blob_b64 = envelope["blob"]
+        sig_hex = envelope["sig"]
+    except (KeyError, TypeError, ValueError):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="malformed_envelope_fields",
+        )
+
+    try:
+        blob_bytes = base64.b64decode(blob_b64, validate=True)
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="blob_not_base64",
+        )
+    if len(blob_bytes) > settings.max_blob_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail="blob_too_large",
+        )
+
+    envelope_id = compute_group_envelope_id(
+        sender_pubkey, gid.bytes, ts, blob_bytes,
+    )
+
+    # Cross-hop dedup: if we've already seen this envelope, ack and bail.
+    if await envelope_exists(redis, envelope_id):
+        return ForwardResponse(
+            accepted=True, envelope_id=envelope_id,
+            reason="duplicate_already_processed",
+        )
+
+    if mode == "to_host":
+        # Load the group; we must be its host.
+        stmt = (
+            select(Group)
+            .options(selectinload(Group.members))
+            .where(Group.id == gid)
+            .where(Group.deleted_at.is_(None))
+        )
+        group = (await db.execute(stmt)).scalar_one_or_none()
+        if group is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="group_not_found",
+            )
+
+        group_home = group.home_relay or settings.relay_name
+        if group_home != settings.relay_name:
+            # Forwarder picked the wrong relay; we won't relay further to
+            # avoid loops. They should consult /federation/users/lookup
+            # or maintain group_home metadata.
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="not_group_host",
+            )
+
+        if not _is_member(group, sender_pubkey):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="sender_not_a_member",
+            )
+
+        await blob_storage.write_blob(envelope_id, blob_bytes)
+
+        # Use whatever sender_username the forwarder supplied; we don't
+        # re-resolve from our DB because the user may not exist locally.
+        envelope_for_fanout = {
+            "from": envelope["from"],
+            "to": str(gid),
+            "ts": ts,
+            "ttl": ttl,
+            "blob": blob_b64,
+            "sig": sig_hex,
+            "from_username": envelope.get("from_username"),
+        }
+        local_count, remote_relay_count = await do_group_fanout(
+            group=group,
+            envelope=envelope_for_fanout,
+            envelope_id=envelope_id,
+            db=db,
+            redis=redis,
+        )
+        logger.info(
+            "Group forward to_host %s: local=%d remote_relays=%d",
+            envelope_id[:8], local_count, remote_relay_count,
+        )
+        return ForwardResponse(accepted=True, envelope_id=envelope_id)
+
+    # mode == "deliver"
+    raw_recipients = envelope.get("deliver_to_pubkeys") or []
+    if not isinstance(raw_recipients, list) or not raw_recipients:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="missing_deliver_to_pubkeys",
+        )
+
+    # Sanity: every recipient must be a real local user.
+    recipient_bytes: list[bytes] = []
+    for pk in raw_recipients:
+        if not isinstance(pk, str) or len(pk) != 64:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="malformed_deliver_pubkey",
+            )
+        try:
+            recipient_bytes.append(bytes.fromhex(pk))
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="malformed_deliver_pubkey",
+            )
+
+    stmt = (
+        select(User.pubkey, User.home_relay)
+        .where(User.pubkey.in_(recipient_bytes))
+        .where(User.deleted_at.is_(None))
+    )
+    rows = (await db.execute(stmt)).all()
+    known_local: list[str] = []
+    for pk, hr in rows:
+        if hr == settings.relay_name:
+            known_local.append(bytes(pk).hex())
+
+    if not known_local:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="no_local_recipients_in_deliver_list",
+        )
+
+    await blob_storage.write_blob(envelope_id, blob_bytes)
+    await enqueue_envelope_for_recipients(
+        redis=redis,
+        envelope_id=envelope_id,
+        sender_pubkey_hex=envelope["from"],
+        recipient_pubkeys_hex=known_local,
+        timestamp=ts,
+        ttl_seconds=ttl,
+        signature_hex=sig_hex,
+        hard_ceiling_seconds=settings.message_ttl_hard_seconds,
+        group_id=str(gid),
+        sender_username=envelope.get("from_username"),
+    )
+    logger.info(
+        "Group forward deliver %s: enqueued for %d local recipients",
+        envelope_id[:8], len(known_local),
+    )
     return ForwardResponse(accepted=True, envelope_id=envelope_id)
 
 
