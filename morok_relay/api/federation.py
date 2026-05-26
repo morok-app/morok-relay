@@ -276,11 +276,45 @@ async def forward(
     group_id_str = body.envelope.get("group_id")
     if group_id_str:
         # Inner envelope is a real signed message — verify sender sig.
-        ok, err = crypto.verify_envelope_signature(body.envelope)
-        if not ok:
+        # NOTE: we can't use crypto.verify_envelope_signature here because
+        # for group envelopes `to` is a UUID (group_id), not a pubkey hex.
+        # That function tries to bytes.fromhex(to) and fails on the dashes.
+        try:
+            inner_sender = bytes.fromhex(body.envelope["from"])
+            inner_sig = bytes.fromhex(body.envelope["sig"])
+        except (ValueError, KeyError, TypeError) as e:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"inner_envelope_invalid: {err}",
+                detail=f"malformed_envelope_fields: {e}",
+            )
+        if len(inner_sender) != 32 or len(inner_sig) != 64:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="bad_inner_pubkey_or_sig_length",
+            )
+        # Timestamp sanity (same window as DM)
+        try:
+            inner_ts = int(body.envelope["ts"])
+        except (KeyError, ValueError, TypeError):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="malformed_ts",
+            )
+        if inner_ts < now - 300 or inner_ts > now + 60:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="inner_envelope_timestamp_out_of_window",
+            )
+        unsigned = {
+            k: body.envelope[k]
+            for k in ("from", "to", "ts", "ttl", "blob")
+            if k in body.envelope
+        }
+        canonical = crypto.canonical_json(unsigned)
+        if not crypto.ed25519_verify(canonical, inner_sig, inner_sender):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="inner_envelope_invalid: signature_invalid",
             )
         return await _handle_group_forward(
             envelope=body.envelope,
