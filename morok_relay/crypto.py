@@ -319,8 +319,13 @@ def verify_envelope_signature(
     if timestamp > now + max_future_seconds:
         return False, "envelope from the future"
 
-    # Signature check
-    unsigned = {k: envelope[k] for k in envelope if k != "sig"}
+    # Signature check.
+    # IMPORTANT: client signs over exactly these 5 canonical fields.
+    # Federation relays often add metadata (from_username, group_id,
+    # group_forward_mode, deliver_to_pubkeys, kind, ...) — those must
+    # NOT be included in the signed message or verification will fail.
+    SIGNED_FIELDS = ("from", "to", "ts", "ttl", "blob")
+    unsigned = {k: envelope[k] for k in SIGNED_FIELDS if k in envelope}
     message = canonical_json(unsigned)
     if not ed25519_verify(message, signature, sender):
         return False, "signature invalid"
