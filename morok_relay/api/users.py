@@ -158,6 +158,25 @@ async def _cache_remote_user(
     stmt = select(User).where(User.pubkey == pubkey_bytes)
     existing = (await db.execute(stmt)).scalar_one_or_none()
     if existing is not None:
+        # Federation lookup is authoritative about home_relay. Records
+        # auto-created at login time may have a stale home_relay (set to
+        # our own relay before we knew where this pubkey actually lives).
+        # When a lookup tells us "this user actually lives on relay X",
+        # we trust it and overwrite. Without this, cross-relay routing
+        # never kicks in for users who ever touched this relay's auth.
+        updated = False
+        if existing.home_relay != home_relay:
+            logger.info(
+                "Correcting home_relay for %s...: %s -> %s",
+                pubkey_hex[:8], existing.home_relay, home_relay,
+            )
+            existing.home_relay = home_relay
+            updated = True
+        if username and not existing.username:
+            existing.username = username
+            updated = True
+        if updated:
+            await db.flush()
         return existing
 
     user = User(
