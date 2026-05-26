@@ -374,7 +374,8 @@ async def delete_dm_message(
                 "recipient_pubkey_hex": body.recipient_pubkey_hex,
                 "deleted_by_pubkey_hex": current.pubkey_hex,
             }
-            synthetic_id = f"dmdel-{envelope_id}"
+            from .groups import _synthetic_queue_id
+            synthetic_id = _synthetic_queue_id("dmdel", envelope_id, target_relay)
             dup_stmt = (
                 select(FederationOutboundQueue)
                 .where(FederationOutboundQueue.envelope_id == synthetic_id)

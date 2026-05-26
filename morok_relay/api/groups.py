@@ -451,6 +451,28 @@ def compute_group_envelope_id(
     return h.hexdigest()
 
 
+def _synthetic_queue_id(prefix: str, *parts: str) -> str:
+    """
+    Deterministic, dedup-friendly synthetic envelope_id for control-plane
+    federation rows (snapshots, deletes). Result fits the 64-char column.
+
+    The prefix is a short tag (e.g. "snap", "del", "dmdel") so the row
+    is identifiable in DB inspection; the hash of all parts ensures
+    repeats with the same intent dedupe naturally.
+    """
+    import hashlib
+    h = hashlib.sha256()
+    for p in parts:
+        h.update(p.encode("utf-8"))
+        h.update(b"\x00")
+    digest = h.hexdigest()
+    max_hash_len = 64 - len(prefix) - 1
+    if max_hash_len <= 0:
+        # Prefix too long; fall back to pure hash.
+        return digest[:64]
+    return f"{prefix}-{digest[:max_hash_len]}"
+
+
 def _serialize_group_for_snapshot(group: Group) -> dict:
     """
     Turn a Group ORM row (with members loaded) into the JSON payload
@@ -500,13 +522,15 @@ async def enqueue_snapshot_to_relays(
         return 0
     payload = _serialize_group_for_snapshot(group)
     now = int(time.time())
-    queue_id_base = f"snap-{group.id.hex}-{now}"
     pushed = 0
     for target in target_relays:
         if target == settings.relay_name:
             continue
+        # snapshot can repeat per add_member; include `now` so each call
+        # gets a fresh row instead of dedup'ing with previous snapshots.
+        sid = _synthetic_queue_id("snap", str(group.id), str(now), target)
         db.add(FederationOutboundQueue(
-            envelope_id=f"{queue_id_base}-{target}",
+            envelope_id=sid,
             envelope_data=payload,
             target_relay=target,
             status=FedQueueStatus.PENDING,
@@ -900,7 +924,7 @@ async def delete_group_message(
             "envelope_id": envelope_id,
             "deleted_by_pubkey_hex": current.pubkey_hex,
         }
-        synthetic_id = f"del-{envelope_id}"
+        synthetic_id = _synthetic_queue_id("del", envelope_id, home)
         dup_stmt = (
             select(FederationOutboundQueue)
             .where(FederationOutboundQueue.envelope_id == synthetic_id)
@@ -999,7 +1023,7 @@ async def delete_group_message(
             "deleted_by_pubkey_hex": current.pubkey_hex,
             "deliver_to_pubkeys": members_on_relay,
         }
-        synthetic_id = f"deldlv-{envelope_id}-{target_relay}"
+        synthetic_id = _synthetic_queue_id("deldlv", envelope_id, target_relay)
         dup_stmt = (
             select(FederationOutboundQueue)
             .where(FederationOutboundQueue.envelope_id == synthetic_id)

@@ -779,7 +779,8 @@ async def _handle_group_delete_to_host(
             "deleted_by_pubkey_hex": caller_pubkey_hex,
             "deliver_to_pubkeys": members_on_relay,
         }
-        synthetic_id = f"deldlv-{envelope_id}-{target_relay}"
+        from .groups import _synthetic_queue_id
+        synthetic_id = _synthetic_queue_id("deldlv", envelope_id, target_relay)
         dup_stmt = (
             select(FederationOutboundQueue)
             .where(FederationOutboundQueue.envelope_id == synthetic_id)
