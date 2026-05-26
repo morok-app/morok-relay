@@ -253,19 +253,35 @@ async def forward(
             detail="forwarding_relay_unknown_handshake_first",
         )
 
-    # 3. Verify the inner envelope (original sender's signature)
-    ok, err = crypto.verify_envelope_signature(body.envelope)
-    if not ok:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"inner_envelope_invalid: {err}",
-        )
+    # ========================================================================
+    # KIND-BASED DISPATCH (cross-relay group/DM control plane)
+    # ========================================================================
+    kind = body.envelope.get("kind")
+
+    if kind == "group_snapshot":
+        return await _handle_group_snapshot_push(body.envelope, db)
+
+    if kind == "dm_delete":
+        return await _handle_dm_delete_forward(body.envelope, redis)
+
+    if kind == "group_delete_to_host":
+        return await _handle_group_delete_to_host(body.envelope, db, redis, settings)
+
+    if kind == "group_delete_deliver":
+        return await _handle_group_delete_deliver(body.envelope, db, redis, settings)
 
     # ========================================================================
-    # GROUP MESSAGE HANDLING
+    # GROUP MESSAGE SEND HANDLING (existing — to_host / deliver)
     # ========================================================================
     group_id_str = body.envelope.get("group_id")
     if group_id_str:
+        # Inner envelope is a real signed message — verify sender sig.
+        ok, err = crypto.verify_envelope_signature(body.envelope)
+        if not ok:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"inner_envelope_invalid: {err}",
+            )
         return await _handle_group_forward(
             envelope=body.envelope,
             db=db,
@@ -276,6 +292,14 @@ async def forward(
     # ========================================================================
     # DM HANDLING (existing path)
     # ========================================================================
+    # DM also needs the inner signature verified.
+    ok, err = crypto.verify_envelope_signature(body.envelope)
+    if not ok:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"inner_envelope_invalid: {err}",
+        )
+
     # 4. Recipient must be on this relay — look up by pubkey
     try:
         recipient_pubkey = bytes.fromhex(body.envelope["to"])
@@ -573,3 +597,383 @@ async def federation_lookup(
         "username": user.username,
         "home_relay": user.home_relay,
     }
+
+
+# ============================================================================
+# CROSS-RELAY CONTROL-PLANE HANDLERS (group snapshot push/pull, deletes)
+# ============================================================================
+
+async def _handle_group_snapshot_push(envelope: dict, db) -> "ForwardResponse":
+    """
+    Peer relay pushed us a snapshot of a group we should mirror locally
+    (because we host members of it). Idempotent upsert.
+    """
+    from .groups import apply_group_snapshot
+
+    try:
+        await apply_group_snapshot(db, envelope)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("apply_group_snapshot failed: %s", e)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"snapshot_apply_failed: {type(e).__name__}",
+        )
+    return ForwardResponse(
+        accepted=True,
+        envelope_id=envelope.get("group_id", ""),
+        reason="snapshot_applied",
+    )
+
+
+async def _handle_dm_delete_forward(envelope: dict, redis) -> "ForwardResponse":
+    """
+    Sender's home relay tells us a DM addressed to one of our local
+    users should be deleted. We perform the same Redis cleanup as
+    delete_envelope_by_sender would have, including the "deleted"
+    WS event push.
+
+    Authentication of the original sender already happened on their
+    home relay; we trust the federation hop.
+    """
+    from ..queue import delete_envelope_by_sender
+
+    envelope_id = envelope.get("envelope_id")
+    recipient_pubkey_hex = envelope.get("recipient_pubkey_hex")
+    caller_pubkey_hex = envelope.get("deleted_by_pubkey_hex")
+
+    if not (envelope_id and recipient_pubkey_hex and caller_pubkey_hex):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="dm_delete_missing_fields",
+        )
+
+    result = await delete_envelope_by_sender(
+        redis=redis,
+        envelope_id=envelope_id,
+        caller_pubkey_hex=caller_pubkey_hex,
+        recipient_pubkey_hex=recipient_pubkey_hex,
+    )
+    logger.info(
+        "Federation dm_delete %s by %s... (queue_hit=%s, meta=%s, err=%s)",
+        envelope_id[:8] if envelope_id else "?",
+        caller_pubkey_hex[:8] if caller_pubkey_hex else "?",
+        result.get("deleted_from_queue"),
+        result.get("meta_existed"),
+        result.get("error"),
+    )
+    return ForwardResponse(
+        accepted=True,
+        envelope_id=envelope_id,
+        reason=result.get("error") or "dm_delete_done",
+    )
+
+
+async def _handle_group_delete_to_host(
+    envelope: dict, db, redis, settings,
+) -> "ForwardResponse":
+    """
+    Peer relay forwarded us a group-delete request from one of their
+    users. We're the host → authorize via meta (sender) OR admin →
+    perform the full fan-out delete (local + federation to peers).
+    """
+    from .groups import (
+        _find_admin, _is_member, _load_group, _group_home_relay,
+    )
+    from ..queue import delete_envelope_for_group, get_envelope_meta
+
+    envelope_id = envelope.get("envelope_id")
+    group_id_str = envelope.get("group_id")
+    caller_pubkey_hex = envelope.get("deleted_by_pubkey_hex")
+
+    if not (envelope_id and group_id_str and caller_pubkey_hex):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="group_delete_to_host_missing_fields",
+        )
+    try:
+        gid = uuid.UUID(group_id_str)
+        caller_bytes = bytes.fromhex(caller_pubkey_hex)
+    except (ValueError, TypeError):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="malformed_id_or_pubkey",
+        )
+
+    group = await _load_group(db, gid)
+
+    home = _group_home_relay(group)
+    if home != settings.relay_name:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="not_group_host",
+        )
+
+    if not _is_member(group, caller_bytes):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="caller_not_a_member",
+        )
+
+    meta = await get_envelope_meta(redis, envelope_id)
+    sender_pubkey_hex = None
+    if meta is not None:
+        if meta.get("group_id") != str(group.id):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="envelope_not_in_this_group",
+            )
+        sender_pubkey_hex = meta.get("from")
+    is_sender = (
+        sender_pubkey_hex is not None
+        and sender_pubkey_hex == caller_pubkey_hex
+    )
+    admin_member = _find_admin(group)
+    is_admin = admin_member is not None and admin_member.pubkey == caller_bytes
+    if not (is_sender or is_admin):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="must_be_sender_or_admin",
+        )
+
+    # Same split-by-home-relay logic as delete_group_message host case.
+    from ..models import FederationOutboundQueue, FedQueueStatus, User
+    member_pubkeys_bytes = [m.pubkey for m in group.members]
+    home_by_pubkey_hex: dict[str, str | None] = {}
+    if member_pubkeys_bytes:
+        stmt = (
+            select(User.pubkey, User.home_relay)
+            .where(User.pubkey.in_(member_pubkeys_bytes))
+            .where(User.deleted_at.is_(None))
+        )
+        rows = (await db.execute(stmt)).all()
+        for pk, hr in rows:
+            home_by_pubkey_hex[bytes(pk).hex()] = hr
+
+    local_recipients: list[str] = []
+    remote_by_relay: dict[str, list[str]] = {}
+    for m in group.members:
+        pk_hex = m.pubkey.hex()
+        h = home_by_pubkey_hex.get(pk_hex)
+        if h is None or h == settings.relay_name:
+            local_recipients.append(pk_hex)
+        else:
+            remote_by_relay.setdefault(h, []).append(pk_hex)
+
+    await delete_envelope_for_group(
+        redis=redis,
+        envelope_id=envelope_id,
+        group_id=str(group.id),
+        recipient_pubkeys_hex=local_recipients,
+        deleted_by_pubkey_hex=caller_pubkey_hex,
+    )
+
+    import time as _t
+    now = int(_t.time())
+    for target_relay, members_on_relay in remote_by_relay.items():
+        deliver_payload = {
+            "kind": "group_delete_deliver",
+            "group_id": str(group.id),
+            "envelope_id": envelope_id,
+            "deleted_by_pubkey_hex": caller_pubkey_hex,
+            "deliver_to_pubkeys": members_on_relay,
+        }
+        synthetic_id = f"deldlv-{envelope_id}-{target_relay}"
+        dup_stmt = (
+            select(FederationOutboundQueue)
+            .where(FederationOutboundQueue.envelope_id == synthetic_id)
+            .where(FederationOutboundQueue.target_relay == target_relay)
+            .limit(1)
+        )
+        existing = (await db.execute(dup_stmt)).scalar_one_or_none()
+        if existing is None:
+            db.add(FederationOutboundQueue(
+                envelope_id=synthetic_id,
+                envelope_data=deliver_payload,
+                target_relay=target_relay,
+                status=FedQueueStatus.PENDING,
+                attempts=0,
+                next_attempt_at=now,
+                created_at=now,
+            ))
+    if remote_by_relay:
+        await db.flush()
+
+    logger.info(
+        "Federation group_delete_to_host %s by %s... applied (local=%d, remote_relays=%d)",
+        envelope_id[:8], caller_pubkey_hex[:8],
+        len(local_recipients), len(remote_by_relay),
+    )
+    return ForwardResponse(accepted=True, envelope_id=envelope_id)
+
+
+async def _handle_group_delete_deliver(
+    envelope: dict, db, redis, settings,
+) -> "ForwardResponse":
+    """
+    Host relay tells us: drop this group envelope from these specific
+    local member inboxes and push a "deleted" WS event to each.
+    """
+    from ..queue import delete_envelope_for_group
+    from ..models import User
+
+    envelope_id = envelope.get("envelope_id")
+    group_id_str = envelope.get("group_id")
+    caller_pubkey_hex = envelope.get("deleted_by_pubkey_hex")
+    raw_recipients = envelope.get("deliver_to_pubkeys") or []
+
+    if not (envelope_id and group_id_str and caller_pubkey_hex and raw_recipients):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="group_delete_deliver_missing_fields",
+        )
+
+    recipient_bytes: list[bytes] = []
+    for pk in raw_recipients:
+        if not isinstance(pk, str) or len(pk) != 64:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="malformed_deliver_pubkey",
+            )
+        try:
+            recipient_bytes.append(bytes.fromhex(pk))
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="malformed_deliver_pubkey",
+            )
+
+    # Filter to actually-local users (defensive)
+    stmt = (
+        select(User.pubkey, User.home_relay)
+        .where(User.pubkey.in_(recipient_bytes))
+        .where(User.deleted_at.is_(None))
+    )
+    rows = (await db.execute(stmt)).all()
+    known_local = [
+        bytes(pk).hex() for pk, hr in rows
+        if hr == settings.relay_name
+    ]
+    if not known_local:
+        # All requested pubkeys are unknown or non-local — nothing to do.
+        return ForwardResponse(
+            accepted=True, envelope_id=envelope_id,
+            reason="no_local_recipients",
+        )
+
+    result = await delete_envelope_for_group(
+        redis=redis,
+        envelope_id=envelope_id,
+        group_id=group_id_str,
+        recipient_pubkeys_hex=known_local,
+        deleted_by_pubkey_hex=caller_pubkey_hex,
+    )
+    logger.info(
+        "Federation group_delete_deliver %s for %d local recipients (hits=%d)",
+        envelope_id[:8], len(known_local), result["deleted_from_count"],
+    )
+    return ForwardResponse(accepted=True, envelope_id=envelope_id)
+
+
+# ============================================================================
+# PULL SNAPSHOT (peer requests current group state from host)
+# ============================================================================
+
+class PullSnapshotRequest(BaseModel):
+    group_id: str = Field(..., min_length=36, max_length=36)
+    caller_pubkey_hex: str = Field(..., pattern=r"^[0-9a-f]{64}$")
+    relay_pubkey_hex: str = Field(..., pattern=r"^[0-9a-f]{64}$")
+    relay_signature_hex: str = Field(..., pattern=r"^[0-9a-f]{128}$")
+    timestamp: int = Field(..., ge=0)
+
+
+@router.post(
+    "/group_snapshot/pull",
+    summary="Peer pulls a group snapshot from us (we're the host)",
+)
+async def pull_group_snapshot(
+    body: PullSnapshotRequest,
+    db: DBSession,
+) -> dict:
+    """
+    Peer relay calls this to fetch a group's current state. Required
+    because peer-side users may receive a group_key DM before any push
+    snapshot landed (e.g., legacy data, or invite-token join flow).
+
+    Auth:
+      1. Peer relay signs (group_id, caller_pubkey, our_pubkey, ts).
+      2. We verify the signature against a known peer in federation_peers.
+      3. The caller_pubkey MUST be a member of the requested group, or
+         we 404 — prevents peer-relay enumeration of groups.
+    """
+    from .groups import _serialize_group_for_snapshot, _is_member
+    settings = get_settings()
+    now = int(time.time())
+
+    if abs(now - body.timestamp) > 300:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="timestamp_out_of_window",
+        )
+
+    try:
+        relay_pubkey = bytes.fromhex(body.relay_pubkey_hex)
+        relay_sig = bytes.fromhex(body.relay_signature_hex)
+        gid = uuid.UUID(body.group_id)
+        caller_bytes = bytes.fromhex(body.caller_pubkey_hex)
+    except (ValueError, TypeError):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="malformed_hex_or_uuid",
+        )
+
+    message = crypto.canonical_json({
+        "morok_pull_snapshot": "v1",
+        "group_id": body.group_id,
+        "caller_pubkey": body.caller_pubkey_hex,
+        "relay_pubkey": body.relay_pubkey_hex,
+        "timestamp": body.timestamp,
+    })
+    if not crypto.ed25519_verify(message, relay_sig, relay_pubkey):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="relay_signature_invalid",
+        )
+
+    peer_stmt = select(FederationPeer).where(FederationPeer.pubkey == relay_pubkey)
+    peer = (await db.execute(peer_stmt)).scalar_one_or_none()
+    if peer is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="relay_unknown_handshake_first",
+        )
+
+    stmt = (
+        select(Group)
+        .options(selectinload(Group.members))
+        .where(Group.id == gid)
+        .where(Group.deleted_at.is_(None))
+    )
+    group = (await db.execute(stmt)).scalar_one_or_none()
+    if group is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="group_not_found",
+        )
+
+    home = group.home_relay or settings.relay_name
+    if home != settings.relay_name:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="group_not_hosted_here",
+        )
+
+    if not _is_member(group, caller_bytes):
+        # Don't reveal that group exists — 404 like above.
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="group_not_found",
+        )
+
+    return _serialize_group_for_snapshot(group)

@@ -324,6 +324,18 @@ async def add_member(
     ))
     await db.flush()
     await db.refresh(group, attribute_names=["members"])
+
+    # Push fresh snapshot to every peer relay that hosts at least one
+    # member (including the newly added one). Worker delivers async.
+    member_bytes = [m.pubkey for m in group.members]
+    peer_relays = await _peer_relays_for_members(db, member_bytes)
+    if peer_relays:
+        await enqueue_snapshot_to_relays(db, group, peer_relays)
+        logger.info(
+            "Group %s: snapshot queued to %d peer relay(s) after add_member",
+            group.id, len(peer_relays),
+        )
+
     return GroupMembershipChange(
         group_id=str(group.id),
         member_pubkey_hex=body.pubkey_hex,
@@ -368,9 +380,22 @@ async def remove_member(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="not_a_member",
         )
+    # Capture peer relays BEFORE removing — so a relay losing its last
+    # local member also gets the final snapshot (member_count drops).
+    member_bytes_before = [m.pubkey for m in group.members]
+    peer_relays = await _peer_relays_for_members(db, member_bytes_before)
+
     await db.delete(target_member)
     await db.flush()
     await db.refresh(group, attribute_names=["members"])
+
+    if peer_relays:
+        await enqueue_snapshot_to_relays(db, group, peer_relays)
+        logger.info(
+            "Group %s: snapshot queued to %d peer relay(s) after remove_member",
+            group.id, len(peer_relays),
+        )
+
     return GroupMembershipChange(
         group_id=str(group.id),
         member_pubkey_hex=pubkey_hex,
@@ -424,6 +449,95 @@ def compute_group_envelope_id(
     h.update(timestamp.to_bytes(8, "big"))
     h.update(hashlib.sha256(blob_bytes).digest())
     return h.hexdigest()
+
+
+def _serialize_group_for_snapshot(group: Group) -> dict:
+    """
+    Turn a Group ORM row (with members loaded) into the JSON payload
+    that peer relays expect on /forward with kind='group_snapshot'.
+    """
+    return {
+        "kind": "group_snapshot",
+        "group_id": str(group.id),
+        "creator_pubkey_hex": group.creator_pubkey.hex(),
+        "name_encrypted_b64": base64.b64encode(group.name_encrypted).decode("ascii"),
+        "is_channel": group.is_channel,
+        "default_ttl_seconds": group.default_ttl_seconds,
+        "slug": group.slug,
+        "expires_at": group.expires_at,
+        "anonymous_senders": group.anonymous_senders,
+        "max_members": group.max_members,
+        "home_relay": group.home_relay or get_settings().relay_name,
+        "members": [
+            {
+                "pubkey_hex": m.pubkey.hex(),
+                "is_admin": m.is_admin,
+                "joined_at": m.joined_at,
+            }
+            for m in group.members
+        ],
+        "snapshotted_at": int(time.time()),
+    }
+
+
+async def enqueue_snapshot_to_relays(
+    db,
+    group: Group,
+    target_relays: set[str],
+) -> int:
+    """
+    Push the current group snapshot into federation_outbound_queue for
+    each target_relay in the set. Worker will deliver to peer's /forward
+    where the kind='group_snapshot' branch upserts the shadow row.
+
+    Uses an envelope_id derived from group_id + version-ish marker so
+    repeated snapshots for the same group can be re-queued (dedup is
+    target_relay-scoped via DB unique check only if we add one; for now
+    multiple pending snapshots are tolerated — the latest wins on apply).
+    """
+    settings = get_settings()
+    if not target_relays:
+        return 0
+    payload = _serialize_group_for_snapshot(group)
+    now = int(time.time())
+    queue_id_base = f"snap-{group.id.hex}-{now}"
+    pushed = 0
+    for target in target_relays:
+        if target == settings.relay_name:
+            continue
+        db.add(FederationOutboundQueue(
+            envelope_id=f"{queue_id_base}-{target}",
+            envelope_data=payload,
+            target_relay=target,
+            status=FedQueueStatus.PENDING,
+            attempts=0,
+            next_attempt_at=now,
+            created_at=now,
+        ))
+        pushed += 1
+    if pushed:
+        await db.flush()
+    return pushed
+
+
+async def _peer_relays_for_members(
+    db,
+    member_pubkeys_bytes: list[bytes],
+) -> set[str]:
+    """Return the set of OTHER relays that host any of the given members."""
+    settings = get_settings()
+    if not member_pubkeys_bytes:
+        return set()
+    stmt = (
+        select(User.home_relay)
+        .where(User.pubkey.in_(member_pubkeys_bytes))
+        .where(User.deleted_at.is_(None))
+    )
+    rows = (await db.execute(stmt)).all()
+    return {
+        hr for (hr,) in rows
+        if hr and hr != settings.relay_name
+    }
 
 
 async def do_group_fanout(
@@ -764,6 +878,7 @@ async def delete_group_message(
     gid = _parse_group_id(group_id)
     group = await _load_group(db, gid)
     caller = bytes.fromhex(current.pubkey_hex)
+    settings = get_settings()
 
     if not _is_member(group, caller):
         raise HTTPException(
@@ -771,8 +886,54 @@ async def delete_group_message(
             detail="not_a_member",
         )
 
-    meta = await get_envelope_meta(redis, envelope_id)
+    home = _group_home_relay(group)
 
+    # ------------------------------------------------------------------
+    # Case A: I'm NOT the host → forward the delete request to the host.
+    # The host does the real authorization (sender or admin) and the
+    # actual fan-out of "deleted" events.
+    # ------------------------------------------------------------------
+    if home != settings.relay_name:
+        delete_payload = {
+            "kind": "group_delete_to_host",
+            "group_id": str(group.id),
+            "envelope_id": envelope_id,
+            "deleted_by_pubkey_hex": current.pubkey_hex,
+        }
+        synthetic_id = f"del-{envelope_id}"
+        dup_stmt = (
+            select(FederationOutboundQueue)
+            .where(FederationOutboundQueue.envelope_id == synthetic_id)
+            .where(FederationOutboundQueue.target_relay == home)
+            .limit(1)
+        )
+        existing = (await db.execute(dup_stmt)).scalar_one_or_none()
+        if existing is None:
+            now = int(time.time())
+            db.add(FederationOutboundQueue(
+                envelope_id=synthetic_id,
+                envelope_data=delete_payload,
+                target_relay=home,
+                status=FedQueueStatus.PENDING,
+                attempts=0,
+                next_attempt_at=now,
+                created_at=now,
+            ))
+            await db.flush()
+        logger.info(
+            "Forwarding group delete %s... to host %s",
+            envelope_id[:8], home,
+        )
+        return {
+            "deleted": True,
+            "envelope_id": envelope_id,
+            "forwarded_to_host": home,
+        }
+
+    # ------------------------------------------------------------------
+    # Case B: I AM the host. Authorize via meta (sender) or admin.
+    # ------------------------------------------------------------------
+    meta = await get_envelope_meta(redis, envelope_id)
     sender_pubkey_hex: str | None = None
     if meta is not None:
         if meta.get("group_id") != str(group.id):
@@ -795,20 +956,74 @@ async def delete_group_message(
             detail="must_be_sender_or_admin",
         )
 
-    recipient_pubkeys_hex = [m.pubkey.hex() for m in group.members]
+    # Split members by home_relay (same pattern as do_group_fanout).
+    member_pubkeys_bytes = [m.pubkey for m in group.members]
+    home_by_pubkey_hex: dict[str, str | None] = {}
+    if member_pubkeys_bytes:
+        stmt = (
+            select(User.pubkey, User.home_relay)
+            .where(User.pubkey.in_(member_pubkeys_bytes))
+            .where(User.deleted_at.is_(None))
+        )
+        rows = (await db.execute(stmt)).all()
+        for pk, hr in rows:
+            home_by_pubkey_hex[bytes(pk).hex()] = hr
 
+    local_recipients: list[str] = []
+    remote_by_relay: dict[str, list[str]] = {}
+    for m in group.members:
+        pk_hex = m.pubkey.hex()
+        h = home_by_pubkey_hex.get(pk_hex)
+        if h is None or h == settings.relay_name:
+            local_recipients.append(pk_hex)
+        else:
+            remote_by_relay.setdefault(h, []).append(pk_hex)
+
+    # Local fan-out delete
     result = await delete_envelope_for_group(
         redis=redis,
         envelope_id=envelope_id,
         group_id=str(group.id),
-        recipient_pubkeys_hex=recipient_pubkeys_hex,
+        recipient_pubkeys_hex=local_recipients,
         deleted_by_pubkey_hex=current.pubkey_hex,
     )
 
+    # Federation: per remote relay, tell it which local-to-it members
+    # should drop this envelope.
+    now = int(time.time())
+    for target_relay, members_on_relay in remote_by_relay.items():
+        deliver_payload = {
+            "kind": "group_delete_deliver",
+            "group_id": str(group.id),
+            "envelope_id": envelope_id,
+            "deleted_by_pubkey_hex": current.pubkey_hex,
+            "deliver_to_pubkeys": members_on_relay,
+        }
+        synthetic_id = f"deldlv-{envelope_id}-{target_relay}"
+        dup_stmt = (
+            select(FederationOutboundQueue)
+            .where(FederationOutboundQueue.envelope_id == synthetic_id)
+            .where(FederationOutboundQueue.target_relay == target_relay)
+            .limit(1)
+        )
+        existing = (await db.execute(dup_stmt)).scalar_one_or_none()
+        if existing is None:
+            db.add(FederationOutboundQueue(
+                envelope_id=synthetic_id,
+                envelope_data=deliver_payload,
+                target_relay=target_relay,
+                status=FedQueueStatus.PENDING,
+                attempts=0,
+                next_attempt_at=now,
+                created_at=now,
+            ))
+    if remote_by_relay:
+        await db.flush()
+
     logger.info(
-        "Group %s msg %s... deleted by %s... (sender=%s, admin=%s)",
+        "Group %s msg %s... deleted by %s (sender=%s, admin=%s), local=%d remote_relays=%d",
         group_id, envelope_id[:8], current.pubkey_hex[:8],
-        is_sender, is_admin,
+        is_sender, is_admin, len(local_recipients), len(remote_by_relay),
     )
 
     return {
@@ -817,6 +1032,7 @@ async def delete_group_message(
         "deleted_from_count": result["deleted_from_count"],
         "broadcast_to": result["broadcast_to"],
         "meta_existed": result["meta_existed"],
+        "federated_to_relays": len(remote_by_relay),
     }
 
 
@@ -1010,3 +1226,164 @@ async def join_via_token(
         joined=True,
         member_count=len(group.members),
     )
+
+
+# ============================================================================
+# CROSS-RELAY GROUP SYNC (on-demand fetch from host)
+# ============================================================================
+
+@router.post(
+    "/{group_id}/sync",
+    summary="Pull a group snapshot from its host relay (peer client triggers)",
+)
+async def sync_group_from_host(
+    group_id: str,
+    current: CurrentSession,
+    db: DBSession,
+    host_relay: str = Query(..., min_length=3, max_length=255,
+                             description="Host relay hostname where the group lives"),
+) -> dict:
+    """
+    Client-side trigger: peer relay reaches out to host relay and pulls
+    the current group snapshot, upserts it locally.
+
+    Used after a peer-side user gets a `group_key` DM from someone but
+    has no local row for the group yet (so /groups/{id} would 404). Once
+    synced, normal send/delete endpoints on this peer relay can run
+    because `_load_group` finds the shadow row.
+
+    Authentication: caller must be the eventually-included member — but
+    we can't verify that without already having the group. So we just
+    require an authenticated session (any logged-in user) and rate-limit.
+    The host relay returns 404 if the caller isn't a member of the
+    requested group, so we can't fetch arbitrary groups.
+    """
+    settings = get_settings()
+
+    if host_relay == settings.relay_name:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="host_is_self_no_sync_needed",
+        )
+
+    try:
+        gid = uuid.UUID(group_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="malformed_group_id",
+        )
+
+    from ..federation_client import remote_pull_group_snapshot
+    snapshot = await remote_pull_group_snapshot(
+        peer_hostname=host_relay,
+        group_id=str(gid),
+        caller_pubkey_hex=current.pubkey_hex,
+    )
+    if snapshot is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="snapshot_unavailable_from_host",
+        )
+
+    # Apply locally (idempotent upsert)
+    await apply_group_snapshot(db, snapshot)
+    await db.flush()
+
+    return {
+        "synced": True,
+        "group_id": str(gid),
+        "host_relay": host_relay,
+        "member_count": len(snapshot.get("members", [])),
+    }
+
+
+async def apply_group_snapshot(db, snapshot: dict) -> Group:
+    """
+    Idempotent upsert of a group + its members from a snapshot payload.
+    Called from /federation/forward (push direction) and /groups/{id}/sync
+    (pull direction).
+    """
+    try:
+        gid = uuid.UUID(snapshot["group_id"])
+        creator_bytes = bytes.fromhex(snapshot["creator_pubkey_hex"])
+        name_bytes = base64.b64decode(snapshot["name_encrypted_b64"], validate=True)
+    except (KeyError, ValueError, TypeError) as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"malformed_snapshot: {e}",
+        )
+
+    stmt = (
+        select(Group)
+        .options(selectinload(Group.members))
+        .where(Group.id == gid)
+    )
+    existing = (await db.execute(stmt)).scalar_one_or_none()
+
+    if existing is None:
+        group = Group(
+            id=gid,
+            creator_pubkey=creator_bytes,
+            name_encrypted=name_bytes,
+            is_channel=bool(snapshot.get("is_channel", False)),
+            default_ttl_seconds=int(snapshot.get("default_ttl_seconds", 86400)),
+            slug=snapshot.get("slug"),
+            expires_at=snapshot.get("expires_at"),
+            anonymous_senders=bool(snapshot.get("anonymous_senders", False)),
+            max_members=int(snapshot.get("max_members", 50)),
+            home_relay=snapshot.get("home_relay") or get_settings().relay_name,
+        )
+        db.add(group)
+        await db.flush()
+        # No members yet — they get added below.
+    else:
+        # Overwrite mutable fields. We never overwrite home_relay if it
+        # was set locally (defensive).
+        existing.is_channel = bool(snapshot.get("is_channel", existing.is_channel))
+        existing.default_ttl_seconds = int(
+            snapshot.get("default_ttl_seconds", existing.default_ttl_seconds)
+        )
+        existing.anonymous_senders = bool(
+            snapshot.get("anonymous_senders", existing.anonymous_senders)
+        )
+        existing.max_members = int(snapshot.get("max_members", existing.max_members))
+        if not existing.home_relay:
+            existing.home_relay = snapshot.get("home_relay") or get_settings().relay_name
+        group = existing
+
+    # Reconcile members. Members listed in snapshot are authoritative.
+    snap_pubkeys: dict[bytes, dict] = {}
+    for m in snapshot.get("members", []):
+        try:
+            pk = bytes.fromhex(m["pubkey_hex"])
+        except (KeyError, ValueError, TypeError):
+            continue
+        snap_pubkeys[pk] = m
+
+    # Fetch existing members
+    cur_stmt = select(GroupMember).where(GroupMember.group_id == group.id)
+    existing_members = list((await db.execute(cur_stmt)).scalars())
+    existing_by_pk = {m.pubkey: m for m in existing_members}
+
+    # Remove members no longer in snapshot
+    for pk, member in existing_by_pk.items():
+        if pk not in snap_pubkeys:
+            await db.delete(member)
+
+    # Add or update members from snapshot
+    for pk, m in snap_pubkeys.items():
+        if pk in existing_by_pk:
+            existing_member = existing_by_pk[pk]
+            existing_member.is_admin = bool(m.get("is_admin", existing_member.is_admin))
+        else:
+            db.add(GroupMember(
+                group_id=group.id,
+                pubkey=pk,
+                is_admin=bool(m.get("is_admin", False)),
+                joined_at=int(m.get("joined_at", int(time.time()))),
+            ))
+
+    await db.flush()
+    await db.refresh(group, attribute_names=["members"])
+    return group

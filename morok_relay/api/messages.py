@@ -298,6 +298,7 @@ async def delete_dm_message(
     envelope_id: str,
     body: DMDeleteRequest,
     current: CurrentSession,
+    db: DBSession,
     redis: RedisClient,
 ) -> dict:
     """
@@ -344,10 +345,61 @@ async def delete_dm_message(
             detail="recipient_mismatch",
         )
 
+    # Cross-relay propagation: if the recipient lives on a peer relay,
+    # forward the delete event so that peer's Redis (and any online
+    # client there) also drops the message. Local delete already
+    # happened above (no-op if envelope was federated and never queued
+    # locally).
+    settings = get_settings()
+    try:
+        recipient_pubkey = bytes.fromhex(body.recipient_pubkey_hex)
+    except ValueError:
+        recipient_pubkey = None
+
+    federated_to: str | None = None
+    if recipient_pubkey is not None:
+        stmt = (
+            select(User)
+            .where(User.pubkey == recipient_pubkey)
+            .where(User.deleted_at.is_(None))
+        )
+        recipient_user = (await db.execute(stmt)).scalar_one_or_none()
+        if (recipient_user is not None
+                and recipient_user.home_relay
+                and recipient_user.home_relay != settings.relay_name):
+            target_relay = recipient_user.home_relay
+            delete_payload = {
+                "kind": "dm_delete",
+                "envelope_id": envelope_id,
+                "recipient_pubkey_hex": body.recipient_pubkey_hex,
+                "deleted_by_pubkey_hex": current.pubkey_hex,
+            }
+            synthetic_id = f"dmdel-{envelope_id}"
+            dup_stmt = (
+                select(FederationOutboundQueue)
+                .where(FederationOutboundQueue.envelope_id == synthetic_id)
+                .where(FederationOutboundQueue.target_relay == target_relay)
+                .limit(1)
+            )
+            existing = (await db.execute(dup_stmt)).scalar_one_or_none()
+            if existing is None:
+                now = int(time.time())
+                db.add(FederationOutboundQueue(
+                    envelope_id=synthetic_id,
+                    envelope_data=delete_payload,
+                    target_relay=target_relay,
+                    status=FedQueueStatus.PENDING,
+                    attempts=0,
+                    next_attempt_at=now,
+                    created_at=now,
+                ))
+                await db.flush()
+            federated_to = target_relay
+
     logger.info(
-        "DM %s... deleted by sender %s... (queue_hit=%s, meta_existed=%s)",
+        "DM %s... deleted by sender %s... (queue_hit=%s, meta_existed=%s, fed=%s)",
         envelope_id[:8], current.pubkey_hex[:8],
-        result["deleted_from_queue"], result["meta_existed"],
+        result["deleted_from_queue"], result["meta_existed"], federated_to,
     )
 
     return {
@@ -355,4 +407,5 @@ async def delete_dm_message(
         "envelope_id": envelope_id,
         "deleted_from_queue": result["deleted_from_queue"],
         "recipient_already_acked": not result["meta_existed"],
+        "federated_to_relay": federated_to,
     }
