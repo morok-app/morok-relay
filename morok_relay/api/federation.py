@@ -393,6 +393,7 @@ async def forward(
         ttl_seconds=int(body.envelope["ttl"]),
         signature_hex=body.envelope["sig"],
         hard_ceiling_seconds=settings.message_ttl_hard_seconds,
+        sender_username=body.envelope.get("from_username"),
     )
 
     return ForwardResponse(accepted=True, envelope_id=envelope_id)
