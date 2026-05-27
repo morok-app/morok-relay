@@ -209,27 +209,6 @@ async def forward(
     db: DBSession,
     redis: RedisClient,
 ) -> ForwardResponse:
-    try:
-        return await _forward_impl(body, db, redis)
-    except HTTPException as e:
-        env_keys = list(body.envelope.keys()) if body.envelope else []
-        logger.warning(
-            "FORWARD_REJECTED status=%s detail=%s | envelope.kind=%s group_id=%s to=%s ts=%s keys=%s",
-            e.status_code, e.detail,
-            body.envelope.get("kind") if body.envelope else None,
-            body.envelope.get("group_id") if body.envelope else None,
-            body.envelope.get("to") if body.envelope else None,
-            body.envelope.get("ts") if body.envelope else None,
-            env_keys,
-        )
-        raise
-
-
-async def _forward_impl(
-    body: ForwardRequest,
-    db: DBSession,
-    redis: RedisClient,
-) -> ForwardResponse:
     """
     Another relay is forwarding an envelope to one of our local users.
 

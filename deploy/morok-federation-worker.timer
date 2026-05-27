@@ -1,10 +1,10 @@
 [Unit]
-Description=Run Morok federation worker every minute
+Description=Run Morok federation worker every 12s
 
 [Timer]
-OnBootSec=30s
-OnUnitActiveSec=60s
-AccuracySec=5s
+OnBootSec=15s
+OnUnitActiveSec=12s
+AccuracySec=2s
 Persistent=true
 
 [Install]
