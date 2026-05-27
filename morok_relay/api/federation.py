@@ -321,6 +321,7 @@ async def forward(
             db=db,
             redis=redis,
             settings=settings,
+            calling_peer=peer,
         )
 
     # ========================================================================
@@ -384,6 +385,27 @@ async def forward(
 
     # 7. Persist
     await blob_storage.write_blob(envelope_id, blob_bytes)
+
+    # Cache the sender as a remote user on our side. This is what
+    # makes `_peer_relays_for_members` later correctly classify them
+    # as peer-hosted (rather than treating their auto-created local row
+    # with home_relay=self as authoritative). Without this step, group
+    # auto-snapshot federation doesn't trigger when a cross-relay user
+    # is added to a local group.
+    try:
+        from .users import _cache_remote_user
+        await _cache_remote_user(
+            db=db,
+            pubkey_hex=body.envelope["from"],
+            username=body.envelope.get("from_username") or None,
+            home_relay=peer.hostname,
+        )
+    except Exception as e:
+        logger.warning(
+            "Failed to cache remote sender %s from %s: %s",
+            body.envelope["from"][:8], peer.hostname, e,
+        )
+
     await enqueue_envelope(
         redis=redis,
         envelope_id=envelope_id,
@@ -404,6 +426,7 @@ async def _handle_group_forward(
     db,
     redis,
     settings,
+    calling_peer=None,
 ) -> "ForwardResponse":
     """
     Group message arrived via federation. Two sub-modes:
@@ -510,6 +533,23 @@ async def _handle_group_forward(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="sender_not_a_member",
             )
+
+        # Cache sender as a peer-relay user. Without this the host's
+        # add_member auto-snapshot logic may misclassify them as local.
+        if calling_peer is not None:
+            try:
+                from .users import _cache_remote_user
+                await _cache_remote_user(
+                    db=db,
+                    pubkey_hex=envelope["from"],
+                    username=envelope.get("from_username") or None,
+                    home_relay=calling_peer.hostname,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Failed to cache group sender %s from %s: %s",
+                    envelope["from"][:8], calling_peer.hostname, e,
+                )
 
         await blob_storage.write_blob(envelope_id, blob_bytes)
 
