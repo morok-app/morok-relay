@@ -57,6 +57,19 @@ class Settings(BaseSettings):
     rate_limit_dms_create_per_minute: int = Field(default=5)
     rate_limit_ws_connections_per_pubkey: int = Field(default=5)
 
+    # ----- Admin dashboard -----
+    admin_username: str = Field(
+        default="",
+        description="Admin panel login. Empty = admin panel disabled.",
+    )
+    admin_password_hash: str = Field(
+        default="",
+        description="Argon2id hash of admin password (from nacl.pwhash.str). "
+                    "Generate: python -c \"import nacl.pwhash; "
+                    "print(nacl.pwhash.str(b'YOURPASS').decode())\"",
+    )
+    admin_session_ttl_seconds: int = Field(default=3600)
+
 
 @lru_cache
 def get_settings() -> Settings:
