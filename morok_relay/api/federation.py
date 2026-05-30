@@ -209,6 +209,27 @@ async def forward(
     db: DBSession,
     redis: RedisClient,
 ) -> ForwardResponse:
+    try:
+        return await _forward_impl(body, db, redis)
+    except HTTPException as e:
+        env_keys = list(body.envelope.keys()) if body.envelope else []
+        logger.warning(
+            "FORWARD_REJECTED status=%s detail=%s | envelope.kind=%s group_id=%s to=%s ts=%s keys=%s",
+            e.status_code, e.detail,
+            body.envelope.get("kind") if body.envelope else None,
+            body.envelope.get("group_id") if body.envelope else None,
+            body.envelope.get("to") if body.envelope else None,
+            body.envelope.get("ts") if body.envelope else None,
+            env_keys,
+        )
+        raise
+
+
+async def _forward_impl(
+    body: ForwardRequest,
+    db: DBSession,
+    redis: RedisClient,
+) -> ForwardResponse:
     """
     Another relay is forwarding an envelope to one of our local users.
 
@@ -270,6 +291,9 @@ async def forward(
     if kind == "group_delete_deliver":
         return await _handle_group_delete_deliver(body.envelope, db, redis, settings)
 
+    if kind == "read_receipt":
+        return await _handle_read_receipt(body.envelope, db, redis, settings)
+
     # ========================================================================
     # GROUP MESSAGE SEND HANDLING (existing — to_host / deliver)
     # ========================================================================
@@ -321,7 +345,6 @@ async def forward(
             db=db,
             redis=redis,
             settings=settings,
-            calling_peer=peer,
         )
 
     # ========================================================================
@@ -385,27 +408,6 @@ async def forward(
 
     # 7. Persist
     await blob_storage.write_blob(envelope_id, blob_bytes)
-
-    # Cache the sender as a remote user on our side. This is what
-    # makes `_peer_relays_for_members` later correctly classify them
-    # as peer-hosted (rather than treating their auto-created local row
-    # with home_relay=self as authoritative). Without this step, group
-    # auto-snapshot federation doesn't trigger when a cross-relay user
-    # is added to a local group.
-    try:
-        from .users import _cache_remote_user
-        await _cache_remote_user(
-            db=db,
-            pubkey_hex=body.envelope["from"],
-            username=body.envelope.get("from_username") or None,
-            home_relay=peer.hostname,
-        )
-    except Exception as e:
-        logger.warning(
-            "Failed to cache remote sender %s from %s: %s",
-            body.envelope["from"][:8], peer.hostname, e,
-        )
-
     await enqueue_envelope(
         redis=redis,
         envelope_id=envelope_id,
@@ -415,7 +417,6 @@ async def forward(
         ttl_seconds=int(body.envelope["ttl"]),
         signature_hex=body.envelope["sig"],
         hard_ceiling_seconds=settings.message_ttl_hard_seconds,
-        sender_username=body.envelope.get("from_username"),
     )
 
     return ForwardResponse(accepted=True, envelope_id=envelope_id)
@@ -426,7 +427,6 @@ async def _handle_group_forward(
     db,
     redis,
     settings,
-    calling_peer=None,
 ) -> "ForwardResponse":
     """
     Group message arrived via federation. Two sub-modes:
@@ -533,23 +533,6 @@ async def _handle_group_forward(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="sender_not_a_member",
             )
-
-        # Cache sender as a peer-relay user. Without this the host's
-        # add_member auto-snapshot logic may misclassify them as local.
-        if calling_peer is not None:
-            try:
-                from .users import _cache_remote_user
-                await _cache_remote_user(
-                    db=db,
-                    pubkey_hex=envelope["from"],
-                    username=envelope.get("from_username") or None,
-                    home_relay=calling_peer.hostname,
-                )
-            except Exception as e:
-                logger.warning(
-                    "Failed to cache group sender %s from %s: %s",
-                    envelope["from"][:8], calling_peer.hostname, e,
-                )
 
         await blob_storage.write_blob(envelope_id, blob_bytes)
 
@@ -742,6 +725,69 @@ async def _handle_dm_delete_forward(envelope: dict, redis) -> "ForwardResponse":
         accepted=True,
         envelope_id=envelope_id,
         reason=result.get("error") or "dm_delete_done",
+    )
+
+
+async def _handle_read_receipt(
+    envelope: dict, db, redis, settings,
+) -> "ForwardResponse":
+    """
+    A peer relay tells us "your user X had a message read by Y".
+    Verify the sender lives on our relay, then push a WS event.
+
+    Read receipts are unsigned (cheap metadata). Acceptable risk: a
+    misbehaving peer relay could fabricate receipts; the only effect
+    is a misleading checkmark on the sender's screen.
+    """
+    from ..queue import publish_read_receipt as _publish_read
+
+    envelope_id = envelope.get("envelope_id")
+    sender_pubkey_hex = envelope.get("sender_pubkey_hex")
+    reader_pubkey_hex = envelope.get("reader_pubkey_hex")
+    group_id = envelope.get("group_id")
+
+    if not (envelope_id and sender_pubkey_hex and reader_pubkey_hex):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="read_receipt_missing_fields",
+        )
+
+    # Sanity: the named sender must be local. Otherwise this receipt
+    # doesn't belong on our relay.
+    try:
+        sender_pubkey = bytes.fromhex(sender_pubkey_hex)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="bad_sender_pubkey_hex",
+        )
+
+    stmt = (
+        select(User)
+        .where(User.pubkey == sender_pubkey)
+        .where(User.deleted_at.is_(None))
+    )
+    sender_user = (await db.execute(stmt)).scalar_one_or_none()
+    if sender_user is None or sender_user.home_relay != settings.relay_name:
+        return ForwardResponse(
+            accepted=False, envelope_id=envelope_id,
+            reason="sender_not_on_this_relay",
+        )
+
+    await _publish_read(
+        redis=redis,
+        sender_pubkey_hex=sender_pubkey_hex,
+        envelope_id=envelope_id,
+        reader_pubkey_hex=reader_pubkey_hex,
+        group_id=group_id,
+    )
+    logger.info(
+        "Federation read_receipt for %s... (envelope %s..., reader %s...)",
+        sender_pubkey_hex[:8], envelope_id[:8], reader_pubkey_hex[:8],
+    )
+    return ForwardResponse(
+        accepted=True, envelope_id=envelope_id,
+        reason="read_receipt_delivered",
     )
 
 

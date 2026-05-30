@@ -30,6 +30,7 @@ from ..queue import (
     enqueue_envelope,
     envelope_exists,
     list_inbox,
+    publish_read_receipt,
 )
 from ..rate_limit import rate_limit_by_pubkey
 from ..schemas import EnvelopeAck, EnvelopeIn
@@ -288,6 +289,126 @@ class DMDeleteRequest(BaseModel):
         ..., min_length=64, max_length=64,
         pattern=r"^[0-9a-fA-F]{64}$",
     )
+
+
+class ReadReceiptItem(BaseModel):
+    envelope_id: str = Field(
+        ..., min_length=64, max_length=64, pattern=r"^[0-9a-fA-F]{64}$",
+    )
+    sender_pubkey_hex: str = Field(
+        ..., min_length=64, max_length=64, pattern=r"^[0-9a-fA-F]{64}$",
+    )
+    group_id: str | None = Field(default=None, max_length=64)
+
+
+class ReadReceiptsRequest(BaseModel):
+    reads: list[ReadReceiptItem] = Field(..., min_length=1, max_length=100)
+
+
+@router.post(
+    "/read",
+    summary="Acknowledge that messages were read; notifies senders",
+    dependencies=[Depends(rate_limit_by_pubkey(
+        "messages_read",
+        get_settings().rate_limit_messages_per_minute,
+    ))],
+)
+async def post_read_receipts(
+    body: ReadReceiptsRequest,
+    current: CurrentSession,
+    db: DBSession,
+    redis: RedisClient,
+) -> dict:
+    """
+    Client tells us "I read these messages". We propagate the receipt
+    to each message's sender (local WS push or cross-relay federation).
+
+    No persistent storage: receipts are ephemeral, like envelopes. If
+    the sender is offline at this moment, the receipt is silently lost.
+
+    Privacy notes:
+    - Receipts contain ONLY: which envelope, by which reader (this user).
+    - Receipts are NOT signed and NOT verified — a misbehaving client
+      could send fake receipts. That only fools the supposed sender,
+      not the relay. Acceptable in v1.
+    """
+    settings = get_settings()
+    reader_pubkey_hex = current.pubkey_hex
+    sent = 0
+    federated = 0
+    skipped = 0
+
+    for r in body.reads:
+        # Reader never reads their own messages back to themselves
+        if r.sender_pubkey_hex == reader_pubkey_hex:
+            skipped += 1
+            continue
+
+        try:
+            sender_pubkey = bytes.fromhex(r.sender_pubkey_hex)
+        except ValueError:
+            skipped += 1
+            continue
+
+        stmt = (
+            select(User)
+            .where(User.pubkey == sender_pubkey)
+            .where(User.deleted_at.is_(None))
+        )
+        sender_user = (await db.execute(stmt)).scalar_one_or_none()
+
+        if sender_user is None:
+            skipped += 1
+            continue
+
+        if sender_user.home_relay == settings.relay_name:
+            # Local sender — push WS event directly
+            await publish_read_receipt(
+                redis=redis,
+                sender_pubkey_hex=r.sender_pubkey_hex,
+                envelope_id=r.envelope_id,
+                reader_pubkey_hex=reader_pubkey_hex,
+                group_id=r.group_id,
+            )
+            sent += 1
+        elif sender_user.home_relay:
+            # Cross-relay — queue a federation forward
+            from .groups import _synthetic_queue_id  # avoid circular import
+            target_relay = sender_user.home_relay
+            payload = {
+                "kind": "read_receipt",
+                "envelope_id": r.envelope_id,
+                "sender_pubkey_hex": r.sender_pubkey_hex,
+                "reader_pubkey_hex": reader_pubkey_hex,
+                "group_id": r.group_id,
+            }
+            synthetic_id = _synthetic_queue_id(
+                "read", r.envelope_id, reader_pubkey_hex, target_relay,
+            )
+            dup_stmt = (
+                select(FederationOutboundQueue)
+                .where(FederationOutboundQueue.envelope_id == synthetic_id)
+                .where(FederationOutboundQueue.target_relay == target_relay)
+                .limit(1)
+            )
+            existing = (await db.execute(dup_stmt)).scalar_one_or_none()
+            if existing is None:
+                now = int(time.time())
+                db.add(FederationOutboundQueue(
+                    envelope_id=synthetic_id,
+                    envelope_data=payload,
+                    target_relay=target_relay,
+                    status=FedQueueStatus.PENDING,
+                    attempts=0,
+                    next_attempt_at=now,
+                    created_at=now,
+                ))
+                await db.flush()
+            federated += 1
+        else:
+            skipped += 1
+
+    return {"sent": sent, "federated": federated, "skipped": skipped}
 
 
 @router.post(

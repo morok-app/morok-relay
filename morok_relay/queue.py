@@ -50,6 +50,8 @@ def _inbox_channel(recipient_pubkey_hex: str) -> str:
 
 
 def _new_event(envelope_id: str) -> str:
+    # JSON now (was bare envelope_id); reader_task in inbox.py recognises
+    # both legacy bare-id and tagged-event formats.
     return json.dumps({"kind": "new", "envelope_id": envelope_id})
 
 
@@ -64,6 +66,47 @@ def _deleted_event(
         "by": deleted_by_pubkey_hex,
         "group_id": group_id,
     })
+
+
+def _read_event(
+    envelope_id: str,
+    reader_pubkey_hex: str,
+    group_id: str | None = None,
+) -> str:
+    return json.dumps({
+        "kind": "read",
+        "envelope_id": envelope_id,
+        "reader": reader_pubkey_hex,
+        "group_id": group_id,
+    })
+
+
+async def publish_read_receipt(
+    redis: redis_async.Redis,
+    sender_pubkey_hex: str,
+    envelope_id: str,
+    reader_pubkey_hex: str,
+    group_id: str | None = None,
+) -> None:
+    """
+    Notify a sender that one of their messages was read.
+
+    No persistent storage — this is an ephemeral push. If the sender's
+    WS is offline at this moment, the event is lost; the client will
+    not retroactively learn that an old message was read after coming
+    back online. That's by design: read receipts are best-effort, the
+    relay should not keep state about who read what.
+    """
+    try:
+        await redis.publish(
+            _inbox_channel(sender_pubkey_hex),
+            _read_event(envelope_id, reader_pubkey_hex, group_id),
+        )
+    except Exception as e:
+        logger.warning(
+            "publish_read_receipt failed for sender %s: %s",
+            sender_pubkey_hex[:8], e,
+        )
 
 
 async def enqueue_envelope(
