@@ -45,6 +45,7 @@ from ..config import get_settings
 from ..deps import DBSession, RedisClient
 from ..models import FederationPeer, Group, GroupMember, User
 from ..queue import enqueue_envelope, enqueue_envelope_for_recipients, envelope_exists
+from ..push_sender import trigger_push
 
 logger = logging.getLogger(__name__)
 
@@ -418,6 +419,16 @@ async def _forward_impl(
         signature_hex=body.envelope["sig"],
         hard_ceiling_seconds=settings.message_ttl_hard_seconds,
     )
+    # Best-effort push for the local recipient (sender side already pushed
+    # any of its own local users; here we cover ours).
+    try:
+        await trigger_push(
+            db=db, redis=redis,
+            recipient_pubkeys_hex=[body.envelope["to"]],
+            sender_username=body.envelope.get("from_username"),
+        )
+    except Exception as e:
+        logger.warning("trigger_push (federation DM) failed: %s", e)
 
     return ForwardResponse(accepted=True, envelope_id=envelope_id)
 
@@ -614,6 +625,17 @@ async def _handle_group_forward(
         group_id=str(gid),
         sender_username=envelope.get("from_username"),
     )
+    # Push fanout to local offline members. The peer relay (sender side)
+    # already pushed its own local members; we cover ours.
+    try:
+        await trigger_push(
+            db=db, redis=redis,
+            recipient_pubkeys_hex=known_local,
+            sender_username=envelope.get("from_username"),
+            group_id=str(gid),
+        )
+    except Exception as e:
+        logger.warning("trigger_push (federation group deliver) failed: %s", e)
     logger.info(
         "Group forward deliver %s: enqueued for %d local recipients",
         envelope_id[:8], len(known_local),

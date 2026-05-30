@@ -72,6 +72,16 @@ async def inbox_socket(
     await websocket.accept()
     logger.info("inbox WebSocket open: pubkey=%s...", pubkey_hex[:8])
 
+    # Track this connection in Redis so push fanout can skip users who
+    # have at least one tab open. Counter has a TTL so a crashed server
+    # doesn't leave stale "online" state forever.
+    ws_active_key = f"morok:ws:active:{pubkey_hex}"
+    try:
+        await redis.incr(ws_active_key)
+        await redis.expire(ws_active_key, 3600)
+    except Exception as e:
+        logger.warning("ws-active incr failed for %s: %s", pubkey_hex[:8], e)
+
     # 2. Send catch-up frame
     try:
         envelopes = await list_inbox(redis, pubkey_hex, limit=200)
@@ -101,64 +111,16 @@ async def inbox_socket(
     #    - pinger: send periodic ping
 
     async def reader_task() -> None:
-        """Listen to Redis pub/sub and forward to client.
-
-        Events published on the channel come in two formats:
-        - JSON object: {"kind": "new"|"deleted"|"read", ...}
-        - Legacy bare envelope_id string (treated as "new")
-        """
+        """Listen to Redis pub/sub and forward to client."""
         try:
             async for message in pubsub.listen():
                 if message.get("type") != "message":
                     continue
-                raw = message["data"]
-                if isinstance(raw, bytes):
-                    raw = raw.decode("utf-8")
-
-                # Try to parse as JSON event.
-                event = None
-                if raw and raw[:1] == "{":
-                    try:
-                        event = json.loads(raw)
-                    except json.JSONDecodeError:
-                        event = None
-
-                if event and isinstance(event, dict) and "kind" in event:
-                    kind = event["kind"]
-                    if kind == "new":
-                        envelope_id = event.get("envelope_id")
-                        if not envelope_id:
-                            continue
-                        envs = await list_inbox(redis, pubkey_hex, limit=200)
-                        env = next(
-                            (e for e in envs if e["envelope_id"] == envelope_id),
-                            None,
-                        )
-                        if env is not None:
-                            await websocket.send_json({"type": "new", "envelope": env})
-                    elif kind == "deleted":
-                        await websocket.send_json({
-                            "type": "deleted",
-                            "envelope_id": event.get("envelope_id"),
-                            "by": event.get("by"),
-                            "group_id": event.get("group_id"),
-                        })
-                    elif kind == "read":
-                        await websocket.send_json({
-                            "type": "read",
-                            "envelope_id": event.get("envelope_id"),
-                            "reader": event.get("reader"),
-                            "group_id": event.get("group_id"),
-                        })
-                    else:
-                        logger.warning("inbox WS: unknown event kind %s", kind)
-                    continue
-
-                # Legacy fallback: bare envelope_id string
-                envelope_id = raw
+                envelope_id = message["data"].decode("utf-8")
+                # Look up the metadata
                 envs = await list_inbox(redis, pubkey_hex, limit=200)
                 env = next(
-                    (e for e in envs if e["envelope_id"] == envelope_id), None,
+                    (e for e in envs if e["envelope_id"] == envelope_id), None
                 )
                 if env is not None:
                     await websocket.send_json({"type": "new", "envelope": env})
@@ -236,4 +198,12 @@ async def inbox_socket(
             await websocket.close()
         except Exception:
             pass
+        # Decrement WS-active counter; once it hits 0 the key is gone and
+        # push fanout will start sending notifications for this user again.
+        try:
+            new_count = await redis.decr(ws_active_key)
+            if new_count is not None and new_count <= 0:
+                await redis.delete(ws_active_key)
+        except Exception as e:
+            logger.warning("ws-active decr failed for %s: %s", pubkey_hex[:8], e)
         logger.info("inbox WS closed: pubkey=%s...", pubkey_hex[:8])

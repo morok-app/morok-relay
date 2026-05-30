@@ -70,6 +70,21 @@ class Settings(BaseSettings):
     )
     admin_session_ttl_seconds: int = Field(default=3600)
 
+    # ----- Web push (VAPID) -----
+    # When `vapid_public_key_b64` is empty, push is silently disabled —
+    # endpoints return 503 and the trigger function is a no-op. To enable:
+    # run generate_vapid_keys.py once, drop the PEM where the path points,
+    # and set the public key (base64url, ~88 chars) in MOROK_VAPID_PUBLIC_KEY_B64.
+    vapid_public_key_b64: str = Field(default="")
+    vapid_private_key_path: Path = Field(
+        default=Path("/etc/morok/vapid_private.pem"),
+        description="Path to VAPID private key in PEM format (EC P-256, PKCS8).",
+    )
+    vapid_subject: str = Field(
+        default="mailto:morok.messenger@protonmail.com",
+        description="VAPID `sub` claim — admin contact for push providers.",
+    )
+
 
 @lru_cache
 def get_settings() -> Settings:

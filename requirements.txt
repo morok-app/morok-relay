@@ -20,6 +20,9 @@ cryptography==44.0.0
 # === HTTP client (for federation) ===
 httpx==0.28.1
 
+# === Web push ===
+pywebpush==2.0.0
+
 # === WebSocket support ===
 websockets==14.1
 

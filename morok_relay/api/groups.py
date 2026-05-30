@@ -30,6 +30,7 @@ from ..queue import (
     envelope_exists,
     get_envelope_meta,
 )
+from ..push_sender import trigger_push
 from ..rate_limit import rate_limit_by_pubkey
 from ..schemas import (
     GroupAddMemberRequest,
@@ -630,6 +631,18 @@ async def do_group_fanout(
             group_id=str(group.id),
             sender_username=envelope.get("from_username"),
         )
+        # Best-effort push fanout to offline members on THIS relay. Members
+        # on peer relays receive their push via the federation handler on
+        # the receiving end (api/federation.py _handle_group_send_deliver).
+        try:
+            await trigger_push(
+                db=db, redis=redis,
+                recipient_pubkeys_hex=local_recipients,
+                sender_username=envelope.get("from_username"),
+                group_id=str(group.id),
+            )
+        except Exception as e:
+            logger.warning("trigger_push (group local) failed: %s", e)
 
     now = int(time.time())
     for target_relay, members_on_relay in remote_by_relay.items():

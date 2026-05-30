@@ -12,7 +12,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from . import __version__
-from .api import admin, auth, backup, burner, dms, federation, groups, inbox, messages, users
+from .api import admin, auth, backup, burner, dms, federation, groups, inbox, messages, push, users
 from .cleanup import cleanup_task_loop
 from .config import get_settings
 from .db import lifespan as db_lifespan
@@ -138,6 +138,7 @@ app.include_router(burner.router, prefix="/api/v1/burner")
 app.include_router(federation.router, prefix="/api/v1/federation")
 app.include_router(backup.router, prefix="/api/v1/backup")
 app.include_router(admin.router, prefix="/api/v1/admin")
+app.include_router(push.router, prefix="/api/v1/push")
 
 # WebSocket
 app.include_router(inbox.router, prefix="/ws/v1")

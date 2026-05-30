@@ -34,6 +34,7 @@ from ..queue import (
 )
 from ..rate_limit import rate_limit_by_pubkey
 from ..schemas import EnvelopeAck, EnvelopeIn
+from ..push_sender import trigger_push
 
 from pydantic import BaseModel, Field
 
@@ -162,6 +163,16 @@ async def send_envelope(
             hard_ceiling_seconds=settings.message_ttl_hard_seconds,
             sender_username=sender_username,
         )
+        # Best-effort push notification — never blocks the response.
+        # The function itself is async-safe and swallows all errors.
+        try:
+            await trigger_push(
+                db=db, redis=redis,
+                recipient_pubkeys_hex=[body.to],
+                sender_username=sender_username,
+            )
+        except Exception as e:
+            logger.warning("trigger_push (DM) failed: %s", e)
         return EnvelopeAck(
             envelope_id=envelope_id, queued=True, expires_at=expires_at,
         )

@@ -320,3 +320,49 @@ class DMSRecipient(Base):
     __table_args__ = (
         UniqueConstraint("dms_id", "recipient_pubkey", name="uq_dms_recipients"),
     )
+
+
+# ============================================================================
+# WEB PUSH SUBSCRIPTIONS
+# ============================================================================
+
+class PushSubscription(Base):
+    """
+    Browser web push subscription. One row per (user, device-endpoint).
+
+    Endpoints are issued by the push provider (Mozilla autopush, Google
+    FCM endpoint, Apple's push service for installed PWAs). We treat
+    them as opaque URLs to POST to with a VAPID-signed payload.
+
+    `p256dh` and `auth` are subscription-specific keys from the browser;
+    pywebpush uses them to encrypt the payload (RFC 8291). They're
+    base64url-encoded strings.
+
+    Dead subscriptions (push provider returns 404/410) are deleted by
+    the push sender automatically — no separate sweeper needed.
+    """
+    __tablename__ = "push_subscriptions"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4,
+    )
+    pubkey: Mapped[bytes] = mapped_column(
+        LargeBinary(32), nullable=False, index=True,
+    )
+    endpoint: Mapped[str] = mapped_column(Text, nullable=False)
+    p256dh: Mapped[str] = mapped_column(String(255), nullable=False)
+    auth: Mapped[str] = mapped_column(String(255), nullable=False)
+    user_agent: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[int] = mapped_column(
+        BigInteger, nullable=False,
+        server_default=func.extract("epoch", func.now()),
+    )
+    updated_at: Mapped[int] = mapped_column(
+        BigInteger, nullable=False,
+        server_default=func.extract("epoch", func.now()),
+    )
+    last_used_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("pubkey", "endpoint", name="uq_push_pubkey_endpoint"),
+    )
