@@ -29,7 +29,7 @@ from sqlalchemy.exc import IntegrityError
 from ..config import get_settings
 from ..deps import CurrentSession, DBSession, RedisClient
 from ..federation_client import remote_lookup
-from ..models import User, UsernameHistory, UserTier
+from ..models import FederationPeer, User, UsernameHistory, UserTier
 from ..schemas import (
     MeInfo,
     UserInfo,
@@ -349,12 +349,36 @@ async def lookup_username(
             last_seen_at=user.last_seen_at,
         )
 
-    # 2. Federation fallback
+    # 2. Federation fallback — figure out which peer(s) to query
     if relay is not None and relay != settings.relay_name:
+        # Explicit relay specified by caller
+        candidate_relays = [relay]
+    else:
+        # No explicit hint — fan out across all trusted federation peers.
+        # Most recently handshaked first (likeliest to be alive).
+        peer_stmt = (
+            select(FederationPeer)
+            .where(FederationPeer.is_trusted.is_(True))
+            .order_by(FederationPeer.last_handshake_at.desc().nullslast())
+        )
+        peers = (await db.execute(peer_stmt)).scalars().all()
+        candidate_relays = [
+            p.hostname for p in peers if p.hostname != settings.relay_name
+        ]
+        if not candidate_relays:
+            # No peers known — fall through to 404
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="username_not_found",
+            )
+
+    last_error_status: int | None = None  # remember if any peer was unreachable
+
+    for relay_host in candidate_relays:
         # 2a. Redis cache
-        cached = await _get_lookup_cache(redis, relay, normalized)
+        cached = await _get_lookup_cache(redis, relay_host, normalized)
         if cached is not None:
-            logger.info("Federation lookup cache hit: %s on %s", normalized, relay)
+            logger.info("Federation lookup cache hit: %s on %s", normalized, relay_host)
             return UserInfo(
                 pubkey_hex=cached["pubkey_hex"],
                 username=cached["username"],
@@ -363,33 +387,28 @@ async def lookup_username(
             )
 
         # 2b. Federation lookup with retry
-        logger.info("Federation lookup: %s on %s (with retry)", normalized, relay)
-        result = await _remote_lookup_with_retry(relay, normalized)
+        logger.info(
+            "Federation lookup: %s on %s (with retry)", normalized, relay_host,
+        )
+        result = await _remote_lookup_with_retry(relay_host, normalized)
 
-        # 2c. Peer says no such user (or remote_lookup couldn't distinguish)
+        # Peer says "no such user" — try next peer
         if result is not None and result.get("__not_found"):
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="username_not_found_on_remote_relay",
-            )
+            continue
 
-        # 2d. Peer unreachable → check stale cache (none in our case
-        # because we already checked above), then 503
+        # Peer unreachable — remember and try next
         if result is None:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="remote_relay_unreachable_try_later",
-                headers={"Retry-After": "30"},
-            )
+            last_error_status = status.HTTP_503_SERVICE_UNAVAILABLE
+            continue
 
-        # 2e. Success — cache + persist locally
+        # Success — cache + persist locally + return
         cache_payload = {
             "pubkey_hex": result["pubkey_hex"],
             "username": result["username"],
             "home_relay": result["home_relay"],
             "last_seen_at": result.get("last_seen_at"),
         }
-        await _set_lookup_cache(redis, relay, normalized, cache_payload)
+        await _set_lookup_cache(redis, relay_host, normalized, cache_payload)
 
         cached_user = await _cache_remote_user(
             db,
@@ -405,7 +424,14 @@ async def lookup_username(
             last_seen_at=cached_user.last_seen_at if cached_user else None,
         )
 
-    # 3. Not found
+    # 3. Not found on any peer
+    if last_error_status == status.HTTP_503_SERVICE_UNAVAILABLE:
+        # Every peer we tried was unreachable — tell the client to retry
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="remote_relay_unreachable_try_later",
+            headers={"Retry-After": "30"},
+        )
     raise HTTPException(
         status_code=status.HTTP_404_NOT_FOUND,
         detail="username_not_found",
