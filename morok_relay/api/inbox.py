@@ -111,16 +111,64 @@ async def inbox_socket(
     #    - pinger: send periodic ping
 
     async def reader_task() -> None:
-        """Listen to Redis pub/sub and forward to client."""
+        """Listen to Redis pub/sub and forward to client.
+
+        Events come in two formats:
+        - JSON: {"kind": "new"|"deleted"|"read", ...}
+        - Legacy bare envelope_id string (treated as "new")
+        """
         try:
             async for message in pubsub.listen():
                 if message.get("type") != "message":
                     continue
-                envelope_id = message["data"].decode("utf-8")
-                # Look up the metadata
+                raw = message["data"]
+                if isinstance(raw, bytes):
+                    raw = raw.decode("utf-8")
+
+                # Try JSON event first
+                event = None
+                if raw and raw[:1] == "{":
+                    try:
+                        event = json.loads(raw)
+                    except json.JSONDecodeError:
+                        event = None
+
+                if event and isinstance(event, dict) and "kind" in event:
+                    kind = event["kind"]
+                    if kind == "new":
+                        envelope_id = event.get("envelope_id")
+                        if not envelope_id:
+                            continue
+                        envs = await list_inbox(redis, pubkey_hex, limit=200)
+                        env = next(
+                            (e for e in envs if e["envelope_id"] == envelope_id),
+                            None,
+                        )
+                        if env is not None:
+                            await websocket.send_json({"type": "new", "envelope": env})
+                    elif kind == "deleted":
+                        await websocket.send_json({
+                            "type": "deleted",
+                            "envelope_id": event.get("envelope_id"),
+                            "by": event.get("by"),
+                            "group_id": event.get("group_id"),
+                        })
+                    elif kind == "read":
+                        await websocket.send_json({
+                            "type": "read",
+                            "envelope_id": event.get("envelope_id"),
+                            "reader": event.get("reader"),
+                            "group_id": event.get("group_id"),
+                        })
+                    else:
+                        logger.warning("inbox WS: unknown event kind %s", kind)
+                    continue
+
+                # Legacy fallback: bare envelope_id
+                envelope_id = raw
                 envs = await list_inbox(redis, pubkey_hex, limit=200)
                 env = next(
-                    (e for e in envs if e["envelope_id"] == envelope_id), None
+                    (e for e in envs if e["envelope_id"] == envelope_id), None,
                 )
                 if env is not None:
                     await websocket.send_json({"type": "new", "envelope": env})
