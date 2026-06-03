@@ -22,6 +22,7 @@ from ..deps import CurrentSession, DBSession, RedisClient
 from ..models import (
     DeadManSwitch,
     EncryptedBackup,
+    LoginLog,
     PushSubscription,
     User,
     UsernameHistory,
@@ -119,3 +120,71 @@ async def delete_me(
 
     logger.info("Account deleted: pubkey=%s...", current.pubkey_hex[:8])
     return {"deleted": True}
+
+
+# ============================================================================
+# LOGIN AUDIT LOG ENDPOINTS
+# ============================================================================
+
+@router.get(
+    "/me/sessions",
+    summary="Get the user's login history (audit log)",
+)
+async def get_sessions(
+    current: CurrentSession,
+    db: DBSession,
+) -> dict:
+    """
+    Return up to 30 most-recent login events for the calling user.
+
+    Each event includes:
+      - created_at (unix seconds)
+      - ip_hash (sha256 hex — daily-rotated, see auth.py for details)
+      - user_agent (truncated to 255 chars; nullable)
+
+    The IP is intentionally NOT included — we never store it. The hash
+    lets the user spot "this device is the same as that earlier one
+    today" or "this came from a different network than usual"; raw IPs
+    would be a target for subpoena.
+    """
+    pubkey_bytes = bytes.fromhex(current.pubkey_hex)
+    stmt = (
+        select(LoginLog)
+        .where(LoginLog.pubkey == pubkey_bytes)
+        .order_by(LoginLog.created_at.desc())
+        .limit(30)
+    )
+    rows = (await db.execute(stmt)).scalars().all()
+    return {
+        "sessions": [
+            {
+                "created_at": r.created_at,
+                "ip_hash": r.ip_hash,
+                "user_agent": r.user_agent,
+            }
+            for r in rows
+        ],
+    }
+
+
+@router.delete(
+    "/me/sessions",
+    summary="Clear the user's login history",
+)
+async def clear_sessions(
+    current: CurrentSession,
+    db: DBSession,
+) -> dict:
+    """
+    Wipe every login_log row for the calling user.
+
+    This is purely a privacy convenience — the rows weren't accessible
+    to anyone else, but a user might want to "start fresh" after a
+    sensitive event (new device, paranoia, whatever).
+    """
+    pubkey_bytes = bytes.fromhex(current.pubkey_hex)
+    result = await db.execute(
+        delete(LoginLog).where(LoginLog.pubkey == pubkey_bytes)
+    )
+    await db.flush()
+    return {"cleared": result.rowcount or 0}

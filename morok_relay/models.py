@@ -366,3 +366,41 @@ class PushSubscription(Base):
     __table_args__ = (
         UniqueConstraint("pubkey", "endpoint", name="uq_push_pubkey_endpoint"),
     )
+
+
+# ============================================================================
+# LOGIN AUDIT LOG
+# ============================================================================
+
+class LoginLog(Base):
+    """
+    Audit log of successful authentications — one row per /auth/verify
+    that returned a session.
+
+    Privacy strategy:
+      - We NEVER store the raw IP. Instead, sha256(daily_salt || ip) is
+        recorded, where daily_salt rotates every UTC midnight. So an
+        operator with DB access can confirm that two logins came from
+        the same network within a 24h window, but linkability evaporates
+        after the salt rolls over.
+      - daily_salt = sha256(relay_privkey || UTC date string). If the
+        relay's private key were ever exfiltrated, hashes from that day
+        could in theory be brute-forced against a precomputed dictionary
+        of all IPv4 — but after the salt rotates, the window closes.
+      - user_agent is truncated to 255 chars.
+      - We keep at most 30 rows per pubkey; older entries are pruned on
+        insert.
+    """
+    __tablename__ = "login_log"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4,
+    )
+    pubkey: Mapped[bytes] = mapped_column(
+        LargeBinary(32), nullable=False, index=True,
+    )
+    created_at: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, index=True,
+    )
+    ip_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    user_agent: Mapped[str | None] = mapped_column(String(255), nullable=True)
