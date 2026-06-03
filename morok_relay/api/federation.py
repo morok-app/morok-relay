@@ -266,13 +266,22 @@ async def _forward_impl(
             detail="forwarding_relay_signature_invalid",
         )
 
-    # 2. Check the relay is a known peer with matching pubkey
+    # 2. Check the relay is a known peer with matching pubkey AND trusted
     stmt = select(FederationPeer).where(FederationPeer.pubkey == relay_pubkey)
     peer = (await db.execute(stmt)).scalar_one_or_none()
     if peer is None:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="forwarding_relay_unknown_handshake_first",
+        )
+    if not peer.is_trusted:
+        # Handshake succeeded but operator hasn't marked this peer as
+        # trusted. We refuse to forward — open handshake is fine because
+        # the local DB just records the candidate; trust is granted out
+        # of band via SQL or admin panel.
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="forwarding_relay_untrusted",
         )
 
     # ========================================================================
@@ -1091,6 +1100,11 @@ async def pull_group_snapshot(
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="relay_unknown_handshake_first",
+        )
+    if not peer.is_trusted:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="relay_untrusted",
         )
 
     stmt = (
