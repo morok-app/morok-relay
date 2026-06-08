@@ -290,7 +290,7 @@ async def _forward_impl(
     kind = body.envelope.get("kind")
 
     if kind == "group_snapshot":
-        return await _handle_group_snapshot_push(body.envelope, db)
+        return await _handle_group_snapshot_push(body.envelope, peer, db)
 
     if kind == "dm_delete":
         return await _handle_dm_delete_forward(body.envelope, redis)
@@ -692,15 +692,23 @@ async def federation_lookup(
 # CROSS-RELAY CONTROL-PLANE HANDLERS (group snapshot push/pull, deletes)
 # ============================================================================
 
-async def _handle_group_snapshot_push(envelope: dict, db) -> "ForwardResponse":
+async def _handle_group_snapshot_push(
+    envelope: dict,
+    peer: "FederationPeer",
+    db,
+) -> "ForwardResponse":
     """
     Peer relay pushed us a snapshot of a group we should mirror locally
     (because we host members of it). Idempotent upsert.
+
+    The peer's verified hostname is passed in so apply_group_snapshot
+    can enforce "only the host may modify this group" — without it, a
+    trusted-but-not-host peer could plant arbitrary admins/members.
     """
     from .groups import apply_group_snapshot
 
     try:
-        await apply_group_snapshot(db, envelope)
+        await apply_group_snapshot(db, envelope, expected_home_relay=peer.hostname)
     except HTTPException:
         raise
     except Exception as e:

@@ -1323,8 +1323,11 @@ async def sync_group_from_host(
             detail="snapshot_unavailable_from_host",
         )
 
-    # Apply locally (idempotent upsert)
-    await apply_group_snapshot(db, snapshot)
+    # Apply locally (idempotent upsert). The host we asked to pull from
+    # IS the authoritative host for this group — that's what makes this
+    # operation meaningful in the first place — so it serves as our
+    # expected_home_relay.
+    await apply_group_snapshot(db, snapshot, expected_home_relay=host_relay)
     await db.flush()
 
     return {
@@ -1335,12 +1338,38 @@ async def sync_group_from_host(
     }
 
 
-async def apply_group_snapshot(db, snapshot: dict) -> Group:
+async def apply_group_snapshot(
+    db,
+    snapshot: dict,
+    *,
+    expected_home_relay: str,
+) -> Group:
     """
     Idempotent upsert of a group + its members from a snapshot payload.
     Called from /federation/forward (push direction) and /groups/{id}/sync
     (pull direction).
+
+    `expected_home_relay` is the hostname of the relay that is allowed to
+    push this snapshot — for federation pushes that's the verified peer
+    hostname (NOT a field in the envelope), for sync-pulls it's the host
+    the caller asked us to pull from. This blocks two abuses:
+
+      * A trusted peer X tries to push a snapshot for a group whose
+        actual host is Y. We refuse — only the host can modify membership.
+      * A trusted peer X pushes a brand-new group with `home_relay=Y`
+        in the payload, trying to plant a malicious group on the network
+        with someone else's hostname. We ignore the payload field and
+        record X as the host (which is true: X just sent it to us).
+
+    Legacy rows where home_relay is NULL get the field filled in from
+    expected_home_relay — there's no prior owner to defer to.
     """
+    if not expected_home_relay:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="snapshot_missing_expected_home_relay",
+        )
+
     try:
         gid = uuid.UUID(snapshot["group_id"])
         creator_bytes = bytes.fromhex(snapshot["creator_pubkey_hex"])
@@ -1359,6 +1388,10 @@ async def apply_group_snapshot(db, snapshot: dict) -> Group:
     existing = (await db.execute(stmt)).scalar_one_or_none()
 
     if existing is None:
+        # New group: home_relay is determined by the verified sender,
+        # NEVER trusted from the payload. This prevents a malicious peer
+        # from creating a group locally whose "host" is some other relay
+        # they don't actually control.
         group = Group(
             id=gid,
             creator_pubkey=creator_bytes,
@@ -1369,14 +1402,29 @@ async def apply_group_snapshot(db, snapshot: dict) -> Group:
             expires_at=snapshot.get("expires_at"),
             anonymous_senders=bool(snapshot.get("anonymous_senders", False)),
             max_members=int(snapshot.get("max_members", 50)),
-            home_relay=snapshot.get("home_relay") or get_settings().relay_name,
+            home_relay=expected_home_relay,
         )
         db.add(group)
         await db.flush()
         # No members yet — they get added below.
     else:
-        # Overwrite mutable fields. We never overwrite home_relay if it
-        # was set locally (defensive).
+        # Existing group: only the recorded host may push updates.
+        # Legacy rows (home_relay NULL) get adopted by the first pushing
+        # peer — there's no prior claim to honour.
+        if existing.home_relay and existing.home_relay != expected_home_relay:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    f"snapshot_from_wrong_host: group hosted on "
+                    f"{existing.home_relay!r}, push came from "
+                    f"{expected_home_relay!r}"
+                ),
+            )
+        if not existing.home_relay:
+            existing.home_relay = expected_home_relay
+
+        # Overwrite mutable fields — only the host can do this, which is
+        # now enforced above.
         existing.is_channel = bool(snapshot.get("is_channel", existing.is_channel))
         existing.default_ttl_seconds = int(
             snapshot.get("default_ttl_seconds", existing.default_ttl_seconds)
@@ -1385,8 +1433,6 @@ async def apply_group_snapshot(db, snapshot: dict) -> Group:
             snapshot.get("anonymous_senders", existing.anonymous_senders)
         )
         existing.max_members = int(snapshot.get("max_members", existing.max_members))
-        if not existing.home_relay:
-            existing.home_relay = snapshot.get("home_relay") or get_settings().relay_name
         group = existing
 
     # Reconcile members. Members listed in snapshot are authoritative.
