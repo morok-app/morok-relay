@@ -103,19 +103,30 @@ async def get_token(redis: redis_async.Redis, token: str) -> dict | None:
 async def consume_token(redis: redis_async.Redis, token: str) -> dict | None:
     """
     Atomically read + delete a token. Returns metadata if valid, else None.
+
+    Uses Redis GETDEL (since 6.2) so that if two clients race to consume
+    the same invite link, exactly one observes the metadata and the other
+    sees None — without it the previous "GET then DELETE" left a window
+    where both could pass the check.
+
+    The set-side cleanup (group_invites:<gid>) is still a separate hop;
+    it's an enumeration aid, not a security gate, so a brief stale entry
+    there is harmless (list_tokens already does lazy cleanup).
     """
-    raw = await redis.get(_token_key(token))
+    raw = await redis.execute_command("GETDEL", _token_key(token))
     if raw is None:
         return None
     try:
         meta = json.loads(raw)
     except json.JSONDecodeError:
         return None
-    # Delete from both Redis structures
-    async with redis.pipeline(transaction=True) as pipe:
-        pipe.delete(_token_key(token))
-        pipe.srem(_group_invites_key(meta["group_id"]), token)
-        await pipe.execute()
+    group_id = meta.get("group_id")
+    if group_id:
+        try:
+            await redis.srem(_group_invites_key(group_id), token)
+        except Exception:
+            # Set-side cleanup is best-effort — list_tokens will catch up.
+            pass
     return meta
 
 

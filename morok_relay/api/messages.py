@@ -163,6 +163,12 @@ async def send_envelope(
             hard_ceiling_seconds=settings.message_ttl_hard_seconds,
             sender_username=sender_username,
         )
+        if expires_at is None:
+            # Lost the dedup race with a concurrent send (or this is a
+            # client retry after a network blip). Same outcome the
+            # envelope_exists() short-circuit above would have given —
+            # the message is delivered, we just weren't the writer.
+            return EnvelopeAck(envelope_id=envelope_id, queued=False, expires_at=0)
         # Best-effort push notification — never blocks the response.
         # The function itself is async-safe and swallows all errors.
         try:

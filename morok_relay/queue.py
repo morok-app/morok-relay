@@ -119,7 +119,7 @@ async def enqueue_envelope(
     signature_hex: str,
     hard_ceiling_seconds: int,
     sender_username: str | None = None,
-) -> int:
+) -> int | None:
     """
     Add an envelope to the recipient's inbox queue and publish a notification.
 
@@ -127,12 +127,20 @@ async def enqueue_envelope(
     in the metadata so the recipient's client can display "@bob" instead of
     a raw pubkey prefix without doing a separate lookup.
 
-    Returns the expires_at timestamp (capped at hard ceiling).
+    Returns the expires_at timestamp (capped at hard ceiling), or None
+    if the envelope already exists in Redis (dedup hit). The atomic
+    SET NX is the dedup gate — using a separate envelope_exists() check
+    here would leave a TOCTOU window where two concurrent sends with the
+    same envelope_id could both pass the check and double-deliver.
     """
     now = int(time.time())
     requested_expires = timestamp + ttl_seconds
     ceiling = now + hard_ceiling_seconds
     expires_at = min(requested_expires, ceiling)
+    ttl_until_expiry = expires_at - now
+    if ttl_until_expiry <= 0:
+        # Already expired before it was even queued — nothing to do.
+        return None
 
     meta = {
         "envelope_id": envelope_id,
@@ -145,12 +153,20 @@ async def enqueue_envelope(
         "expires_at": expires_at,
     }
 
+    # SET NX is the dedup gate — only one writer "wins" the slot.
+    written = await redis.set(
+        _envelope_meta_key(envelope_id),
+        json.dumps(meta).encode("utf-8"),
+        ex=ttl_until_expiry,
+        nx=True,
+    )
+    if not written:
+        # Already exists (a previous send / retry won the race). The
+        # inbox row and notification were already published by that
+        # caller — do nothing.
+        return None
+
     async with redis.pipeline(transaction=True) as pipe:
-        pipe.set(
-            _envelope_meta_key(envelope_id),
-            json.dumps(meta).encode("utf-8"),
-            ex=expires_at - now,
-        )
         pipe.zadd(_inbox_key(recipient_pubkey_hex), {envelope_id: expires_at})
         pipe.publish(_inbox_channel(recipient_pubkey_hex), _new_event(envelope_id))
         await pipe.execute()

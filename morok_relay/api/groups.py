@@ -105,10 +105,33 @@ def _is_member(group: Group, pubkey: bytes) -> bool:
 
 
 def _find_admin(group: Group) -> GroupMember | None:
+    """
+    Return the first admin found, or None.
+
+    NOTE: This returns ONLY ONE admin even when a group has multiple.
+    For authorization checks ("is this caller an admin?") use
+    `_is_admin(group, caller_bytes)` instead — using `_find_admin().pubkey
+    == caller` silently locks out every admin except the first one in
+    the member list, which is a subtle multi-admin correctness bug.
+    `_find_admin` is still useful for "tell me who the admin is" UI
+    queries.
+    """
     for m in group.members:
         if m.is_admin:
             return m
     return None
+
+
+def _is_admin(group: Group, caller_pubkey: bytes) -> bool:
+    """
+    True if `caller_pubkey` is an admin of `group`. Works correctly when
+    a group has multiple admins — the previous `_find_admin().pubkey ==
+    caller` pattern only matched the first admin and rejected the rest.
+    """
+    for m in group.members:
+        if m.is_admin and m.pubkey == caller_pubkey:
+            return True
+    return False
 
 
 def _to_group_info(group: Group) -> GroupInfo:
@@ -299,8 +322,7 @@ async def add_member(
     gid = _parse_group_id(group_id)
     group = await _load_group(db, gid)
     caller = bytes.fromhex(current.pubkey_hex)
-    admin_member = _find_admin(group)
-    if admin_member is None or admin_member.pubkey != caller:
+    if not _is_admin(group, caller):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="only_admin_can_add_members",
@@ -364,8 +386,7 @@ async def remove_member(
     caller = bytes.fromhex(current.pubkey_hex)
     target = bytes.fromhex(pubkey_hex)
     is_self = caller == target
-    admin_member = _find_admin(group)
-    is_admin = admin_member is not None and admin_member.pubkey == caller
+    is_admin = _is_admin(group, caller)
     if not (is_self or is_admin):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -722,8 +743,7 @@ async def send_group_message(
         )
 
     if group.is_channel:
-        admin_member = _find_admin(group)
-        if admin_member is None or admin_member.pubkey != sender_pubkey:
+        if not _is_admin(group, sender_pubkey):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="channel_admin_only_post",
@@ -1037,8 +1057,7 @@ async def delete_group_message(
         sender_pubkey_hex is not None
         and sender_pubkey_hex == current.pubkey_hex
     )
-    admin_member = _find_admin(group)
-    is_admin = admin_member is not None and admin_member.pubkey == caller
+    is_admin = _is_admin(group, caller)
 
     if not (is_sender or is_admin):
         raise HTTPException(
@@ -1154,8 +1173,7 @@ async def create_invite_token(
     gid = _parse_group_id(group_id)
     group = await _load_group(db, gid)
     caller = bytes.fromhex(current.pubkey_hex)
-    admin_member = _find_admin(group)
-    if admin_member is None or admin_member.pubkey != caller:
+    if not _is_admin(group, caller):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="only_admin_can_create_invites",
@@ -1198,8 +1216,7 @@ async def list_invite_tokens(
     gid = _parse_group_id(group_id)
     group = await _load_group(db, gid)
     caller = bytes.fromhex(current.pubkey_hex)
-    admin_member = _find_admin(group)
-    if admin_member is None or admin_member.pubkey != caller:
+    if not _is_admin(group, caller):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="only_admin_can_list_invites",
@@ -1238,8 +1255,7 @@ async def revoke_invite_token(
     gid = _parse_group_id(group_id)
     group = await _load_group(db, gid)
     caller = bytes.fromhex(current.pubkey_hex)
-    admin_member = _find_admin(group)
-    if admin_member is None or admin_member.pubkey != caller:
+    if not _is_admin(group, caller):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="only_admin_can_revoke_invites",

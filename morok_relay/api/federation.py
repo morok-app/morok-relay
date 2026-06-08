@@ -915,7 +915,7 @@ async def _handle_group_delete_to_host(
     to trust us as the host either.
     """
     from .groups import (
-        _find_admin, _is_member, _load_group, _group_home_relay,
+        _is_admin, _is_member, _load_group, _group_home_relay,
     )
     from ..queue import delete_envelope_for_group, get_envelope_meta
 
@@ -989,8 +989,7 @@ async def _handle_group_delete_to_host(
         sender_pubkey_hex is not None
         and sender_pubkey_hex == caller_pubkey_hex
     )
-    admin_member = _find_admin(group)
-    is_admin = admin_member is not None and admin_member.pubkey == caller_bytes
+    is_admin = _is_admin(group, caller_bytes)
     if not (is_sender or is_admin):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
