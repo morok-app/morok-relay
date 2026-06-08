@@ -300,6 +300,18 @@ class DMDeleteRequest(BaseModel):
         ..., min_length=64, max_length=64,
         pattern=r"^[0-9a-fA-F]{64}$",
     )
+    # Sender's Ed25519 signature over canonical_json({
+    #   "kind": "dm_delete",
+    #   "envelope_id": "<envelope_id>",
+    #   "ts": <ts>,
+    # }) — verified against current.pubkey_hex. Forwarded to the
+    # recipient's home relay so they can also verify without trusting
+    # the federation hop.
+    signature_hex: str = Field(
+        ..., min_length=128, max_length=128,
+        pattern=r"^[0-9a-fA-F]{128}$",
+    )
+    ts: int = Field(..., ge=0)
 
 
 class ReadReceiptItem(BaseModel):
@@ -453,6 +465,39 @@ async def delete_dm_message(
             detail="malformed_envelope_id",
         )
 
+    # ── Verify sender signature on the delete request ──────────────────
+    # Without this, a malicious trusted peer could fabricate "alice
+    # deleted msg X" via federation — censorship by impersonation. We
+    # require the sender to sign the delete intent so the recipient's
+    # relay (next hop, may be us if same-relay) can verify cryptographically
+    # before honouring it.
+    now = int(time.time())
+    if abs(now - body.ts) > 7 * 86400:
+        # ±7 days window — generous for clock skew + offline-then-delete,
+        # tight enough that a leaked signature can't be replayed forever.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="delete_ts_out_of_window",
+        )
+    sig_message = crypto.canonical_json({
+        "kind":        "dm_delete",
+        "envelope_id": envelope_id,
+        "ts":          body.ts,
+    })
+    try:
+        sig_bytes = bytes.fromhex(body.signature_hex)
+        sender_pubkey = bytes.fromhex(current.pubkey_hex)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="malformed_signature_or_pubkey",
+        )
+    if not crypto.ed25519_verify(sig_message, sig_bytes, sender_pubkey):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="invalid_delete_signature",
+        )
+
     result = await delete_envelope_by_sender(
         redis=redis,
         envelope_id=envelope_id,
@@ -505,6 +550,11 @@ async def delete_dm_message(
                 "envelope_id": envelope_id,
                 "recipient_pubkey_hex": body.recipient_pubkey_hex,
                 "deleted_by_pubkey_hex": current.pubkey_hex,
+                # Forward the sender's signature so the recipient's relay
+                # can verify the delete intent — federation trust alone
+                # is not enough.
+                "deleter_signature_hex": body.signature_hex,
+                "deleter_ts": body.ts,
             }
             from .groups import _synthetic_queue_id
             synthetic_id = _synthetic_queue_id("dmdel", envelope_id, target_relay)

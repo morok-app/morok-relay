@@ -108,6 +108,56 @@ def _forward_message(envelope: dict, relay_pubkey_hex: str, forwarded_at: int) -
     })
 
 
+def _verify_delete_sig(
+    *,
+    kind: str,
+    envelope_id: str,
+    ts,
+    sig_hex: str,
+    signer_pubkey_hex: str,
+    group_id: str | None = None,
+    ts_window_seconds: int = 7 * 86400,
+) -> bool:
+    """
+    Verify a sender's Ed25519 signature on a delete request that was
+    forwarded through federation.
+
+    The signed payload is the canonical_json of:
+      DM:    {"kind":"dm_delete",     "envelope_id":..., "ts":...}
+      Group: {"kind":"group_delete",  "group_id":..., "envelope_id":..., "ts":...}
+
+    Returns True if the signature checks out AND ts is within the
+    allowed window (defense against very-old replays). Returns False
+    on any malformed input — caller is expected to reject the request.
+    """
+    # Type / range guards — these are fields from an untrusted envelope.
+    try:
+        ts_int = int(ts)
+    except (TypeError, ValueError):
+        return False
+    import time as _t
+    if abs(int(_t.time()) - ts_int) > ts_window_seconds:
+        return False
+
+    payload = {"kind": kind, "envelope_id": envelope_id, "ts": ts_int}
+    if group_id is not None:
+        payload["group_id"] = group_id
+    message = crypto.canonical_json(payload)
+
+    try:
+        sig_bytes = bytes.fromhex(sig_hex)
+        pubkey_bytes = bytes.fromhex(signer_pubkey_hex)
+    except (TypeError, ValueError):
+        return False
+    if len(sig_bytes) != 64 or len(pubkey_bytes) != 32:
+        return False
+
+    try:
+        return crypto.ed25519_verify(message, sig_bytes, pubkey_bytes)
+    except Exception:  # noqa: BLE001 — verification failures must not 500
+        return False
+
+
 async def _get_or_create_peer(
     db,
     hostname: str,
@@ -727,23 +777,45 @@ async def _handle_group_snapshot_push(
 async def _handle_dm_delete_forward(envelope: dict, redis) -> "ForwardResponse":
     """
     Sender's home relay tells us a DM addressed to one of our local
-    users should be deleted. We perform the same Redis cleanup as
-    delete_envelope_by_sender would have, including the "deleted"
-    WS event push.
-
-    Authentication of the original sender already happened on their
-    home relay; we trust the federation hop.
+    users should be deleted. Verify the sender's signature on the
+    delete intent before acting — a trusted federation peer alone is
+    not sufficient authorization, otherwise any peer could forge
+    "alice deleted X" and censor our local users.
     """
     from ..queue import delete_envelope_by_sender
 
     envelope_id = envelope.get("envelope_id")
     recipient_pubkey_hex = envelope.get("recipient_pubkey_hex")
     caller_pubkey_hex = envelope.get("deleted_by_pubkey_hex")
+    deleter_sig_hex = envelope.get("deleter_signature_hex")
+    deleter_ts = envelope.get("deleter_ts")
 
     if not (envelope_id and recipient_pubkey_hex and caller_pubkey_hex):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="dm_delete_missing_fields",
+        )
+    if not deleter_sig_hex or deleter_ts is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="dm_delete_missing_signature",
+        )
+
+    if not _verify_delete_sig(
+        kind="dm_delete",
+        envelope_id=envelope_id,
+        ts=deleter_ts,
+        sig_hex=deleter_sig_hex,
+        signer_pubkey_hex=caller_pubkey_hex,
+    ):
+        logger.warning(
+            "Rejected federated dm_delete for %s — bad signature from claimed sender %s",
+            envelope_id[:8] if envelope_id else "?",
+            caller_pubkey_hex[:8] if caller_pubkey_hex else "?",
+        )
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="invalid_delete_signature",
         )
 
     result = await delete_envelope_by_sender(
@@ -837,6 +909,10 @@ async def _handle_group_delete_to_host(
     Peer relay forwarded us a group-delete request from one of their
     users. We're the host → authorize via meta (sender) OR admin →
     perform the full fan-out delete (local + federation to peers).
+
+    The sender's signature on the delete intent is verified here AND
+    re-propagated to other relays in the fan-out so they don't have
+    to trust us as the host either.
     """
     from .groups import (
         _find_admin, _is_member, _load_group, _group_home_relay,
@@ -846,11 +922,18 @@ async def _handle_group_delete_to_host(
     envelope_id = envelope.get("envelope_id")
     group_id_str = envelope.get("group_id")
     caller_pubkey_hex = envelope.get("deleted_by_pubkey_hex")
+    deleter_sig_hex = envelope.get("deleter_signature_hex")
+    deleter_ts = envelope.get("deleter_ts")
 
     if not (envelope_id and group_id_str and caller_pubkey_hex):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="group_delete_to_host_missing_fields",
+        )
+    if not deleter_sig_hex or deleter_ts is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="group_delete_missing_signature",
         )
     try:
         gid = uuid.UUID(group_id_str)
@@ -859,6 +942,23 @@ async def _handle_group_delete_to_host(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="malformed_id_or_pubkey",
+        )
+
+    if not _verify_delete_sig(
+        kind="group_delete",
+        envelope_id=envelope_id,
+        ts=deleter_ts,
+        sig_hex=deleter_sig_hex,
+        signer_pubkey_hex=caller_pubkey_hex,
+        group_id=str(gid),
+    ):
+        logger.warning(
+            "Rejected federated group_delete %s — bad signature from claimed sender %s",
+            envelope_id[:8], caller_pubkey_hex[:8],
+        )
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="invalid_delete_signature",
         )
 
     group = await _load_group(db, gid)
@@ -938,6 +1038,11 @@ async def _handle_group_delete_to_host(
             "envelope_id": envelope_id,
             "deleted_by_pubkey_hex": caller_pubkey_hex,
             "deliver_to_pubkeys": members_on_relay,
+            # Re-propagate the verified sender signature unchanged so
+            # the delivering relay can verify it locally rather than
+            # trust us (the host) as a federation hop.
+            "deleter_signature_hex": deleter_sig_hex,
+            "deleter_ts": deleter_ts,
         }
         from .groups import _synthetic_queue_id
         synthetic_id = _synthetic_queue_id("deldlv", envelope_id, target_relay)
@@ -975,6 +1080,11 @@ async def _handle_group_delete_deliver(
     """
     Host relay tells us: drop this group envelope from these specific
     local member inboxes and push a "deleted" WS event to each.
+
+    The host has already verified the sender's authorization. We
+    independently re-verify the sender's signature on the delete
+    intent — this means a compromised host cannot censor messages
+    in our local users' inboxes by forging deletes.
     """
     from ..queue import delete_envelope_for_group
     from ..models import User
@@ -983,11 +1093,35 @@ async def _handle_group_delete_deliver(
     group_id_str = envelope.get("group_id")
     caller_pubkey_hex = envelope.get("deleted_by_pubkey_hex")
     raw_recipients = envelope.get("deliver_to_pubkeys") or []
+    deleter_sig_hex = envelope.get("deleter_signature_hex")
+    deleter_ts = envelope.get("deleter_ts")
 
     if not (envelope_id and group_id_str and caller_pubkey_hex and raw_recipients):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="group_delete_deliver_missing_fields",
+        )
+    if not deleter_sig_hex or deleter_ts is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="group_delete_missing_signature",
+        )
+
+    if not _verify_delete_sig(
+        kind="group_delete",
+        envelope_id=envelope_id,
+        ts=deleter_ts,
+        sig_hex=deleter_sig_hex,
+        signer_pubkey_hex=caller_pubkey_hex,
+        group_id=group_id_str,
+    ):
+        logger.warning(
+            "Rejected federated group_delete_deliver %s — bad signature from claimed sender %s",
+            envelope_id[:8], caller_pubkey_hex[:8],
+        )
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="invalid_delete_signature",
         )
 
     recipient_bytes: list[bytes] = []

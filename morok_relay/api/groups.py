@@ -16,7 +16,8 @@ import logging
 import time
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
@@ -878,6 +879,22 @@ async def send_group_message(
     )
 
 
+class GroupDeleteRequest(BaseModel):
+    # Sender's Ed25519 signature over canonical_json({
+    #   "kind": "group_delete",
+    #   "group_id": "<group_uuid>",
+    #   "envelope_id": "<envelope_id>",
+    #   "ts": <ts>,
+    # }) — verified against current.pubkey_hex and forwarded unchanged
+    # through the federation hop chain (sender → host → other relays)
+    # so each delivering relay can verify cryptographically.
+    signature_hex: str = Field(
+        ..., min_length=128, max_length=128,
+        pattern=r"^[0-9a-fA-F]{128}$",
+    )
+    ts: int = Field(..., ge=0)
+
+
 @router.post(
     "/{group_id}/messages/{envelope_id}/delete",
     summary="Delete a group message (sender or group admin)",
@@ -885,6 +902,7 @@ async def send_group_message(
 async def delete_group_message(
     group_id: str,
     envelope_id: str,
+    body: GroupDeleteRequest,
     current: CurrentSession,
     db: DBSession,
     redis: RedisClient,
@@ -917,6 +935,37 @@ async def delete_group_message(
     caller = bytes.fromhex(current.pubkey_hex)
     settings = get_settings()
 
+    # ── Verify sender signature on the delete request ──────────────────
+    # A trusted federation peer must not be able to fabricate "alice
+    # deleted msg X" — that's a censorship vector. The caller signs
+    # their intent here, the signature is forwarded unchanged through
+    # the host hop (case A) and the per-relay deliver hops (case B),
+    # and each receiving relay verifies it against deleted_by_pubkey.
+    now = int(time.time())
+    if abs(now - body.ts) > 7 * 86400:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="delete_ts_out_of_window",
+        )
+    sig_message = crypto.canonical_json({
+        "kind":        "group_delete",
+        "group_id":    str(gid),
+        "envelope_id": envelope_id,
+        "ts":          body.ts,
+    })
+    try:
+        sig_bytes = bytes.fromhex(body.signature_hex)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="malformed_signature",
+        )
+    if not crypto.ed25519_verify(sig_message, sig_bytes, caller):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="invalid_delete_signature",
+        )
+
     if not _is_member(group, caller):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -936,6 +985,10 @@ async def delete_group_message(
             "group_id": str(group.id),
             "envelope_id": envelope_id,
             "deleted_by_pubkey_hex": current.pubkey_hex,
+            # Sender's signature, forwarded so host can verify the
+            # delete intent rather than trusting our forwarding hop.
+            "deleter_signature_hex": body.signature_hex,
+            "deleter_ts": body.ts,
         }
         synthetic_id = _synthetic_queue_id("del", envelope_id, home)
         dup_stmt = (
@@ -1035,6 +1088,10 @@ async def delete_group_message(
             "envelope_id": envelope_id,
             "deleted_by_pubkey_hex": current.pubkey_hex,
             "deliver_to_pubkeys": members_on_relay,
+            # Original sender's signature forwarded unchanged so each
+            # receiving relay can verify (not trust the host's fan-out).
+            "deleter_signature_hex": body.signature_hex,
+            "deleter_ts": body.ts,
         }
         synthetic_id = _synthetic_queue_id("deldlv", envelope_id, target_relay)
         dup_stmt = (
