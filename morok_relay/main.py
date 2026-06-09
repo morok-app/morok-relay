@@ -9,6 +9,7 @@ import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from . import __version__
@@ -54,6 +55,42 @@ app = FastAPI(
     docs_url="/docs" if not settings.is_production else None,
     redoc_url="/redoc" if not settings.is_production else None,
     openapi_url="/openapi.json" if not settings.is_production else None,
+)
+
+
+# ============================================================================
+# CORS — allow the Capacitor mobile app (Android+iOS) to call the API.
+# ============================================================================
+#
+# The web client lives on the SAME origin as the relay (https://relay1.morok.app
+# serves both the API and /web/), so for browser users CORS is irrelevant —
+# same-origin requests aren't subject to it. The mobile app, however, runs
+# inside a WebView whose origin is one of these constants depending on
+# platform and Capacitor version:
+#
+#   Android default:           http://localhost  (Capacitor's local HTTP server)
+#   iOS default:               capacitor://localhost
+#   Older Capacitor / config:  https://localhost
+#
+# We allow all three. We do NOT allow_credentials — auth is via the
+# Authorization header (Bearer token), not cookies, so credential-less
+# CORS is sufficient and avoids the "no wildcard with credentials" footgun.
+#
+# We don't allow arbitrary origins ("*") because that would let any random
+# webpage's JavaScript hit our API from a logged-in user's browser. The
+# narrow allow-list below restricts to our own mobile builds.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost",
+        "https://localhost",
+        "capacitor://localhost",
+    ],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "DELETE", "PUT", "PATCH", "OPTIONS"],
+    allow_headers=["*"],
+    expose_headers=["*"],
+    max_age=3600,
 )
 
 
