@@ -26,6 +26,7 @@ from ..config import get_settings
 from ..deps import CurrentSession, DBSession, RedisClient
 from ..models import FederationOutboundQueue, FedQueueStatus, Group, GroupMember, User, UserTier
 from ..queue import (
+    publish_group_gone,
     delete_envelope_for_group,
     enqueue_envelope_for_recipients,
     envelope_exists,
@@ -301,6 +302,7 @@ async def get_group(
 @router.delete("/{group_id}")
 async def delete_group(
     group_id: str, current: CurrentSession, db: DBSession,
+    redis: RedisClient,
 ) -> dict:
     gid = _parse_group_id(group_id)
     group = await _load_group(db, gid)
@@ -310,7 +312,23 @@ async def delete_group(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="only_creator_can_delete",
         )
+    # Collect member pubkeys BEFORE tombstoning, so we can notify them.
+    member_pubkeys = [
+        m.pubkey.hex() for m in group.members
+        if m.pubkey != pubkey
+    ]
     group.deleted_at = int(time.time())
+
+    # Real-time push to local members: "this group is gone". Members on
+    # other relays learn about it lazily (404 on next group refresh in
+    # the client). Best-effort — failures here must not fail the delete.
+    try:
+        await publish_group_gone(
+            redis, member_pubkeys, str(group.id), current.pubkey_hex,
+        )
+    except Exception:
+        pass
+
     return {"deleted": True, "group_id": str(group.id)}
 
 

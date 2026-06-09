@@ -81,6 +81,37 @@ def _read_event(
     })
 
 
+def _group_gone_event(group_id: str, by_pubkey_hex: str) -> str:
+    return json.dumps({
+        "kind": "group_gone",
+        "group_id": group_id,
+        "by": by_pubkey_hex,
+    })
+
+
+async def publish_group_gone(
+    redis: redis_async.Redis,
+    recipient_pubkeys_hex: list[str],
+    group_id: str,
+    by_pubkey_hex: str,
+) -> None:
+    """
+    Notify group members that the group was deleted by its creator.
+
+    Ephemeral push (like read receipts): if a member's WS is offline,
+    the event is lost — but that's fine, because clients also detect
+    deleted groups lazily (GET /groups/{id} -> 404 on next open).
+    """
+    event = _group_gone_event(group_id, by_pubkey_hex)
+    for pk in recipient_pubkeys_hex:
+        try:
+            await redis.publish(_inbox_channel(pk), event)
+        except Exception as e:
+            logger.warning(
+                "publish_group_gone failed for %s: %s", pk[:8], e,
+            )
+
+
 async def publish_read_receipt(
     redis: redis_async.Redis,
     sender_pubkey_hex: str,

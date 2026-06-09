@@ -160,6 +160,12 @@ async def inbox_socket(
                             "reader": event.get("reader"),
                             "group_id": event.get("group_id"),
                         })
+                    elif kind == "group_gone":
+                        await websocket.send_json({
+                            "type": "group_gone",
+                            "group_id": event.get("group_id"),
+                            "by": event.get("by"),
+                        })
                     else:
                         logger.warning("inbox WS: unknown event kind %s", kind)
                     continue
