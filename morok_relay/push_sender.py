@@ -159,7 +159,7 @@ def _send_fcm_blocking(token: str) -> str:
                     "android": {
                         "priority": "HIGH",
                         "notification": {
-                            "channel_id": "messages",
+                            "channel_id": "messages_v2",
                         },
                     },
                 }
