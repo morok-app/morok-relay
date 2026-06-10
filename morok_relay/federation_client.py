@@ -22,6 +22,57 @@ logger = logging.getLogger(__name__)
 
 REQUEST_TIMEOUT_SECONDS = 10.0
 
+# ── SSRF guard ─────────────────────────────────────────────────────
+# peer_hostname приходить із зовнішнього вводу (?relay=... у lookup,
+# поля у federation-запитах). Без перевірки зловмисник змусить релей
+# слати HTTPS на будь-який хост: внутрішні адреси (169.254.169.254
+# метадані хмари, 127.0.0.1 локальні сервіси, 10.x/192.168.x інтранет)
+# або довільні зовнішні хости (relay як проксі для сканування/DoS).
+import ipaddress
+import re
+import socket
+
+_HOSTNAME_RE = re.compile(
+    r"^(?=.{1,253}$)([a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+"
+    r"[a-zA-Z]{2,63}$"
+)
+
+
+def _is_public_ip(ip_str: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return False
+    return not (
+        ip.is_private or ip.is_loopback or ip.is_link_local
+        or ip.is_multicast or ip.is_reserved or ip.is_unspecified
+    )
+
+
+def is_safe_peer_hostname(hostname: str) -> bool:
+    """
+    True лише якщо hostname — валідне публічне FQDN, що НЕ резолвиться
+    у приватну/локальну адресу. Голі IP заборонені (федерація завжди
+    по доменах). Будь-який сумнів = відмова (fail closed).
+    """
+    if not hostname or not _HOSTNAME_RE.match(hostname):
+        return False
+    # Заборонити голі IP, які пройшли б regex лише частково — і
+    # перевірити, що домен не вказує на приватну мережу (DNS rebinding
+    # пом'якшуємо: резолвимо й валідуємо всі A/AAAA записи).
+    try:
+        infos = socket.getaddrinfo(hostname, 443, proto=socket.IPPROTO_TCP)
+    except (socket.gaierror, UnicodeError):
+        return False
+    if not infos:
+        return False
+    for info in infos:
+        ip_str = info[4][0]
+        if not _is_public_ip(ip_str):
+            return False
+    return True
+
+
 
 async def remote_handshake(peer_hostname: str) -> dict | None:
     settings = get_settings()
@@ -46,6 +97,9 @@ async def remote_handshake(peer_hostname: str) -> dict | None:
         "signature_hex": signature.hex(),
     }
     url = f"https://{peer_hostname}/api/v1/federation/handshake"
+    if not is_safe_peer_hostname(peer_hostname):
+        logger.warning("Blocked federation call to unsafe host: %r", peer_hostname)
+        return None
     try:
         async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
             response = await client.post(url, json=payload)
@@ -85,6 +139,9 @@ async def remote_forward(peer_hostname: str, envelope: dict) -> dict | None:
         "forwarded_at": forwarded_at,
     }
     url = f"https://{peer_hostname}/api/v1/federation/forward"
+    if not is_safe_peer_hostname(peer_hostname):
+        logger.warning("Blocked federation call to unsafe host: %r", peer_hostname)
+        return None
     try:
         async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
             response = await client.post(url, json=payload)
@@ -98,6 +155,9 @@ async def remote_forward(peer_hostname: str, envelope: dict) -> dict | None:
 async def remote_lookup(peer_hostname: str, username: str) -> dict | None:
     """Look up a username on a remote relay. Public API, no signing needed."""
     url = f"https://{peer_hostname}/api/v1/federation/users/lookup/{username}"
+    if not is_safe_peer_hostname(peer_hostname):
+        logger.warning("Blocked federation call to unsafe host: %r", peer_hostname)
+        return None
     try:
         async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
             response = await client.get(url)
@@ -147,6 +207,9 @@ async def remote_pull_group_snapshot(
         "timestamp": timestamp,
     }
     url = f"https://{peer_hostname}/api/v1/federation/group_snapshot/pull"
+    if not is_safe_peer_hostname(peer_hostname):
+        logger.warning("Blocked federation call to unsafe host: %r", peer_hostname)
+        return None
     try:
         async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
             response = await client.post(url, json=payload)
