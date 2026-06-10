@@ -23,6 +23,9 @@ httpx==0.28.1
 # === Web push ===
 pywebpush==2.0.0
 
+# === Native push (FCM, OAuth для Firebase HTTP v1 API) ===
+google-auth==2.37.0
+
 # === WebSocket support ===
 websockets==14.1
 

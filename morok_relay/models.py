@@ -352,6 +352,14 @@ class PushSubscription(Base):
     endpoint: Mapped[str] = mapped_column(Text, nullable=False)
     p256dh: Mapped[str] = mapped_column(String(255), nullable=False)
     auth: Mapped[str] = mapped_column(String(255), nullable=False)
+    # 'webpush' — браузерна підписка (VAPID, pywebpush, payload шифрується
+    # end-to-end до браузера за RFC 8291).
+    # 'fcm' — нативний Android (Firebase Cloud Messaging): endpoint = FCM
+    # device token, p256dh/auth = ''. Payload FCM читається Google, тому
+    # туди НІКОЛИ не кладемо нічого, крім generic-тексту (див. push_sender).
+    platform: Mapped[str] = mapped_column(
+        String(16), nullable=False, server_default="webpush",
+    )
     user_agent: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[int] = mapped_column(
         BigInteger, nullable=False,

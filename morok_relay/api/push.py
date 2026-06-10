@@ -123,3 +123,74 @@ async def post_unsubscribe(
     )
     await db.flush()
     return {"ok": True, "removed": result.rowcount or 0}
+
+
+# ─── Нативні (FCM) підписки ──────────────────────────────────────────
+
+class NativePushSubscribeRequest(BaseModel):
+    token: str = Field(..., min_length=10, max_length=4096)
+    user_agent: str | None = Field(default=None, max_length=255)
+
+
+class NativePushUnsubscribeRequest(BaseModel):
+    token: str = Field(..., min_length=10, max_length=4096)
+
+
+@router.post(
+    "/subscribe-native",
+    summary="Register or update a native (FCM) push token for this device",
+)
+async def post_subscribe_native(
+    body: NativePushSubscribeRequest,
+    current: CurrentSession,
+    db: DBSession,
+) -> dict:
+    """
+    Native Android push. `token` — FCM device token; зберігаємо його в
+    endpoint, p256dh/auth порожні (це поля web push). Доступність FCM
+    на боці релея (service account) не перевіряємо тут навмисно:
+    підписка може бути зареєстрована до того, як адмін донастроїв
+    relay, і запрацює без повторної реєстрації.
+    """
+    pubkey = bytes.fromhex(current.pubkey_hex)
+    now = int(time.time())
+
+    stmt = (
+        select(PushSubscription)
+        .where(PushSubscription.pubkey == pubkey)
+        .where(PushSubscription.endpoint == body.token)
+    )
+    existing = (await db.execute(stmt)).scalar_one_or_none()
+
+    if existing is not None:
+        existing.platform = "fcm"
+        existing.user_agent = body.user_agent
+        existing.updated_at = now
+    else:
+        db.add(PushSubscription(
+            pubkey=pubkey,
+            endpoint=body.token,
+            p256dh="",
+            auth="",
+            platform="fcm",
+            user_agent=body.user_agent,
+        ))
+    return {"subscribed": True}
+
+
+@router.post(
+    "/unsubscribe-native",
+    summary="Remove a native (FCM) push token for this device",
+)
+async def post_unsubscribe_native(
+    body: NativePushUnsubscribeRequest,
+    current: CurrentSession,
+    db: DBSession,
+) -> dict:
+    pubkey = bytes.fromhex(current.pubkey_hex)
+    await db.execute(
+        delete(PushSubscription)
+        .where(PushSubscription.pubkey == pubkey)
+        .where(PushSubscription.endpoint == body.token)
+    )
+    return {"unsubscribed": True}

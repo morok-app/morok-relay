@@ -85,6 +85,13 @@ class Settings(BaseSettings):
         description="VAPID `sub` claim — admin contact for push providers.",
     )
 
+    # Firebase Cloud Messaging (нативні Android-пуші). Вимкнено, поки
+    # файла немає. Service-account JSON з Firebase Console:
+    # Project Settings -> Service accounts -> Generate new private key.
+    fcm_service_account_path: Path = Field(
+        default=Path("/etc/morok/fcm-service-account.json"),
+    )
+
 
 @lru_cache
 def get_settings() -> Settings:

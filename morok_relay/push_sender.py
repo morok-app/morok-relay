@@ -95,6 +95,91 @@ def _send_blocking(
         return "err"
 
 
+# ─── FCM (нативний Android) ──────────────────────────────────────────
+#
+# Web push шифрує payload end-to-end до браузера (RFC 8291), тому туди
+# можна класти from_username. FCM-повідомлення читається інфраструктурою
+# Google — тому для FCM payload максимально порожній: generic title/body,
+# БЕЗ відправника, БЕЗ group_id, без жодних метаданих. Користувач
+# відкриває застосунок і бачить, що прийшло, через звичайний WS/інбокс.
+
+_FCM_CREDS_CACHE: tuple | None = None  # (credentials, project_id)
+
+
+def _load_fcm_credentials():
+    """Service-account credentials + project id. None => FCM вимкнено."""
+    global _FCM_CREDS_CACHE
+    if _FCM_CREDS_CACHE is not None:
+        return _FCM_CREDS_CACHE
+
+    settings = get_settings()
+    path = Path(settings.fcm_service_account_path)
+    if not path.is_file():
+        return None
+    try:
+        from google.oauth2 import service_account  # lazy: optional dep
+
+        info = json.loads(path.read_text())
+        creds = service_account.Credentials.from_service_account_info(
+            info, scopes=["https://www.googleapis.com/auth/firebase.messaging"],
+        )
+        project_id = info.get("project_id")
+        if not project_id:
+            logger.warning("FCM service account has no project_id, disabled")
+            return None
+        _FCM_CREDS_CACHE = (creds, project_id)
+        return _FCM_CREDS_CACHE
+    except Exception as e:
+        logger.warning("FCM service account unusable: %s", e)
+        return None
+
+
+def _send_fcm_blocking(token: str) -> str:
+    """
+    Send one generic FCM notification. Returns 'ok' | 'gone' | 'error'.
+    Runs on the push thread-pool (google-auth transport is sync).
+    """
+    loaded = _load_fcm_credentials()
+    if loaded is None:
+        return "error"
+    creds, project_id = loaded
+    try:
+        from google.auth.transport.requests import AuthorizedSession
+
+        session = AuthorizedSession(creds)  # auto-refreshes OAuth token
+        resp = session.post(
+            f"https://fcm.googleapis.com/v1/projects/{project_id}/messages:send",
+            json={
+                "message": {
+                    "token": token,
+                    "notification": {
+                        "title": "Morok",
+                        "body": "Нове повідомлення",
+                    },
+                    "android": {
+                        "priority": "HIGH",
+                        "notification": {
+                            "channel_id": "messages",
+                        },
+                    },
+                }
+            },
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            return "ok"
+        # 404 UNREGISTERED / 400 invalid token => підписка мертва, чистимо
+        if resp.status_code in (400, 404):
+            body = resp.text or ""
+            if "UNREGISTERED" in body or "INVALID_ARGUMENT" in body or resp.status_code == 404:
+                return "gone"
+        logger.warning("FCM send failed (%d): %.200s", resp.status_code, resp.text)
+        return "error"
+    except Exception as e:
+        logger.warning("FCM send exception: %s", e)
+        return "error"
+
+
 async def trigger_push(
     db: AsyncSession,
     redis,
@@ -116,12 +201,14 @@ async def trigger_push(
     api/groups.py) must never await this on the critical path.
     """
     settings = get_settings()
-    if not settings.vapid_public_key_b64:
-        return  # Push globally disabled
 
-    private_pem = _load_private_key()
-    if private_pem is None:
-        return
+    webpush_pem = None
+    if settings.vapid_public_key_b64:
+        webpush_pem = _load_private_key()
+    fcm_ready = _load_fcm_credentials() is not None
+
+    if webpush_pem is None and not fcm_ready:
+        return  # Push globally disabled (ні webpush, ні FCM)
 
     # Filter out recipients with active WS
     offline: list[str] = []
@@ -160,15 +247,24 @@ async def trigger_push(
     now = int(time.time())
 
     async def send_one(row: PushSubscription) -> None:
-        sub_dict = {
-            "endpoint": row.endpoint,
-            "keys": {"p256dh": row.p256dh, "auth": row.auth},
-        }
-        result = await loop.run_in_executor(
-            _executor,
-            _send_blocking,
-            sub_dict, payload, private_pem, settings.vapid_subject,
-        )
+        if getattr(row, "platform", "webpush") == "fcm":
+            if not fcm_ready:
+                return
+            result = await loop.run_in_executor(
+                _executor, _send_fcm_blocking, row.endpoint,
+            )
+        else:
+            if webpush_pem is None:
+                return
+            sub_dict = {
+                "endpoint": row.endpoint,
+                "keys": {"p256dh": row.p256dh, "auth": row.auth},
+            }
+            result = await loop.run_in_executor(
+                _executor,
+                _send_blocking,
+                sub_dict, payload, webpush_pem, settings.vapid_subject,
+            )
         if result == "gone":
             gone_endpoints.append((row.pubkey, row.endpoint))
         elif result == "ok":
