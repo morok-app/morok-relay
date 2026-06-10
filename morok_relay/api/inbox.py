@@ -78,7 +78,10 @@ async def inbox_socket(
     ws_active_key = f"morok:ws:active:{pubkey_hex}"
     try:
         await redis.incr(ws_active_key)
-        await redis.expire(ws_active_key, 3600)
+        # Короткий TTL: якщо з'єднання померло без FIN (вбитий застосунок,
+        # обрив мережі), лічильник зникне за ~90с і пуші підуть. Живі
+        # з'єднання оновлюють TTL у pinger_task кожні 30с.
+        await redis.expire(ws_active_key, 90)
     except Exception as e:
         logger.warning("ws-active incr failed for %s: %s", pubkey_hex[:8], e)
 
@@ -222,6 +225,11 @@ async def inbox_socket(
             while True:
                 await asyncio.sleep(PING_INTERVAL_SECONDS)
                 await websocket.send_json({"type": "ping"})
+                # Живе з'єднання => тримаємо лічильник онлайну живим.
+                try:
+                    await redis.expire(ws_active_key, 90)
+                except Exception:
+                    pass
         except asyncio.CancelledError:
             raise
 
