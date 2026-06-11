@@ -52,6 +52,10 @@ class Settings(BaseSettings):
     rate_limit_enabled: bool = Field(default=True)
     rate_limit_auth_per_minute: int = Field(default=10)
     rate_limit_messages_per_minute: int = Field(default=60)
+
+    # Sealed Sender: ліміт відправки ПО delivery-токену (релей не знає
+    # хто шле, але стримує як часто шлють конкретному одержувачу).
+    rate_limit_sealed_per_minute: int = 30
     rate_limit_group_create_per_minute: int = Field(default=5)
     rate_limit_group_messages_per_minute: int = Field(default=30)
     rate_limit_dms_create_per_minute: int = Field(default=5)

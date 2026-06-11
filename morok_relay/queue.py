@@ -28,6 +28,8 @@ Keys
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import logging
 import time
@@ -150,9 +152,17 @@ async def enqueue_envelope(
     signature_hex: str,
     hard_ceiling_seconds: int,
     sender_username: str | None = None,
+    sealed: bool = False,
+    delete_key_hash: str | None = None,
 ) -> int | None:
     """
     Add an envelope to the recipient's inbox queue and publish a notification.
+
+    Sealed Sender: when `sealed=True`, `sender_pubkey_hex`/`signature_hex`
+    are empty strings — sender identity lives INSIDE the encrypted blob
+    and is verified by the recipient client. `delete_key_hash` (sha256
+    hex) lets the anonymous sender later prove deletion rights by
+    presenting the preimage — without revealing who they are.
 
     `sender_username` is the username of the sender AT SEND TIME — included
     in the metadata so the recipient's client can display "@bob" instead of
@@ -183,6 +193,10 @@ async def enqueue_envelope(
         "sig": signature_hex,
         "expires_at": expires_at,
     }
+    if sealed:
+        meta["sealed"] = True
+        if delete_key_hash:
+            meta["delete_key_hash"] = delete_key_hash
 
     # SET NX is the dedup gate — only one writer "wins" the slot.
     written = await redis.set(
@@ -412,6 +426,57 @@ async def delete_envelope_by_sender(
         "ok": True,
         "deleted_from_queue": bool(results[0]),
         "meta_existed": meta_existed,
+        "error": None,
+    }
+
+
+async def delete_sealed_envelope(
+    redis: redis_async.Redis,
+    envelope_id: str,
+    delete_key_hex: str,
+) -> dict:
+    """
+    Anonymous sender deletes their SEALED envelope by presenting the
+    preimage of the delete_key_hash stored in the envelope meta.
+
+    Unlike delete_envelope_by_sender we CANNOT fall back to trusting the
+    caller when meta has expired — there is no authenticated identity to
+    trust. No meta => nothing to authorize against => error.
+
+    Returns dict: ok, deleted_from_queue, error
+        error: "not_found" | "not_sealed" | "wrong_key" | None
+    """
+    meta_raw = await redis.get(_envelope_meta_key(envelope_id))
+    if meta_raw is None:
+        return {"ok": False, "deleted_from_queue": False, "error": "not_found"}
+    try:
+        meta = json.loads(meta_raw)
+    except json.JSONDecodeError:
+        return {"ok": False, "deleted_from_queue": False, "error": "not_found"}
+
+    if not meta.get("sealed") or not meta.get("delete_key_hash"):
+        return {"ok": False, "deleted_from_queue": False, "error": "not_sealed"}
+
+    try:
+        presented = hashlib.sha256(bytes.fromhex(delete_key_hex)).hexdigest()
+    except ValueError:
+        return {"ok": False, "deleted_from_queue": False, "error": "wrong_key"}
+    if not hmac.compare_digest(presented, meta["delete_key_hash"]):
+        return {"ok": False, "deleted_from_queue": False, "error": "wrong_key"}
+
+    recipient_pubkey_hex = meta.get("to") or ""
+    # deleted_by порожній — відправник анонімний навіть у delete-події.
+    event_payload = _deleted_event(envelope_id, "")
+
+    async with redis.pipeline(transaction=True) as pipe:
+        pipe.zrem(_inbox_key(recipient_pubkey_hex), envelope_id)
+        pipe.delete(_envelope_meta_key(envelope_id))
+        pipe.publish(_inbox_channel(recipient_pubkey_hex), event_payload)
+        results = await pipe.execute()
+
+    return {
+        "ok": True,
+        "deleted_from_queue": bool(results[0]),
         "error": None,
     }
 

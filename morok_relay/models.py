@@ -326,6 +326,30 @@ class DMSRecipient(Base):
 # WEB PUSH SUBSCRIPTIONS
 # ============================================================================
 
+class InboxToken(Base):
+    """
+    Sealed Sender delivery token (hash only — plaintext never reaches us).
+
+    The recipient generates a random secret token client-side, registers
+    sha256(token) here, and shares the token itself with contacts over
+    E2EE. A sealed envelope is accepted iff sha256(presented_token)
+    matches a registered hash for the recipient. Up to 2 rows per user
+    (current + previous) so rotation doesn't break in-flight senders.
+    """
+    __tablename__ = "inbox_tokens"
+
+    id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, autoincrement=True,
+    )
+    pubkey: Mapped[bytes] = mapped_column(
+        LargeBinary(32), nullable=False, index=True,
+    )
+    token_hash: Mapped[str] = mapped_column(
+        String(64), nullable=False, unique=True,
+    )
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+
 class PushSubscription(Base):
     """
     Browser web push subscription. One row per (user, device-endpoint).
