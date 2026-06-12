@@ -267,11 +267,11 @@ async def delete_sealed(
         delete_key_hex=body.delete_key,
     )
     err = result.get("error")
-    if err == "not_found":
-        # Мета зникла (доставлено/протухло) — видаляти нічого, але
-        # детальніше не відповідаємо, щоб не давати oracle.
-        raise HTTPException(status_code=404, detail="envelope_not_found")
-    if err in ("not_sealed", "wrong_key"):
+    # Uniform response for every failure mode (not_found / not_sealed /
+    # wrong_key): a single opaque 403 so a caller holding an envelope_id
+    # can't use the status code as an oracle to learn whether the
+    # envelope still exists / is sealed / had a different delete-key.
+    if err is not None:
         raise HTTPException(status_code=403, detail="delete_not_authorized")
 
     return {"deleted": True, "envelope_id": envelope_id}

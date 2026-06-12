@@ -50,6 +50,14 @@ class Settings(BaseSettings):
 
     # ----- Rate limiting -----
     rate_limit_enabled: bool = Field(default=True)
+
+    # Proxy IPs whose forwarded headers (X-Real-IP / X-Forwarded-For) we
+    # trust. Direct connections from any OTHER source have their forwarded
+    # headers IGNORED — otherwise anyone reaching uvicorn directly (past
+    # nginx) could spoof X-Real-IP to bypass IP rate-limits and poison the
+    # audit log. Comma-separated. Default: loopback only (standard nginx
+    # reverse-proxy on the same host).
+    trusted_proxy_ips: str = Field(default="127.0.0.1,::1")
     rate_limit_auth_per_minute: int = Field(default=10)
     rate_limit_messages_per_minute: int = Field(default=60)
 

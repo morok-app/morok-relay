@@ -75,13 +75,13 @@ def _daily_ip_hash(ip: str) -> str:
 
 def _extract_client_ip(request: Request) -> str:
     """
-    Best-effort client IP extraction. We sit behind nginx which sets
-    X-Forwarded-For; the leftmost entry is the real client.
+    Client IP for the login audit log. Delegates to the hardened
+    rate_limit.get_ip_from_request, which only trusts forwarded headers
+    from configured trusted proxies — so a direct connection past nginx
+    can't spoof the IP recorded in login_log.
     """
-    fwd = request.headers.get("x-forwarded-for")
-    if fwd:
-        return fwd.split(",")[0].strip()
-    return request.client.host if request.client else "unknown"
+    from ..rate_limit import get_ip_from_request
+    return get_ip_from_request(request)
 
 
 async def _record_login(

@@ -17,6 +17,12 @@ from .sessions import Session, verify_session_token
 
 logger = logging.getLogger(__name__)
 
+# DMS check-in is bumped at most once per this window per pubkey, to avoid
+# spawning an unbounded number of background DB-session tasks (one per
+# authenticated request). 5 minutes is far finer than DMS needs — it fires
+# on inactivity measured in days.
+DMS_CHECKIN_THROTTLE_SECONDS = 300
+
 
 async def _bump_dms_check_in_for_pubkey(pubkey_hex: str) -> None:
     """
@@ -87,10 +93,28 @@ async def get_current_session(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    # Fire-and-forget: bump DMS check-in. Doesn't block the response.
-    # If the user has no armed DMS, the UPDATE is a no-op (still cheap with
-    # the (creator_pubkey, status) index).
-    asyncio.create_task(_bump_dms_check_in_for_pubkey(session.pubkey_hex))
+    # Fire-and-forget: bump DMS check-in. THROTTLED to once per
+    # DMS_CHECKIN_THROTTLE_SECONDS per pubkey via an atomic Redis SET NX.
+    # Without this throttle, every authenticated request spawned an
+    # unbounded background task opening its own DB session — a self-DoS
+    # vector under load. DMS fires on days/weeks of inactivity, so
+    # 5-minute granularity on "user is alive" is more than enough.
+    #
+    # SET NX returns True only for the FIRST request in the window; all
+    # others skip spawning entirely. If Redis is down we skip the bump
+    # (fail-safe: a missed check-in only delays nothing — the next
+    # request bumps it; DMS won't misfire from one skipped bump).
+    try:
+        should_bump = await redis.set(
+            f"morok:dms:checkin_throttle:{session.pubkey_hex}",
+            b"1",
+            nx=True,
+            ex=DMS_CHECKIN_THROTTLE_SECONDS,
+        )
+    except Exception:
+        should_bump = False
+    if should_bump:
+        asyncio.create_task(_bump_dms_check_in_for_pubkey(session.pubkey_hex))
 
     return session
 

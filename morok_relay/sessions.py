@@ -74,8 +74,12 @@ async def create_session(redis: redis_async.Redis, pubkey_hex: str) -> Session:
     )
 
     # Track in reverse index so we can revoke all sessions for a user.
-    # The set itself doesn't have TTL — entries are cleaned up lazily.
+    # The SET gets a TTL slightly longer than the session TTL and is
+    # refreshed on each verify — so a naturally-expired session's token
+    # doesn't linger in the index forever (it would otherwise accumulate
+    # dead tokens and bloat Redis / slow revoke_all).
     await redis.sadd(_user_sessions_key(pubkey_hex), token.encode("utf-8"))
+    await redis.expire(_user_sessions_key(pubkey_hex), SESSION_TTL_SECONDS + 86400)
 
     return Session(token=token, pubkey_hex=pubkey_hex, expires_at=expires_at)
 
@@ -100,6 +104,11 @@ async def verify_session_token(
 
     # Sliding window: every use extends TTL by full 7 days from now.
     await redis.expire(key, SESSION_TTL_SECONDS)
+    # Keep the reverse index alive alongside, so logout-everywhere stays
+    # accurate and the SET doesn't expire out from under an active user.
+    await redis.expire(
+        _user_sessions_key(pubkey_hex), SESSION_TTL_SECONDS + 86400
+    )
 
     expires_at = int(time.time()) + SESSION_TTL_SECONDS
     return Session(token=token, pubkey_hex=pubkey_hex, expires_at=expires_at)

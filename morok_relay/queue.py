@@ -38,6 +38,15 @@ import redis.asyncio as redis_async
 
 logger = logging.getLogger(__name__)
 
+# Hard cap on how many envelopes may sit in one recipient's inbox queue
+# at once. Anti-flood storage guard — a recipient who hasn't been online
+# can accumulate at most this many pending messages; beyond it, new sends
+# are refused until they drain. Generous enough never to bite normal use
+# (even a chatty group over days), tight enough to bound disk/Redis per
+# user. Expired envelopes are pruned before this is checked, so it only
+# counts live, undelivered messages.
+MAX_INBOX_QUEUE_DEPTH = 5000
+
 
 def _inbox_key(recipient_pubkey_hex: str) -> str:
     return f"morok:inbox:{recipient_pubkey_hex}"
@@ -183,6 +192,27 @@ async def enqueue_envelope(
         # Already expired before it was even queued — nothing to do.
         return None
 
+    # ── Per-recipient queue cap (anti-flood storage guard) ──
+    # Hard physical limit on how many envelopes may wait for one recipient
+    # at once. Independent of the Redis rate-limiter (which is a separate,
+    # fail-open layer) — this protects storage even if that limiter is
+    # bypassed or Redis-side counters are unavailable. We first drop
+    # expired rows so a backlog of stale envelopes can't wedge delivery
+    # for a recipient who simply hasn't been online.
+    try:
+        await redis.zremrangebyscore(_inbox_key(recipient_pubkey_hex), 0, now)
+        depth = await redis.zcard(_inbox_key(recipient_pubkey_hex))
+        if depth >= MAX_INBOX_QUEUE_DEPTH:
+            # Recipient's queue is full. Reject — sender (or their relay)
+            # will see this as a delivery failure and can retry later once
+            # the recipient drains their inbox.
+            return None
+    except Exception as e:
+        # Redis hiccup on the cap check — do NOT fail-open into unbounded
+        # growth. Treat as "cannot guarantee headroom" and refuse.
+        logger.warning("inbox queue-depth check failed, refusing enqueue: %s", e)
+        return None
+
     meta = {
         "envelope_id": envelope_id,
         "from": sender_pubkey_hex,
@@ -267,18 +297,38 @@ async def enqueue_envelope_for_recipients(
 
     new_event = _new_event(envelope_id)
 
+    # Per-recipient queue cap: prune expired then skip any recipient whose
+    # inbox is already at the depth limit. Unlike the DM path we DON'T
+    # refuse the whole send — other group members must still get the
+    # message; only the flooded inbox is skipped.
+    eligible: list[str] = []
+    for recipient in recipient_pubkeys_hex:
+        try:
+            await redis.zremrangebyscore(_inbox_key(recipient), 0, now)
+            if await redis.zcard(_inbox_key(recipient)) < MAX_INBOX_QUEUE_DEPTH:
+                eligible.append(recipient)
+            else:
+                logger.warning(
+                    "inbox full for %s — skipping in group fan-out",
+                    recipient[:8],
+                )
+        except Exception as e:
+            # On a check error, skip this recipient rather than risk
+            # unbounded growth. They'll catch up via a later message.
+            logger.warning("queue-depth check failed for %s: %s", recipient[:8], e)
+
     async with redis.pipeline(transaction=True) as pipe:
         pipe.set(
             _envelope_meta_key(envelope_id),
             json.dumps(meta).encode("utf-8"),
             ex=expires_at - now,
         )
-        for recipient in recipient_pubkeys_hex:
+        for recipient in eligible:
             pipe.zadd(_inbox_key(recipient), {envelope_id: expires_at})
             pipe.publish(_inbox_channel(recipient), new_event)
         await pipe.execute()
 
-    return expires_at, len(recipient_pubkeys_hex)
+    return expires_at, len(eligible)
 
 
 async def list_inbox(

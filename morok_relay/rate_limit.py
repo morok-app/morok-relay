@@ -46,17 +46,41 @@ logger = logging.getLogger(__name__)
 
 def get_ip_from_request(request: Request) -> str:
     """
-    Extract the client's IP. Trusts X-Real-IP set by nginx.
+    Extract the client's IP — SECURELY.
 
-    In nginx config we have `proxy_set_header X-Real-IP $remote_addr` so this
-    is reliable. Without nginx, falls back to request.client.host.
+    Forwarded headers (X-Real-IP, X-Forwarded-For) are only trusted when
+    the DIRECT connection comes from a configured trusted proxy (nginx on
+    loopback by default). Any other source has its forwarded headers
+    ignored, falling back to the real peer address.
+
+    This closes a spoofing hole: without the trust check, anyone reaching
+    uvicorn directly (e.g. if the port is exposed past nginx) could set
+    X-Real-IP to an arbitrary value to bypass per-IP rate-limits (auth,
+    admin login, sealed) and poison login_log.ip_hash.
     """
-    real_ip = request.headers.get("x-real-ip")
-    if real_ip:
-        return real_ip.strip()
+    peer = request.client.host if request.client else None
 
-    if request.client:
-        return request.client.host
+    # Is the immediate connection from a trusted proxy?
+    settings = get_settings()
+    trusted = {
+        ip.strip() for ip in (settings.trusted_proxy_ips or "").split(",")
+        if ip.strip()
+    }
+    proxy_trusted = peer is not None and peer in trusted
+
+    if proxy_trusted:
+        # nginx sets X-Real-IP $remote_addr — reliable here.
+        real_ip = request.headers.get("x-real-ip")
+        if real_ip:
+            return real_ip.strip()
+        # Fallback to leftmost XFF entry if X-Real-IP absent.
+        fwd = request.headers.get("x-forwarded-for")
+        if fwd:
+            return fwd.split(",")[0].strip()
+
+    # Untrusted (or direct) connection: NEVER trust forwarded headers.
+    if peer:
+        return peer
 
     return "unknown"
 
