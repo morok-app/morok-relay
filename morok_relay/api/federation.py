@@ -1254,7 +1254,8 @@ async def _handle_group_gone(
     )
 
 
-
+class PullSnapshotRequest(BaseModel):
+    """Peer relay requests a group snapshot from us (we're the host)."""
     group_id: str = Field(..., min_length=36, max_length=36)
     caller_pubkey_hex: str = Field(..., pattern=r"^[0-9a-f]{64}$")
     relay_pubkey_hex: str = Field(..., pattern=r"^[0-9a-f]{64}$")

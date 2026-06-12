@@ -344,10 +344,21 @@ class InboxToken(Base):
     pubkey: Mapped[bytes] = mapped_column(
         LargeBinary(32), nullable=False, index=True,
     )
+    # Uniqueness is per (pubkey, token_hash) — see __table_args__. The
+    # old global unique on token_hash alone was semantically wrong: two
+    # users registering the same hash (vanishingly unlikely with random
+    # 32-byte tokens, but possible) would make the second registration
+    # fail with IntegrityError for no good reason.
     token_hash: Mapped[str] = mapped_column(
-        String(64), nullable=False, unique=True,
+        String(64), nullable=False,
     )
     created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "pubkey", "token_hash", name="uq_inbox_tokens_pubkey_token_hash",
+        ),
+    )
 
 
 class PushSubscription(Base):

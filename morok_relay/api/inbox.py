@@ -32,11 +32,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import uuid
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, status
 
+from ..config import get_settings
 from ..deps import get_redis
-from ..queue import acknowledge_envelope, list_inbox
+from ..queue import acknowledge_envelope, get_envelope_meta, list_inbox
+from ..rate_limit import release_ws_slot, reserve_ws_slot
 from ..sessions import verify_session_token
 
 logger = logging.getLogger(__name__)
@@ -69,6 +72,21 @@ async def inbox_socket(
         return
 
     pubkey_hex = session.pubkey_hex
+
+    # Enforce the per-pubkey concurrent-connection cap. The helper and
+    # the setting existed since day one but were never wired in — without
+    # this, one account could open unlimited parallel sockets (each one
+    # holds a Redis pub/sub connection + a server task: cheap DoS).
+    settings = get_settings()
+    connection_id = str(uuid.uuid4())
+    slot_ok = await reserve_ws_slot(
+        redis, pubkey_hex, connection_id,
+        settings.rate_limit_ws_connections_per_pubkey,
+    )
+    if not slot_ok:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+
     await websocket.accept()
     logger.info("inbox WebSocket open: pubkey=%s...", pubkey_hex[:8])
 
@@ -96,6 +114,7 @@ async def inbox_socket(
     except Exception as e:
         logger.exception("Failed catchup for %s: %s", pubkey_hex[:8], e)
         await websocket.close(code=status.WS_1011_INTERNAL_ERROR)
+        await release_ws_slot(redis, pubkey_hex, connection_id)
         return
 
     # 3. Subscribe to pub/sub channel for this recipient
@@ -106,6 +125,7 @@ async def inbox_socket(
     except Exception as e:
         logger.exception("Subscribe failed: %s", e)
         await websocket.close(code=status.WS_1011_INTERNAL_ERROR)
+        await release_ws_slot(redis, pubkey_hex, connection_id)
         return
 
     # 4. Run two cooperating tasks:
@@ -142,11 +162,14 @@ async def inbox_socket(
                         envelope_id = event.get("envelope_id")
                         if not envelope_id:
                             continue
-                        envs = await list_inbox(redis, pubkey_hex, limit=200)
-                        env = next(
-                            (e for e in envs if e["envelope_id"] == envelope_id),
-                            None,
-                        )
+                        # Direct meta lookup. The old list_inbox(limit=200)
+                        # scan silently dropped "new" events whenever the
+                        # inbox held >200 pending envelopes (the fresh one
+                        # sorts past the cutoff). The pub/sub channel is
+                        # already scoped to THIS recipient, so the meta is
+                        # ours by construction; meta=None just means it
+                        # expired/was deleted between publish and read.
+                        env = await get_envelope_meta(redis, envelope_id)
                         if env is not None:
                             await websocket.send_json({"type": "new", "envelope": env})
                     elif kind == "deleted":
@@ -175,10 +198,7 @@ async def inbox_socket(
 
                 # Legacy fallback: bare envelope_id
                 envelope_id = raw
-                envs = await list_inbox(redis, pubkey_hex, limit=200)
-                env = next(
-                    (e for e in envs if e["envelope_id"] == envelope_id), None,
-                )
+                env = await get_envelope_meta(redis, envelope_id)
                 if env is not None:
                     await websocket.send_json({"type": "new", "envelope": env})
         except asyncio.CancelledError:
@@ -268,4 +288,6 @@ async def inbox_socket(
                 await redis.delete(ws_active_key)
         except Exception as e:
             logger.warning("ws-active decr failed for %s: %s", pubkey_hex[:8], e)
+        # Free the concurrent-connection slot reserved at handshake.
+        await release_ws_slot(redis, pubkey_hex, connection_id)
         logger.info("inbox WS closed: pubkey=%s...", pubkey_hex[:8])

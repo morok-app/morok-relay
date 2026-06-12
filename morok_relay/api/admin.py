@@ -180,6 +180,14 @@ async def admin_logout(
 # ============================================================================
 
 async def _ping_relay(hostname: str) -> dict:
+    # Hostnames come from federation_peers (operator-managed), but keep
+    # the same SSRF guard as every other outbound federation call — a
+    # row planted via a malicious handshake hostname must not turn the
+    # admin dashboard into an internal-network prober.
+    from ..federation_client import is_safe_peer_hostname
+    if not is_safe_peer_hostname(hostname):
+        return {"hostname": hostname, "up": False, "latency_ms": None,
+                "version": None}
     url = f"https://{hostname}/health"
     t0 = time.monotonic()
     try:
