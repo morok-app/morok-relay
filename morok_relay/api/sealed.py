@@ -32,7 +32,7 @@ import time
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
 from .. import blob_storage
 from ..config import get_settings
@@ -52,6 +52,11 @@ router = APIRouter(tags=["sealed"])
 
 HEX64 = r"^[0-9a-f]{64}$"
 
+# Per-contact tokens: a user may register one delivery-token hash per
+# contact. 64 is generous for a contact list while bounding storage and
+# the cost of the "is this hash valid" lookup on the unauth sealed path.
+MAX_TOKENS_PER_PUBKEY = 64
+
 
 # ─── Реєстрація delivery-токенів (автентифіковано, бо це МІЙ інбокс) ──
 
@@ -69,8 +74,15 @@ async def register_inbox_token(
     db: DBSession,
 ) -> dict:
     """
-    Тримаємо щонайбільше 2 хеші на користувача (поточний + попередній):
-    ротація токена не ламає відправників, які ще не отримали новий.
+    Per-contact delivery tokens: a user registers one token hash PER
+    contact they hand a token to. The relay stores only the SET of valid
+    hashes — it does NOT know which hash maps to which contact (that
+    binding lives only on the client). So the relay sees "a valid hash
+    was presented", never "contact X is sending".
+
+    Cap at MAX_TOKENS_PER_PUBKEY hashes per user (plenty for a contact
+    list; oldest evicted beyond that). Idempotent: re-registering an
+    existing hash is a no-op.
     """
     pubkey = bytes.fromhex(current.pubkey_hex)
     now = int(time.time())
@@ -84,8 +96,8 @@ async def register_inbox_token(
     if any(r.token_hash == body.token_hash for r in rows):
         return {"registered": True, "rotated": False}
 
-    # Лишаємо тільки найновіший попередній; решту зносимо.
-    for stale in rows[1:]:
+    # Evict oldest beyond the cap (keep the newest MAX-1, add the new one).
+    for stale in rows[MAX_TOKENS_PER_PUBKEY - 1:]:
         await db.delete(stale)
 
     db.add(InboxToken(
@@ -94,6 +106,34 @@ async def register_inbox_token(
         created_at=now,
     ))
     return {"registered": True, "rotated": bool(rows)}
+
+
+class InboxTokenRevokeRequest(BaseModel):
+    token_hash: str = Field(..., pattern=HEX64)
+
+
+@router.post(
+    "/inbox-token/revoke",
+    summary="Revoke a single delivery-token hash (per-contact revocation)",
+)
+async def revoke_inbox_token(
+    body: InboxTokenRevokeRequest,
+    current: CurrentSession,
+    db: DBSession,
+) -> dict:
+    """
+    Remove ONE token hash. Used to cut off a single contact without
+    affecting the tokens given to everyone else. The relay deletes the
+    hash from the valid set; the next sealed envelope presenting it gets
+    rejected (invalid_delivery_token). Idempotent.
+    """
+    pubkey = bytes.fromhex(current.pubkey_hex)
+    await db.execute(
+        delete(InboxToken)
+        .where(InboxToken.pubkey == pubkey)
+        .where(InboxToken.token_hash == body.token_hash)
+    )
+    return {"revoked": True}
 
 
 # ─── Відправка sealed-конверта (БЕЗ автентифікації — це і є суть) ────
