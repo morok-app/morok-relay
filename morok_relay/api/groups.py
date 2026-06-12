@@ -303,6 +303,8 @@ async def get_group(
 async def delete_group(
     group_id: str, current: CurrentSession, db: DBSession,
     redis: RedisClient,
+    gone_signature_hex: str | None = None,
+    gone_ts: int | None = None,
 ) -> dict:
     gid = _parse_group_id(group_id)
     group = await _load_group(db, gid)
@@ -312,22 +314,79 @@ async def delete_group(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="only_creator_can_delete",
         )
-    # Collect member pubkeys BEFORE tombstoning, so we can notify them.
-    member_pubkeys = [
-        m.pubkey.hex() for m in group.members
-        if m.pubkey != pubkey
-    ]
+
+    settings = get_settings()
+    # Split members by home_relay so we can notify local members directly
+    # (WS) and remote-relay members via federation.
+    member_pubkeys_bytes = [m.pubkey for m in group.members if m.pubkey != pubkey]
+    home_by_pubkey_hex: dict[str, str | None] = {}
+    if member_pubkeys_bytes:
+        stmt = (
+            select(User.pubkey, User.home_relay)
+            .where(User.pubkey.in_(member_pubkeys_bytes))
+            .where(User.deleted_at.is_(None))
+        )
+        rows = (await db.execute(stmt)).all()
+        for pk, hr in rows:
+            home_by_pubkey_hex[bytes(pk).hex()] = hr
+
+    local_member_hexes: list[str] = []
+    remote_by_relay: dict[str, list[str]] = {}
+    for m in group.members:
+        if m.pubkey == pubkey:
+            continue
+        pk_hex = m.pubkey.hex()
+        h = home_by_pubkey_hex.get(pk_hex)
+        if h is None or h == settings.relay_name:
+            local_member_hexes.append(pk_hex)
+        else:
+            remote_by_relay.setdefault(h, []).append(pk_hex)
+
     group.deleted_at = int(time.time())
 
-    # Real-time push to local members: "this group is gone". Members on
-    # other relays learn about it lazily (404 on next group refresh in
-    # the client). Best-effort — failures here must not fail the delete.
+    # Real-time push to LOCAL members: "this group is gone".
     try:
         await publish_group_gone(
-            redis, member_pubkeys, str(group.id), current.pubkey_hex,
+            redis, local_member_hexes, str(group.id), current.pubkey_hex,
         )
     except Exception:
         pass
+
+    # Cross-relay: notify members on OTHER relays via federation, BUT only
+    # if the client supplied a creator signature over the gone intent.
+    # Without it we fall back to lazy detection (404 on next open) — this
+    # keeps old clients working unchanged. The receiving relay re-verifies
+    # the signature, so a compromised host can't forge group_gone.
+    if remote_by_relay and gone_signature_hex and gone_ts is not None:
+        now = int(time.time())
+        for target_relay, members_on_relay in remote_by_relay.items():
+            gone_payload = {
+                "kind": "group_gone",
+                "group_id": str(group.id),
+                "by_pubkey_hex": current.pubkey_hex,
+                "deliver_to_pubkeys": members_on_relay,
+                "gone_signature_hex": gone_signature_hex,
+                "gone_ts": gone_ts,
+            }
+            synthetic_id = _synthetic_queue_id("gone", str(group.id), target_relay)
+            dup_stmt = (
+                select(FederationOutboundQueue)
+                .where(FederationOutboundQueue.envelope_id == synthetic_id)
+                .where(FederationOutboundQueue.target_relay == target_relay)
+                .limit(1)
+            )
+            existing = (await db.execute(dup_stmt)).scalar_one_or_none()
+            if existing is None:
+                db.add(FederationOutboundQueue(
+                    envelope_id=synthetic_id,
+                    envelope_data=gone_payload,
+                    target_relay=target_relay,
+                    status=FedQueueStatus.PENDING,
+                    attempts=0,
+                    next_attempt_at=now,
+                    created_at=now,
+                ))
+        await db.flush()
 
     return {"deleted": True, "group_id": str(group.id)}
 

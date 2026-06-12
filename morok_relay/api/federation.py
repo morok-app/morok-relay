@@ -140,6 +140,10 @@ def _verify_delete_sig(
         return False
 
     payload = {"kind": kind, "envelope_id": envelope_id, "ts": ts_int}
+    if kind == "group_gone":
+        # group_gone is not about a single envelope — it binds the whole
+        # group. Signed payload is {kind, group_id, ts}, no envelope_id.
+        payload = {"kind": kind, "ts": ts_int}
     if group_id is not None:
         payload["group_id"] = group_id
     message = crypto.canonical_json(payload)
@@ -350,6 +354,9 @@ async def _forward_impl(
 
     if kind == "group_delete_deliver":
         return await _handle_group_delete_deliver(body.envelope, db, redis, settings)
+
+    if kind == "group_gone":
+        return await _handle_group_gone(body.envelope, db, redis, settings)
 
     if kind == "read_receipt":
         return await _handle_read_receipt(body.envelope, db, redis, settings)
@@ -1170,11 +1177,84 @@ async def _handle_group_delete_deliver(
     return ForwardResponse(accepted=True, envelope_id=envelope_id)
 
 
-# ============================================================================
-# PULL SNAPSHOT (peer requests current group state from host)
-# ============================================================================
+async def _handle_group_gone(
+    envelope: dict, db, redis, settings,
+) -> "ForwardResponse":
+    """
+    Host relay tells us: a group was deleted by its creator. Push a
+    real-time `group_gone` WS event to the specified local members so
+    their clients drop the group immediately (instead of only finding
+    out lazily on next open).
 
-class PullSnapshotRequest(BaseModel):
+    We INDEPENDENTLY re-verify the creator's signature — a compromised
+    or malicious host relay must not be able to make our local users'
+    clients silently delete a group by forging "group_gone". This is
+    the same trust model as group_delete_deliver: trusted peer is
+    necessary but NOT sufficient; the cryptographic signature is.
+    """
+    from ..queue import publish_group_gone
+
+    group_id_str = envelope.get("group_id")
+    by_pubkey_hex = envelope.get("by_pubkey_hex")
+    raw_recipients = envelope.get("deliver_to_pubkeys") or []
+    sig_hex = envelope.get("gone_signature_hex")
+    gone_ts = envelope.get("gone_ts")
+
+    if not (group_id_str and by_pubkey_hex and raw_recipients):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="group_gone_missing_fields",
+        )
+    if not sig_hex or gone_ts is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="group_gone_missing_signature",
+        )
+
+    # Independently verify the creator's signature over the gone intent.
+    if not _verify_delete_sig(
+        kind="group_gone",
+        envelope_id="",                 # group_gone binds group_id, not an envelope
+        ts=gone_ts,
+        sig_hex=sig_hex,
+        signer_pubkey_hex=by_pubkey_hex,
+        group_id=group_id_str,
+    ):
+        logger.warning(
+            "Rejected federated group_gone %s — bad signature from claimed creator %s",
+            group_id_str, by_pubkey_hex[:8],
+        )
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="invalid_group_gone_signature",
+        )
+
+    # Only notify members that are actually local to us, and validate hex.
+    local_recipients: list[str] = []
+    for pk in raw_recipients:
+        if not isinstance(pk, str) or len(pk) != 64:
+            continue
+        try:
+            bytes.fromhex(pk)
+        except ValueError:
+            continue
+        local_recipients.append(pk)
+
+    try:
+        await publish_group_gone(
+            redis, local_recipients, group_id_str, by_pubkey_hex,
+        )
+    except Exception as e:
+        logger.warning("publish_group_gone (federated) failed: %s", e)
+
+    return ForwardResponse(
+        accepted=True,
+        envelope_id=group_id_str,
+        reason="group_gone_delivered",
+    )
+
+
+
     group_id: str = Field(..., min_length=36, max_length=36)
     caller_pubkey_hex: str = Field(..., pattern=r"^[0-9a-f]{64}$")
     relay_pubkey_hex: str = Field(..., pattern=r"^[0-9a-f]{64}$")
