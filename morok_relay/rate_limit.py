@@ -206,9 +206,24 @@ def rate_limit_by_pubkey(bucket: str, limit_per_minute: int):
 # WebSocket helper — count concurrent connections per pubkey
 # ============================================================================
 
-# Key: morok:ws:connections:{pubkey_hex} → set of connection IDs (UUIDs)
-# Each connection adds itself on connect, removes on disconnect.
-# If set size > limit → reject new connection.
+# Key: morok:ws:connections:{pubkey_hex} → ZSET of {connection_id: last_seen_ts}
+#
+# Чому ZSET, а не SET: у SET кожен член живе доти, доки не зробиш srem.
+# Якщо з'єднання вмирає аварійно (вбитий застосунок, обрив мережі) без
+# чистого закриття — release_ws_slot не викликається, і "привид" висить
+# у Redis до TTL усього ключа (раніше — 24 год!). Назбирається >limit
+# привидів → reserve повертає False → relay віддає 403 ВСІМ з'єднанням
+# цього pubkey, поки привиди не протухнуть. Саме це й сталося.
+#
+# ZSET зі score = час останньої активності лікує корінь: на кожному
+# reserve ми спершу викидаємо членів, які не оновлювались довше за
+# SLOT_TTL (мертві), і лише потім рахуємо. Живі з'єднання оновлюють свій
+# score кожні 30с через refresh_ws_slot() у pinger'і, тож ніколи не
+# випадають. Привиди фізично не накопичуються.
+
+WS_SLOT_TTL_SECONDS = 90      # слот без оновлення довше за це = мертвий
+WS_SLOT_KEY_TTL = 200         # TTL усього ключа (живі з'єднання його поновлюють)
+
 
 def _ws_connections_key(pubkey_hex: str) -> str:
     return f"morok:ws:connections:{pubkey_hex}"
@@ -227,33 +242,52 @@ async def reserve_ws_slot(
     False if too many concurrent connections.
 
     On True, caller MUST call release_ws_slot() when the connection closes
-    (in a finally block).
+    (in a finally block), and SHOULD call refresh_ws_slot() periodically
+    (e.g. from the ping loop) to keep the slot alive.
     """
     settings = get_settings()
     if not settings.rate_limit_enabled:
         return True
 
     key = _ws_connections_key(pubkey_hex)
+    now = time.time()
+    cutoff = now - WS_SLOT_TTL_SECONDS
     try:
-        # Count current connections AFTER adding ours
         async with redis.pipeline(transaction=True) as pipe:
-            pipe.sadd(key, connection_id)
-            pipe.expire(key, 86400)  # cleanup orphans after 24h
-            pipe.scard(key)
+            pipe.zremrangebyscore(key, 0, cutoff)   # викинути мертві слоти
+            pipe.zadd(key, {connection_id: now})    # додати/оновити свій
+            pipe.expire(key, WS_SLOT_KEY_TTL)
+            pipe.zcard(key)
             results = await pipe.execute()
-        count = results[2]
+        count = results[3]
     except Exception as e:
         logger.warning("WS slot reservation failed (failing open): %s", e)
         return True
 
     if count > limit:
-        # Roll back our addition — we're over the limit
+        # Над лімітом — відкочуємо свій запис.
         try:
-            await redis.srem(key, connection_id)
+            await redis.zrem(key, connection_id)
         except Exception:
             pass
         return False
     return True
+
+
+async def refresh_ws_slot(
+    redis: Redis,
+    pubkey_hex: str,
+    connection_id: str,
+) -> None:
+    """Оновити час життя слота (виклик із pinger кожні ~30с)."""
+    key = _ws_connections_key(pubkey_hex)
+    try:
+        async with redis.pipeline(transaction=True) as pipe:
+            pipe.zadd(key, {connection_id: time.time()})
+            pipe.expire(key, WS_SLOT_KEY_TTL)
+            await pipe.execute()
+    except Exception as e:
+        logger.warning("WS slot refresh failed: %s", e)
 
 
 async def release_ws_slot(
@@ -263,6 +297,6 @@ async def release_ws_slot(
 ) -> None:
     """Release a WebSocket slot when the connection closes."""
     try:
-        await redis.srem(_ws_connections_key(pubkey_hex), connection_id)
+        await redis.zrem(_ws_connections_key(pubkey_hex), connection_id)
     except Exception as e:
         logger.warning("WS slot release failed: %s", e)

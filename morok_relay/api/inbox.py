@@ -39,7 +39,7 @@ from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, status
 from ..config import get_settings
 from ..deps import get_redis
 from ..queue import acknowledge_envelope, get_envelope_meta, list_inbox
-from ..rate_limit import release_ws_slot, reserve_ws_slot
+from ..rate_limit import release_ws_slot, reserve_ws_slot, refresh_ws_slot
 from ..sessions import verify_session_token
 
 logger = logging.getLogger(__name__)
@@ -245,9 +245,15 @@ async def inbox_socket(
             while True:
                 await asyncio.sleep(PING_INTERVAL_SECONDS)
                 await websocket.send_json({"type": "ping"})
-                # Живе з'єднання => тримаємо лічильник онлайну живим.
+                # Живе з'єднання => тримаємо лічильник онлайну живим...
                 try:
                     await redis.expire(ws_active_key, 90)
+                except Exception:
+                    pass
+                # ...і оновлюємо час життя WS-слота, щоб його не вважали
+                # мертвим і не викинули при reserve інших з'єднань.
+                try:
+                    await refresh_ws_slot(redis, pubkey_hex, connection_id)
                 except Exception:
                     pass
         except asyncio.CancelledError:
