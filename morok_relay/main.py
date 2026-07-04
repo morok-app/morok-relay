@@ -85,6 +85,8 @@ app.add_middleware(
         "http://localhost",
         "https://localhost",
         "capacitor://localhost",
+        "http://tauri.localhost",
+        "https://tauri.localhost",
     ],
     allow_credentials=False,
     allow_methods=["GET", "POST", "DELETE", "PUT", "PATCH", "OPTIONS"],
