@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from . import __version__
-from .api import account, admin, auth, backup, burner, dms, federation, groups, inbox, messages, push, sealed, users
+from .api import account, admin, auth, backup, burner, dms, federation, groups, inbox, mail, messages, push, sealed, users
 from .cleanup import cleanup_task_loop
 from .config import get_settings
 from .db import lifespan as db_lifespan
@@ -175,6 +175,7 @@ app.include_router(messages.router, prefix="/api/v1/messages")
 app.include_router(groups.router, prefix="/api/v1/groups")
 app.include_router(dms.router, prefix="/api/v1/dms")
 app.include_router(burner.router, prefix="/api/v1/burner")
+app.include_router(mail.router, prefix="/api/v1/mail")
 app.include_router(federation.router, prefix="/api/v1/federation")
 app.include_router(backup.router, prefix="/api/v1/backup")
 app.include_router(admin.router, prefix="/api/v1/admin")
