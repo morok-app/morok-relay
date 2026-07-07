@@ -44,6 +44,17 @@ class Settings(BaseSettings):
     redis_url: str = Field(default="redis://localhost:6379/0")
     redis_pool_size: int = Field(default=20)
 
+    # ----- morok.email (mail receiver) -----
+    mail_domain: str = Field(default="morok.email")
+    mail_smtp_port: int = Field(default=25)
+    mail_max_bytes: int = Field(default=26214400)
+    mail_rl_per_ip: int = Field(default=30)
+    mail_ttl_seconds: int = Field(default=604800)
+    mail_alias_start: int = Field(default=3)
+    mail_alias_per_month: int = Field(default=1)
+    mail_alias_cap: int = Field(default=15)
+    mail_admin_pubkey_hex: str = Field(default="")
+
     # ----- Mode -----
     is_production: bool = Field(default=True)
     debug: bool = Field(default=False)
