@@ -141,11 +141,8 @@ async def deliver_email(
         ttl_seconds=ttl,
         signature_hex="",
         hard_ceiling_seconds=ttl,
-        sealed=True,
-        # ПОЗНАЧКА для клієнта: розшифровувати як mail (crypto.mailOpen),
-        # а не sealedDecrypt. Див. MAIL-CRYPTO-FIX.md — потрібен один рядок
-        # у enqueue_envelope, щоб пробросити kind у метадані inbox.
-        # envelope_kind="mail",
+        sealed=False,
+        channel="mail",   # клієнт → crypto.mailOpen (не sealedDecrypt)
     )
     if expires is None:
         logger.info("mail: dedup hit")

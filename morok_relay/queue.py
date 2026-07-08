@@ -163,6 +163,7 @@ async def enqueue_envelope(
     sender_username: str | None = None,
     sealed: bool = False,
     delete_key_hash: str | None = None,
+    channel: str | None = None,
 ) -> int | None:
     """
     Add an envelope to the recipient's inbox queue and publish a notification.
@@ -227,6 +228,9 @@ async def enqueue_envelope(
         meta["sealed"] = True
         if delete_key_hash:
             meta["delete_key_hash"] = delete_key_hash
+    # channel="mail" → клієнт розшифровує через mailOpen, а не sealedDecrypt
+    if channel:
+        meta["channel"] = channel
 
     # SET NX is the dedup gate — only one writer "wins" the slot.
     written = await redis.set(
