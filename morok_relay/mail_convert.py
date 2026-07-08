@@ -128,7 +128,7 @@ async def deliver_email(
     }
     blob = seal_mail(owner_pubkey, payload)
 
-    envelope_id = secrets.token_hex(16)
+    envelope_id = secrets.token_hex(32)
     await write_blob(envelope_id, blob)
 
     ttl = getattr(s, "mail_ttl_seconds", 7 * 86400)
