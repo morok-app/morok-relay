@@ -54,16 +54,30 @@ async def create_alias(
     _rl=Depends(rate_limit_by_pubkey("mail_alias_create", limit_per_minute=5)),
 ):
     from ..models import User
-    pubkey: bytes = session.pubkey
+    pubkey: bytes = bytes.fromhex(session.pubkey_hex)
     want_primary = bool(body.get("primary", False))
     raw = body.get("alias")
 
-    if raw is not None:
+    if want_primary:
+        # PRIMARY = username акаунта (zalupa → zalupa@morok.email), не вводиться руками
+        acc_username = (await db.execute(
+            select(User.username).where(User.pubkey == pubkey))).scalar_one_or_none()
+        if not acc_username:
+            raise HTTPException(409, "Спершу займіть @username у месенджері — він стане вашою адресою")
+        alias = acc_username.lower()
+        if not _ALIAS_RE.fullmatch(alias):
+            raise HTTPException(409, "Ваш username не підходить для email-адреси")
+    elif raw is not None:
         alias = str(raw).strip().lower()
         if not _ALIAS_RE.fullmatch(alias) or ".." in alias:
             raise HTTPException(422, "Аліас: 3–64 символи, малі латинські, цифри, дефіс, крапка")
         if alias in RESERVED:
             raise HTTPException(409, "Цей аліас зарезервовано")
+        # захист namespace: чужий username не можна взяти як аліас
+        owner_of_name = (await db.execute(
+            select(User.pubkey).where(User.username == alias))).scalar_one_or_none()
+        if owner_of_name is not None and bytes(owner_of_name) != pubkey:
+            raise HTTPException(409, "Це ім'я належить іншому користувачу в Morok")
     else:
         alias = _random_alias()
 
@@ -105,7 +119,7 @@ async def create_alias(
 @router.get("/aliases")
 async def list_aliases(session: CurrentSession, db: DBSession):
     from ..models import User
-    pubkey: bytes = session.pubkey
+    pubkey: bytes = bytes.fromhex(session.pubkey_hex)
     s = get_settings()
     rows = (await db.execute(
         select(MailAlias).where(MailAlias.owner_pubkey == pubkey)
@@ -135,7 +149,7 @@ async def _get_own_alias(db, pubkey: bytes, alias: str) -> MailAlias:
 
 @router.post("/aliases/{alias}/pause")
 async def pause_alias(alias: str, session: CurrentSession, db: DBSession):
-    row = await _get_own_alias(db, session.pubkey, alias)
+    row = await _get_own_alias(db, bytes.fromhex(session.pubkey_hex), alias)
     if row.status == AliasStatus.DEAD:
         raise HTTPException(409, "Аліас уже вбито")
     row.status = AliasStatus.PAUSED
@@ -145,7 +159,7 @@ async def pause_alias(alias: str, session: CurrentSession, db: DBSession):
 
 @router.post("/aliases/{alias}/resume")
 async def resume_alias(alias: str, session: CurrentSession, db: DBSession):
-    row = await _get_own_alias(db, session.pubkey, alias)
+    row = await _get_own_alias(db, bytes.fromhex(session.pubkey_hex), alias)
     if row.status == AliasStatus.DEAD:
         raise HTTPException(409, "Мертвий аліас не відновлюється")
     row.status = AliasStatus.ACTIVE
@@ -155,7 +169,7 @@ async def resume_alias(alias: str, session: CurrentSession, db: DBSession):
 
 @router.delete("/aliases/{alias}")
 async def kill_alias(alias: str, session: CurrentSession, db: DBSession):
-    row = await _get_own_alias(db, session.pubkey, alias)
+    row = await _get_own_alias(db, bytes.fromhex(session.pubkey_hex), alias)
     if row.is_primary:
         raise HTTPException(409, "Основну адресу не можна вбити")
     row.status = AliasStatus.DEAD
