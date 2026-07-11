@@ -14,9 +14,11 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 
 from ..config import get_settings
-from ..deps import CurrentSession, DBSession
+from ..deps import CurrentSession, DBSession, RedisClient
 from ..mail_models import AliasStatus, MailAlias
 from ..rate_limit import rate_limit_by_pubkey
+from .. import blob_storage
+from ..queue import enqueue_envelope
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["mail"])
@@ -175,3 +177,88 @@ async def kill_alias(alias: str, session: CurrentSession, db: DBSession):
     row.status = AliasStatus.DEAD
     await db.commit()
     return {"alias": row.alias, "status": "dead"}
+
+
+# ────────────────────────────────────────────────────────────
+# Фаза 2 — внутрішня пошта Morok↔Morok (E2EE, без SMTP)
+# ────────────────────────────────────────────────────────────
+
+@router.get("/resolve/{alias}")
+async def resolve_alias(
+    alias: str,
+    session: CurrentSession,
+    db: DBSession,
+    _rl=Depends(rate_limit_by_pubkey("mail_resolve", limit_per_minute=30)),
+):
+    """
+    Аліас → pubkey власника (щоб відправник міг зашифрувати лист для нього).
+    Тільки active-аліаси. Потрібна авторизація (не публічний перелік).
+    """
+    a = alias.strip().lower()
+    row = (await db.execute(
+        select(MailAlias).where(MailAlias.alias == a))).scalar_one_or_none()
+    if row is None or row.status != AliasStatus.ACTIVE:
+        raise HTTPException(404, "Адресу не знайдено або вона не приймає пошту")
+    return {"alias": a, "pubkey_hex": bytes(row.owner_pubkey).hex()}
+
+
+@router.post("/send", status_code=status.HTTP_202_ACCEPTED)
+async def send_internal(
+    body: dict,
+    session: CurrentSession,
+    db: DBSession,
+    redis: RedisClient,
+    _rl=Depends(rate_limit_by_pubkey("mail_send", limit_per_minute=20)),
+):
+    """
+    Внутрішній лист Morok→Morok. Клієнт уже зашифрував payload у формат
+    morok-mail-v1 НА PUBKEY адресата (E2EE — сервер вміст не бачить).
+    body: { "to_alias": "...", "blob_b64": "<base64 morok-mail-v1>" }
+    Сервер лише резолвить аліас у чергу адресата й кладе конверт —
+    так само, як робить SMTP-приймач для зовнішніх листів (channel="mail").
+    Відправник на транспорті анонімний (from=""), особа — лише в шифрі.
+    """
+    import base64
+
+    to_alias = str(body.get("to_alias", "")).strip().lower()
+    blob_b64 = body.get("blob_b64")
+    if not to_alias or not blob_b64:
+        raise HTTPException(422, "to_alias і blob_b64 обовʼязкові")
+
+    row = (await db.execute(
+        select(MailAlias).where(MailAlias.alias == to_alias))).scalar_one_or_none()
+    if row is None or row.status != AliasStatus.ACTIVE:
+        raise HTTPException(404, "Адресу не знайдено або вона не приймає пошту")
+
+    try:
+        blob = base64.b64decode(blob_b64, validate=True)
+    except Exception:
+        raise HTTPException(422, "blob_b64 не є валідним base64")
+    s = get_settings()
+    if len(blob) > s.mail_max_bytes:
+        raise HTTPException(413, "Лист завеликий")
+
+    envelope_id = secrets.token_hex(32)
+    await blob_storage.write_blob(envelope_id, blob)
+    ttl = s.mail_ttl_seconds
+    expires = await enqueue_envelope(
+        redis,
+        envelope_id=envelope_id,
+        sender_pubkey_hex="",
+        recipient_pubkey_hex=bytes(row.owner_pubkey).hex(),
+        timestamp=int(time.time()),
+        ttl_seconds=ttl,
+        signature_hex="",
+        hard_ceiling_seconds=ttl,
+        sealed=False,
+        channel="mail",
+    )
+    # лічильник прийнятого — як у зовнішніх
+    from sqlalchemy import update as _upd
+    await db.execute(_upd(MailAlias).where(MailAlias.alias == to_alias)
+                     .values(received_count=MailAlias.received_count + 1))
+    await db.commit()
+    if expires is None:
+        return {"status": "duplicate"}
+    logger.info("mail: internal send delivered")
+    return {"status": "sent"}
