@@ -143,10 +143,14 @@ def main():
                             port=settings.mail_smtp_port, ident="morok.email ESMTP")
     controller.start()
     logger.info("morok-mail SMTP listening on :%s", settings.mail_smtp_port)
+    # власний loop замість застарілого get_event_loop() (DeprecationWarning)
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     try:
-        asyncio.get_event_loop().run_forever()
+        loop.run_forever()
     except KeyboardInterrupt:
         controller.stop()
+        loop.close()
 
 
 if __name__ == "__main__":
