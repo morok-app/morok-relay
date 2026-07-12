@@ -54,7 +54,11 @@ def _load_private_key() -> str | None:
         logger.info("VAPID private key not found at %s, push disabled", path)
         return None
     try:
-        _PRIVATE_KEY_CACHE = path.read_text()
+        # pywebpush: рядок трактується як сирий base64url-ключ, а PEM-вміст
+        # ламається ("header too long"). Передаємо ШЛЯХ — тоді бібліотека
+        # сама читає файл як PEM (Vapid.from_file).
+        path.read_text()  # sanity: файл читається
+        _PRIVATE_KEY_CACHE = str(path)
         return _PRIVATE_KEY_CACHE
     except OSError as e:
         logger.warning("VAPID private key unreadable: %s", e)
