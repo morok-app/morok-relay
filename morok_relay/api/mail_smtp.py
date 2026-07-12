@@ -120,6 +120,15 @@ class MorokMailHandler:
             try:
                 await deliver_email(self.redis, raw, local, owner_pubkey, spf_result)
                 delivered += 1
+                # пуш офлайн-пристроям («Новий лист»)
+                try:
+                    from .push_sender import trigger_push
+                    async with _db._session_factory() as pdb:
+                        await trigger_push(pdb, self.redis, [owner_pubkey.hex()],
+                                           sender_username=None, kind="mail")
+                        await pdb.commit()
+                except Exception:
+                    logger.warning("mail push (external) failed", exc_info=False)
                 if status_val == "active":
                     async with _db._session_factory() as db:
                         await db.execute(

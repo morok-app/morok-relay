@@ -187,6 +187,7 @@ async def trigger_push(
     *,
     sender_username: str | None,
     group_id: str | None = None,
+    kind: str | None = None,
 ) -> None:
     """
     Fan out a push notification to every subscription of every recipient
@@ -239,6 +240,7 @@ async def trigger_push(
     payload = json.dumps({
         "from_username": sender_username,
         "group_id": group_id,
+        "kind": kind,
         "ts": int(time.time()),
     })
 
