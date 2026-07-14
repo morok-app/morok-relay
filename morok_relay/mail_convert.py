@@ -143,6 +143,7 @@ async def deliver_email(
         hard_ceiling_seconds=ttl,
         sealed=False,
         channel="mail",   # клієнт → crypto.mailOpen (не sealedDecrypt)
+        mail_origin="external",  # блоб будував релей → блобу можна довіряти
     )
     if expires is None:
         logger.info("mail: dedup hit")
