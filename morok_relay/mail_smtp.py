@@ -117,27 +117,33 @@ class MorokMailHandler:
             if status_val == "paused":
                 continue  # тихий дроп
             local = rcpt.split("@", 1)[0]
+            # КРИТИЧНА частина: тільки доставка. Якщо впаде — 451 (Gmail повторить).
             try:
                 await deliver_email(self.redis, raw, local, owner_pubkey, spf_result)
                 delivered += 1
-                # пуш офлайн-пристроям («Новий лист»)
+            except Exception:
+                logger.exception("mail: delivery failed")
+                return "451 4.3.0 Temporary processing error"
+
+            # НЕкритична частина (пуш + лічильник): best-effort, НІКОЛИ не 451,
+            # інакше косметичний збій спричинив би повторну доставку → дублі.
+            try:
+                from .push_sender import trigger_push
+                async with _db._session_factory() as pdb:
+                    await trigger_push(pdb, self.redis, [owner_pubkey.hex()],
+                                       sender_username=None, kind="mail")
+                    await pdb.commit()
+            except Exception:
+                logger.warning("mail push (external) failed", exc_info=False)
+            if status_val == "active":
                 try:
-                    from .push_sender import trigger_push
-                    async with _db._session_factory() as pdb:
-                        await trigger_push(pdb, self.redis, [owner_pubkey.hex()],
-                                           sender_username=None, kind="mail")
-                        await pdb.commit()
-                except Exception:
-                    logger.warning("mail push (external) failed", exc_info=False)
-                if status_val == "active":
                     async with _db._session_factory() as db:
                         await db.execute(
                             update(MailAlias).where(MailAlias.alias == local)
                             .values(received_count=MailAlias.received_count + 1))
                         await db.commit()
-            except Exception:
-                logger.exception("mail: conversion failed")
-                return "451 4.3.0 Temporary processing error"
+                except Exception:
+                    logger.warning("mail: received_count bump failed", exc_info=False)
 
         logger.info("mail: DATA ok, delivered=%d", delivered)
         return "250 OK"
@@ -149,7 +155,8 @@ def main():
     settings = get_settings()
     handler = MorokMailHandler()
     controller = Controller(handler, hostname="0.0.0.0",
-                            port=settings.mail_smtp_port, ident="morok.email ESMTP")
+                            port=settings.mail_smtp_port, ident="morok.email ESMTP",
+                            data_size_limit=settings.mail_max_bytes)
     controller.start()
     logger.info("morok-mail SMTP listening on :%s", settings.mail_smtp_port)
     # власний loop замість застарілого get_event_loop() (DeprecationWarning)
