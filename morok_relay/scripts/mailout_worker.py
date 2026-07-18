@@ -105,6 +105,7 @@ def main() -> None:
                     j["from_addr"], j["to_addr"],
                     j.get("subject") or "(без теми)",
                     j.get("text") or "",
+                    attachments=j.get("attachments") or [],
                 )
                 if ok:
                     _bump_today()

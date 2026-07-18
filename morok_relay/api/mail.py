@@ -337,6 +337,21 @@ async def _queue_external(body: dict, session, db, to_addr: str):
     if len(text.encode()) > s.mail_max_bytes:
         raise HTTPException(413, "Лист завеликий")
 
+    # вкладення: ≤5 шт, сумарно ≤6MB у base64 (~4.5MB сирих)
+    atts = body.get("attachments") or []
+    if not isinstance(atts, list) or len(atts) > 5:
+        raise HTTPException(422, "Забагато вкладень (максимум 5)")
+    total = 0
+    clean_atts = []
+    for a in atts:
+        b64 = str(a.get("b64") or "")
+        fn = str(a.get("filename") or "file")[:255]
+        ct = str(a.get("content_type") or "application/octet-stream")[:100]
+        total += len(b64)
+        if total > 6 * 1024 * 1024:
+            raise HTTPException(413, "Вкладення завеликі (сумарно до ~4.5MB)")
+        clean_atts.append({"filename": fn, "content_type": ct, "b64": b64})
+
     now = int(time.time())
     # добовий ліміт на акаунт (анти-абуза)
     sent_today = (await db.execute(
@@ -347,9 +362,11 @@ async def _queue_external(body: dict, session, db, to_addr: str):
     if sent_today >= s.mail_out_user_daily:
         raise HTTPException(429, "Добовий ліміт вихідних листів вичерпано")
 
+    import json as _json
     row = MailOutbound(
         owner_pubkey=pubkey, from_alias=from_alias, to_addr=to_addr,
         subject=subject or None, body_text=text,
+        attachments_json=_json.dumps(clean_atts) if clean_atts else None,
         status=OutboundStatus.QUEUED, attempts=0,
         created_at=now, updated_at=now,
     )
@@ -384,7 +401,7 @@ async def outbound_claim(
     for r in stale:
         r.status = OutboundStatus.FAILED
         r.last_error = "expired in queue"
-        r.body_text = None; r.subject = None
+        r.body_text = None; r.subject = None; r.attachments_json = None
         r.updated_at = now
 
     rows = (await db.execute(select(MailOutbound).where(
@@ -395,12 +412,14 @@ async def outbound_claim(
         r.status = OutboundStatus.SENDING
         r.attempts += 1
         r.updated_at = now
+        import json as _json
         out.append({
             "id": str(r.id),
             "from_addr": f"{r.from_alias}@{get_settings().mail_domain}",
             "to_addr": r.to_addr,
             "subject": r.subject or "",
             "text": r.body_text or "",
+            "attachments": _json.loads(r.attachments_json) if r.attachments_json else [],
         })
     await db.commit()
     return {"jobs": out}
@@ -425,14 +444,14 @@ async def outbound_report(
     now = int(time.time())
     if ok:
         row.status = OutboundStatus.DELIVERED
-        row.body_text = None; row.subject = None   # приватність: вміст геть
+        row.body_text = None; row.subject = None; row.attachments_json = None
     elif retry and row.attempts < 5:
         row.status = OutboundStatus.QUEUED          # спробуємо ще (вміст лишається)
         row.last_error = err
     else:
         row.status = OutboundStatus.FAILED
         row.last_error = err
-        row.body_text = None; row.subject = None
+        row.body_text = None; row.subject = None; row.attachments_json = None
     row.updated_at = now
     await db.commit()
     return {"ok": True}

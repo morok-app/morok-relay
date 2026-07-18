@@ -36,7 +36,9 @@ DKIM_HEADERS = [b"From", b"To", b"Subject", b"Date", b"Message-ID", b"MIME-Versi
 
 
 def build_message(from_addr: str, to_addr: str, subject: str, body_text: str,
-                  body_html: str | None = None) -> EmailMessage:
+                  body_html: str | None = None,
+                  attachments: list[dict] | None = None) -> EmailMessage:
+    import base64 as _b64
     msg = EmailMessage()
     msg["From"] = from_addr
     msg["To"] = to_addr
@@ -46,6 +48,16 @@ def build_message(from_addr: str, to_addr: str, subject: str, body_text: str,
     msg.set_content(body_text or "")
     if body_html:
         msg.add_alternative(body_html, subtype="html")
+    for a in (attachments or []):
+        try:
+            data = _b64.b64decode(a.get("b64") or "")
+            ct = a.get("content_type") or "application/octet-stream"
+            maintype, _, subtype = ct.partition("/")
+            msg.add_attachment(data, maintype=maintype or "application",
+                               subtype=subtype or "octet-stream",
+                               filename=a.get("filename") or "file")
+        except Exception:
+            logger.warning("mailout: skipping bad attachment")
     return msg
 
 
@@ -71,6 +83,7 @@ def lookup_mx(domain: str) -> list[str]:
 
 def send_external(from_addr: str, to_addr: str, subject: str,
                   body_text: str, body_html: str | None = None,
+                  attachments: list[dict] | None = None,
                   key_path: str = DKIM_KEY_PATH) -> tuple[bool, str]:
     """
     Надіслати зовнішній лист. Повертає (успіх, повідомлення).
@@ -88,7 +101,7 @@ def send_external(from_addr: str, to_addr: str, subject: str,
     if not mxs:
         return False, "no MX records"
 
-    msg = build_message(from_addr, to_addr, subject, body_text, body_html)
+    msg = build_message(from_addr, to_addr, subject, body_text, body_html, attachments)
     raw = dkim_sign(msg.as_bytes(), key_path)
 
     ctx = ssl.create_default_context()

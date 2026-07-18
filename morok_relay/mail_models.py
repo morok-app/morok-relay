@@ -100,6 +100,9 @@ class MailOutbound(Base):
     to_addr: Mapped[str] = mapped_column(String(255), nullable=False)
     subject: Mapped[str | None] = mapped_column(String(998), nullable=True)
     body_text: Mapped[str | None] = mapped_column(String, nullable=True)
+    # JSON-масив вкладень [{filename, content_type, b64}] — стирається
+    # разом із body_text після доставки (приватність)
+    attachments_json: Mapped[str | None] = mapped_column(String, nullable=True)
     status: Mapped[OutboundStatus] = mapped_column(
         SAEnum(OutboundStatus, name="mail_outbound_status",
                values_callable=lambda e: [m.value for m in e]),
