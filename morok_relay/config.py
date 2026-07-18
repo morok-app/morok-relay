@@ -54,6 +54,11 @@ class Settings(BaseSettings):
     mail_alias_per_month: int = Field(default=1)
     mail_alias_cap: int = Field(default=15)
     mail_admin_pubkey_hex: str = Field(default="")
+    # Фаза 3: спільний секрет relay1 ↔ CX23-воркер (X-Mailout-Token).
+    mail_out_token: str = Field(default="")
+    # Ліміт вихідних на добу на ОДИН акаунт (анти-абуза; прогрів IP
+    # контролюється окремо на воркері).
+    mail_out_user_daily: int = Field(default=20)
 
     # ----- Mode -----
     is_production: bool = Field(default=True)

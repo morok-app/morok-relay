@@ -71,3 +71,41 @@ class MailAlias(Base):
     received_count: Mapped[int] = mapped_column(
         BigInteger, nullable=False, default=0, server_default="0"
     )
+
+
+class OutboundStatus(str, enum.Enum):
+    QUEUED = "queued"
+    SENDING = "sending"
+    DELIVERED = "delivered"
+    FAILED = "failed"
+
+
+class MailOutbound(Base):
+    """
+    Черга вихідних ЗОВНІШНІХ листів (morok → великий світ).
+
+    Приватність: body_text/subject живуть тут ЛИШЕ до доставки. Щойно
+    воркер відзвітував delivered/failed — вміст стирається (NULL),
+    лишаються метадані статусу, щоб юзер бачив ✓/✗ у «Відправлених».
+    """
+    __tablename__ = "mail_outbound"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    owner_pubkey: Mapped[bytes] = mapped_column(
+        LargeBinary(32), nullable=False, index=True
+    )
+    from_alias: Mapped[str] = mapped_column(String(64), nullable=False)
+    to_addr: Mapped[str] = mapped_column(String(255), nullable=False)
+    subject: Mapped[str | None] = mapped_column(String(998), nullable=True)
+    body_text: Mapped[str | None] = mapped_column(String, nullable=True)
+    status: Mapped[OutboundStatus] = mapped_column(
+        SAEnum(OutboundStatus, name="mail_outbound_status",
+               values_callable=lambda e: [m.value for m in e]),
+        nullable=False, default=OutboundStatus.QUEUED, index=True,
+    )
+    attempts: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    last_error: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
