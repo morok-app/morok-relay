@@ -32,7 +32,7 @@ SOURCE_IP = "77.42.19.151"
 HELO_NAME = "mail-out.morok.email"
 
 # заголовки, що входять у DKIM-підпис (стабільні, присутні завжди)
-DKIM_HEADERS = [b"From", b"To", b"Subject", b"Date", b"Message-ID", b"MIME-Version"]
+DKIM_HEADERS = [b"From", b"To", b"Subject", b"Date", b"Message-ID", b"MIME-Version", b"Content-Type"]
 
 
 def build_message(from_addr: str, to_addr: str, subject: str, body_text: str,
