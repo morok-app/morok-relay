@@ -9,13 +9,14 @@ import logging
 import re
 import secrets
 import time
+import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select
+from fastapi import APIRouter, Depends, Header, HTTPException, status
+from sqlalchemy import func, select
 
 from ..config import get_settings
 from ..deps import CurrentSession, DBSession, RedisClient
-from ..mail_models import AliasStatus, MailAlias
+from ..mail_models import AliasStatus, MailAlias, MailOutbound, OutboundStatus
 from ..rate_limit import rate_limit_by_pubkey
 from .. import blob_storage
 from ..queue import enqueue_envelope
@@ -223,6 +224,13 @@ async def send_internal(
     pubkey: bytes = bytes.fromhex(session.pubkey_hex)
     to_alias = str(body.get("to_alias", "")).strip().lower()
     blob_b64 = body.get("blob_b64")
+
+    # ── ЗОВНІШНІЙ адресат (є @ і домен ≠ наш) → черга вихідних ──
+    if "@" in to_alias:
+        _local, _dom = to_alias.rsplit("@", 1)
+        if _dom != get_settings().mail_domain:
+            return await _queue_external(body, session, db, to_alias)
+        to_alias = _local  # свій домен → далі як внутрішній
     # from_alias: необовʼязковий. Якщо вказаний — має належати відправнику
     # (анти-спуфінг). Порожній → анонімний відправник.
     from_alias_raw = body.get("from_alias")
@@ -289,3 +297,187 @@ async def send_internal(
 
     logger.info("mail: internal send delivered")
     return {"status": "sent"}
+
+
+# ────────────────────────────────────────────────────────────
+# Фаза 3 — зовнішня відправка (черга + воркер CX23)
+# ────────────────────────────────────────────────────────────
+
+import re as _re
+_EXT_ADDR_RE = _re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+async def _queue_external(body: dict, session, db, to_addr: str):
+    """
+    Кладе зовнішній лист у чергу mail_outbound. НЕ E2E: сервер бачить
+    вміст до моменту доставки, після — стирає (див. worker report).
+    """
+    pubkey: bytes = bytes.fromhex(session.pubkey_hex)
+    s = get_settings()
+
+    if not _EXT_ADDR_RE.fullmatch(to_addr) or len(to_addr) > 255:
+        raise HTTPException(422, "Некоректна адреса отримувача")
+
+    # від: обовʼязковий власний активний аліас (зовнішній світ вимагає from)
+    from_alias = str(body.get("from_alias") or "").strip().lower()
+    if not from_alias:
+        raise HTTPException(422, "Для зовнішніх листів потрібна адреса «від»")
+    own = (await db.execute(select(MailAlias).where(
+        MailAlias.alias == from_alias,
+        MailAlias.owner_pubkey == pubkey,
+        MailAlias.status == AliasStatus.ACTIVE,
+    ))).scalar_one_or_none()
+    if own is None:
+        raise HTTPException(403, "Адреса «від» не належить вам або неактивна")
+
+    subject = str(body.get("subject") or "").strip()[:998]
+    text = str(body.get("text") or "")
+    if not text.strip():
+        raise HTTPException(422, "Порожній лист")
+    if len(text.encode()) > s.mail_max_bytes:
+        raise HTTPException(413, "Лист завеликий")
+
+    # вкладення: ≤5 шт, сумарно ≤6MB у base64 (~4.5MB сирих)
+    atts = body.get("attachments") or []
+    if not isinstance(atts, list) or len(atts) > 5:
+        raise HTTPException(422, "Забагато вкладень (максимум 5)")
+    total = 0
+    clean_atts = []
+    for a in atts:
+        b64 = str(a.get("b64") or "")
+        fn = str(a.get("filename") or "file")[:255]
+        ct = str(a.get("content_type") or "application/octet-stream")[:100]
+        total += len(b64)
+        if total > 6 * 1024 * 1024:
+            raise HTTPException(413, "Вкладення завеликі (сумарно до ~4.5MB)")
+        clean_atts.append({"filename": fn, "content_type": ct, "b64": b64})
+
+    now = int(time.time())
+    # добовий ліміт на акаунт (анти-абуза)
+    sent_today = (await db.execute(
+        select(func.count()).select_from(MailOutbound).where(
+            MailOutbound.owner_pubkey == pubkey,
+            MailOutbound.created_at > now - 86400,
+        ))).scalar_one()
+    if sent_today >= s.mail_out_user_daily:
+        raise HTTPException(429, "Добовий ліміт вихідних листів вичерпано")
+
+    in_reply_to = str(body.get("in_reply_to") or "").strip()[:256] or None
+    references_hdr = str(body.get("references") or "").strip()[:2048] or None
+
+    import json as _json
+    row = MailOutbound(
+        owner_pubkey=pubkey, from_alias=from_alias, to_addr=to_addr,
+        subject=subject or None, body_text=text,
+        attachments_json=_json.dumps(clean_atts) if clean_atts else None,
+        in_reply_to=in_reply_to, references_hdr=references_hdr,
+        status=OutboundStatus.QUEUED, attempts=0,
+        created_at=now, updated_at=now,
+    )
+    db.add(row)
+    await db.commit()
+    logger.info("mailout: queued external")
+    return {"status": "queued", "ref": str(row.id)}
+
+
+def _check_worker_token(x_mailout_token: str | None):
+    s = get_settings()
+    if not s.mail_out_token or x_mailout_token != s.mail_out_token:
+        raise HTTPException(401, "bad worker token")
+
+
+@router.post("/outbound/claim")
+async def outbound_claim(
+    body: dict,
+    db: DBSession,
+    x_mailout_token: str | None = Header(default=None),
+):
+    """CX23-воркер забирає пачку queued → sending. Auth: X-Mailout-Token."""
+    _check_worker_token(x_mailout_token)
+    limit = min(int(body.get("limit", 5)), 20)
+    now = int(time.time())
+
+    # протухлі queued (48h, CX23 лежав) → failed без вмісту
+    stale = (await db.execute(select(MailOutbound).where(
+        MailOutbound.status == OutboundStatus.QUEUED,
+        MailOutbound.created_at < now - 172800,
+    ))).scalars().all()
+    for r in stale:
+        r.status = OutboundStatus.FAILED
+        r.last_error = "expired in queue"
+        r.body_text = None; r.subject = None; r.attachments_json = None
+        r.updated_at = now
+
+    rows = (await db.execute(select(MailOutbound).where(
+        MailOutbound.status == OutboundStatus.QUEUED,
+    ).order_by(MailOutbound.created_at).limit(limit))).scalars().all()
+    out = []
+    for r in rows:
+        r.status = OutboundStatus.SENDING
+        r.attempts += 1
+        r.updated_at = now
+        import json as _json
+        out.append({
+            "id": str(r.id),
+            "from_addr": f"{r.from_alias}@{get_settings().mail_domain}",
+            "to_addr": r.to_addr,
+            "subject": r.subject or "",
+            "text": r.body_text or "",
+            "attachments": _json.loads(r.attachments_json) if r.attachments_json else [],
+            "in_reply_to": r.in_reply_to or "",
+            "references": r.references_hdr or "",
+        })
+    await db.commit()
+    return {"jobs": out}
+
+
+@router.post("/outbound/report")
+async def outbound_report(
+    body: dict,
+    db: DBSession,
+    x_mailout_token: str | None = Header(default=None),
+):
+    """Воркер звітує результат. Вміст листа СТИРАЄТЬСЯ в будь-якому разі."""
+    _check_worker_token(x_mailout_token)
+    job_id = str(body.get("id") or "")
+    ok = bool(body.get("ok"))
+    err = str(body.get("error") or "")[:500]
+    retry = bool(body.get("retry"))  # тимчасова відмова → назад у чергу
+    row = (await db.execute(select(MailOutbound).where(
+        MailOutbound.id == uuid.UUID(job_id)))).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(404, "job not found")
+    now = int(time.time())
+    if ok:
+        row.status = OutboundStatus.DELIVERED
+        row.body_text = None; row.subject = None; row.attachments_json = None
+    elif retry and row.attempts < 5:
+        row.status = OutboundStatus.QUEUED          # спробуємо ще (вміст лишається)
+        row.last_error = err
+    else:
+        row.status = OutboundStatus.FAILED
+        row.last_error = err
+        row.body_text = None; row.subject = None; row.attachments_json = None
+    row.updated_at = now
+    await db.commit()
+    return {"ok": True}
+
+
+@router.get("/outbound/status")
+async def outbound_status(
+    session: CurrentSession,
+    db: DBSession,
+    _rl=Depends(rate_limit_by_pubkey("mail_ostatus", limit_per_minute=30)),
+):
+    """Статуси МОЇХ останніх вихідних (для ✓/⏳/✗ у «Відправлених»)."""
+    pubkey: bytes = bytes.fromhex(session.pubkey_hex)
+    rows = (await db.execute(select(MailOutbound).where(
+        MailOutbound.owner_pubkey == pubkey,
+    ).order_by(MailOutbound.created_at.desc()).limit(50))).scalars().all()
+    return {"items": [{
+        "ref": str(r.id),
+        "to": r.to_addr,
+        "status": r.status.value,
+        "error": r.last_error,
+        "ts": r.created_at,
+    } for r in rows]}

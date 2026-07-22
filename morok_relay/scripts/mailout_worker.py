@@ -106,6 +106,8 @@ def main() -> None:
                     j.get("subject") or "(без теми)",
                     j.get("text") or "",
                     attachments=j.get("attachments") or [],
+                    in_reply_to=j.get("in_reply_to") or None,
+                    references=j.get("references") or None,
                 )
                 if ok:
                     _bump_today()

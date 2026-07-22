@@ -103,6 +103,9 @@ class MailOutbound(Base):
     # JSON-масив вкладень [{filename, content_type, b64}] — стирається
     # разом із body_text після доставки (приватність)
     attachments_json: Mapped[str | None] = mapped_column(String, nullable=True)
+    # тредінг: заголовки для склеювання ланцюжків у зовнішніх поштах
+    in_reply_to: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    references_hdr: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     status: Mapped[OutboundStatus] = mapped_column(
         SAEnum(OutboundStatus, name="mail_outbound_status",
                values_callable=lambda e: [m.value for m in e]),

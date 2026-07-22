@@ -125,6 +125,9 @@ async def deliver_email(
         "attachments": _extract_attachments(msg),
         "spf": spf_result,
         "received_at": int(time.time()),
+        # для тредінгу відповідей (In-Reply-To/References у Gmail)
+        "message_id": str(msg.get("Message-ID", "")).strip()[:256],
+        "references": str(msg.get("References", "")).strip()[:2048],
     }
     blob = seal_mail(owner_pubkey, payload)
 

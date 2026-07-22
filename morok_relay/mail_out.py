@@ -37,7 +37,9 @@ DKIM_HEADERS = [b"From", b"To", b"Subject", b"Date", b"Message-ID", b"MIME-Versi
 
 def build_message(from_addr: str, to_addr: str, subject: str, body_text: str,
                   body_html: str | None = None,
-                  attachments: list[dict] | None = None) -> EmailMessage:
+                  attachments: list[dict] | None = None,
+                  in_reply_to: str | None = None,
+                  references: str | None = None) -> EmailMessage:
     import base64 as _b64
     msg = EmailMessage()
     msg["From"] = from_addr
@@ -45,6 +47,10 @@ def build_message(from_addr: str, to_addr: str, subject: str, body_text: str,
     msg["Subject"] = subject
     msg["Date"] = formatdate(localtime=False)
     msg["Message-ID"] = make_msgid(domain="morok.email")
+    # тредінг: Gmail/Proton клеять ланцюжок саме за цими заголовками
+    if in_reply_to:
+        msg["In-Reply-To"] = in_reply_to
+        msg["References"] = (f"{references} {in_reply_to}".strip() if references else in_reply_to)
     msg.set_content(body_text or "")
     if body_html:
         msg.add_alternative(body_html, subtype="html")
@@ -84,6 +90,8 @@ def lookup_mx(domain: str) -> list[str]:
 def send_external(from_addr: str, to_addr: str, subject: str,
                   body_text: str, body_html: str | None = None,
                   attachments: list[dict] | None = None,
+                  in_reply_to: str | None = None,
+                  references: str | None = None,
                   key_path: str = DKIM_KEY_PATH) -> tuple[bool, str]:
     """
     Надіслати зовнішній лист. Повертає (успіх, повідомлення).
@@ -101,7 +109,8 @@ def send_external(from_addr: str, to_addr: str, subject: str,
     if not mxs:
         return False, "no MX records"
 
-    msg = build_message(from_addr, to_addr, subject, body_text, body_html, attachments)
+    msg = build_message(from_addr, to_addr, subject, body_text, body_html,
+                        attachments, in_reply_to, references)
     raw = dkim_sign(msg.as_bytes(), key_path)
 
     ctx = ssl.create_default_context()
