@@ -62,6 +62,9 @@ class MailAlias(Base):
     is_primary: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="false"
     )
+    # користувацький підпис «для чого цей аліас» (netflix, олх...) —
+    # серцевина фічі «хто злив адресу»: спам на аліас → підпис каже, хто продав
+    label: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[int] = mapped_column(
         BigInteger, nullable=False,
         server_default=func.extract("epoch", func.now()),

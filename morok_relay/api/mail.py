@@ -111,12 +111,15 @@ async def create_alias(
         if exists is not None:
             raise HTTPException(409, "Адреса зайнята")
 
-    row = MailAlias(alias=alias, owner_pubkey=pubkey, is_primary=want_primary)
+    label = str(body.get("label") or "").strip()[:64] or None
+    row = MailAlias(alias=alias, owner_pubkey=pubkey, is_primary=want_primary,
+                    label=label)
     db.add(row)
     await db.commit()
     s = get_settings()
     logger.info("mail: alias created (primary=%s)", want_primary)
-    return {"alias": alias, "address": f"{alias}@{s.mail_domain}", "primary": want_primary}
+    return {"alias": alias, "address": f"{alias}@{s.mail_domain}",
+            "primary": want_primary, "label": label}
 
 
 @router.get("/aliases")
@@ -136,6 +139,7 @@ async def list_aliases(session: CurrentSession, db: DBSession):
         "aliases": [{
             "alias": a.alias, "address": f"{a.alias}@{s.mail_domain}",
             "status": a.status.value, "primary": a.is_primary,
+            "label": a.label,
             "received": a.received_count, "created_at": a.created_at,
         } for a in rows],
     }
@@ -168,6 +172,21 @@ async def resume_alias(alias: str, session: CurrentSession, db: DBSession):
     row.status = AliasStatus.ACTIVE
     await db.commit()
     return {"alias": row.alias, "status": "active"}
+
+
+@router.post("/aliases/{alias}/label")
+async def set_alias_label(
+    alias: str,
+    body: dict,
+    session: CurrentSession,
+    db: DBSession,
+):
+    """Встановити/змінити/прибрати підпис аліаса (порожній = прибрати)."""
+    pubkey: bytes = bytes.fromhex(session.pubkey_hex)
+    row = await _get_own_alias(db, pubkey, alias)
+    row.label = str(body.get("label") or "").strip()[:64] or None
+    await db.commit()
+    return {"alias": row.alias, "label": row.label}
 
 
 @router.delete("/aliases/{alias}")
@@ -362,11 +381,15 @@ async def _queue_external(body: dict, session, db, to_addr: str):
     if sent_today >= s.mail_out_user_daily:
         raise HTTPException(429, "Добовий ліміт вихідних листів вичерпано")
 
+    in_reply_to = str(body.get("in_reply_to") or "").strip()[:256] or None
+    references_hdr = str(body.get("references") or "").strip()[:2048] or None
+
     import json as _json
     row = MailOutbound(
         owner_pubkey=pubkey, from_alias=from_alias, to_addr=to_addr,
         subject=subject or None, body_text=text,
         attachments_json=_json.dumps(clean_atts) if clean_atts else None,
+        in_reply_to=in_reply_to, references_hdr=references_hdr,
         status=OutboundStatus.QUEUED, attempts=0,
         created_at=now, updated_at=now,
     )
@@ -420,6 +443,8 @@ async def outbound_claim(
             "subject": r.subject or "",
             "text": r.body_text or "",
             "attachments": _json.loads(r.attachments_json) if r.attachments_json else [],
+            "in_reply_to": r.in_reply_to or "",
+            "references": r.references_hdr or "",
         })
     await db.commit()
     return {"jobs": out}
