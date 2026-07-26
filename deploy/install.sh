@@ -142,7 +142,27 @@ ok "Dependencies installed"
 step "Configuring PostgreSQL"
 systemctl enable --now postgresql >/dev/null 2>&1 || true
 
-DB_PASS="$(openssl rand -hex 24)"
+# --- ПОВТОРНИЙ ЗАПУСК: перечитуємо наявні секрети ---------------------------
+# Скрипт документовано як re-runnable, і він САМ радить перезапуск після
+# налаштування DNS. Тому секрети НЕ можна перегенеровувати наосліп:
+#  * новий relay privkey = втрата федеративної identity (усі, хто довіряв
+#    старому pubkey, почнуть відхиляти цей релей);
+#  * новий DB-пароль сам по собі безпечний (роль ALTER-иться), але тримаємо
+#    старий, щоб .env і база не розʼїхались, якщо скрипт впаде посередині.
+EXISTING_ENV="${INSTALL_DIR}/.env"
+OLD_DB_PASS=""; OLD_RELAY_PUB=""; OLD_RELAY_PRIV=""
+if [[ -f "$EXISTING_ENV" ]]; then
+  OLD_DB_PASS="$(sed -n 's|^MOROK_DB_DSN=postgresql+asyncpg://[^:]*:\([^@]*\)@.*|\1|p' "$EXISTING_ENV" | head -1)"
+  OLD_RELAY_PUB="$(sed -n 's/^MOROK_RELAY_PUBKEY_HEX=\([0-9a-fA-F]\{64\}\).*/\1/p'  "$EXISTING_ENV" | head -1)"
+  OLD_RELAY_PRIV="$(sed -n 's/^MOROK_RELAY_PRIVKEY_HEX=\([0-9a-fA-F]\{64\}\).*/\1/p' "$EXISTING_ENV" | head -1)"
+  [[ -n "$OLD_RELAY_PRIV" ]] && ok "Found existing relay identity — will preserve it"
+fi
+
+if [[ -n "$OLD_DB_PASS" ]]; then
+  DB_PASS="$OLD_DB_PASS"
+else
+  DB_PASS="$(openssl rand -hex 24)"
+fi
 # Create role if missing
 if sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='${DB_USER}'" | grep -q 1; then
   sudo -u postgres psql -qc "ALTER ROLE ${DB_USER} WITH PASSWORD '${DB_PASS}';"
@@ -179,15 +199,23 @@ ok "$BLOB_DIR"
 # 8. Relay keypair
 # ===========================================================================
 step "Generating relay identity keypair (Ed25519)"
-KEYS="$(sudo -u "$MOROK_USER" bash -c "cd '$INSTALL_DIR' && .venv/bin/python -m morok_relay.scripts.generate_relay_keypair")"
-# Generator prints lines like:
-#   MOROK_RELAY_PUBKEY_HEX=<64hex>
-#   MOROK_RELAY_PRIVKEY_HEX=<64hex>
-# Parse by variable name (robust against extra hex in comments/output).
-RELAY_PUB="$(echo "$KEYS"  | grep -oP 'MOROK_RELAY_PUBKEY_HEX=\K[0-9a-fA-F]{64}'  | head -1)"
-RELAY_PRIV="$(echo "$KEYS" | grep -oP 'MOROK_RELAY_PRIVKEY_HEX=\K[0-9a-fA-F]{64}' | head -1)"
-[[ -n "$RELAY_PUB" && -n "$RELAY_PRIV" ]] || die "Could not parse relay keypair from generator output."
-ok "Public key: ${RELAY_PUB}"
+if [[ -n "$OLD_RELAY_PUB" && -n "$OLD_RELAY_PRIV" ]]; then
+  # КРИТИЧНО: цей ключ — постійна identity релея у федерації. Перегенерація
+  # розірвала б довіру з усіма пірами. Зберігаємо наявний.
+  RELAY_PUB="$OLD_RELAY_PUB"
+  RELAY_PRIV="$OLD_RELAY_PRIV"
+  ok "Reusing existing keypair: ${RELAY_PUB}"
+else
+  KEYS="$(sudo -u "$MOROK_USER" bash -c "cd '$INSTALL_DIR' && .venv/bin/python -m morok_relay.scripts.generate_relay_keypair")"
+  # Generator prints lines like:
+  #   MOROK_RELAY_PUBKEY_HEX=<64hex>
+  #   MOROK_RELAY_PRIVKEY_HEX=<64hex>
+  # Parse by variable name (robust against extra hex in comments/output).
+  RELAY_PUB="$(echo "$KEYS"  | grep -oP 'MOROK_RELAY_PUBKEY_HEX=\K[0-9a-fA-F]{64}'  | head -1)"
+  RELAY_PRIV="$(echo "$KEYS" | grep -oP 'MOROK_RELAY_PRIVKEY_HEX=\K[0-9a-fA-F]{64}' | head -1)"
+  [[ -n "$RELAY_PUB" && -n "$RELAY_PRIV" ]] || die "Could not parse relay keypair from generator output."
+  ok "Public key: ${RELAY_PUB}"
+fi
 
 # ===========================================================================
 # 9. Tor onion service
@@ -220,6 +248,11 @@ done
 # ===========================================================================
 step "Writing configuration (.env)"
 ENV_FILE="${INSTALL_DIR}/.env"
+# страховка: зберігаємо копію попереднього .env перед перезаписом
+if [[ -f "$ENV_FILE" ]]; then
+  cp -a "$ENV_FILE" "${ENV_FILE}.bak.$(date +%s)"
+  ok "Previous .env backed up"
+fi
 # NOTE: never put a comment '#' on the same line as a secret without a
 # leading space — pydantic reads the whole line otherwise. We keep it
 # simple: no inline comments next to values.
