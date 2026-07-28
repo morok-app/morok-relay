@@ -2,7 +2,7 @@
 #
 # Morok Relay — one-command self-host installer.
 #
-#   curl -fsSL https://get.morok.app/install.sh | sudo bash
+#   curl -fsSL https://morok.app/install.sh | sudo bash
 #
 # Brings up a complete, production-ready Morok relay on a fresh Ubuntu
 # 22.04 / 24.04 server: PostgreSQL, Redis, Python venv, database
@@ -467,15 +467,23 @@ ${C_GREEN}${C_BOLD}════════════════════�
          certbot --nginx -d ${DOMAIN} --agree-tos -m ${EMAIL} --redirect
 
   ${C_BOLD}2. Federate${C_RESET} (optional — to talk to other relays)
-     Exchange pubkeys with an existing relay operator, then on BOTH
-     relays insert a federation_peers row. On this relay:
+     Both operators run this on their own relay:
 
-         sudo -u ${MOROK_USER} psql -d ${DB_NAME} -c \\
-           "INSERT INTO federation_peers (hostname, pubkey, is_trusted)
-            VALUES ('THEIR_RELAY.example.com',
-                    decode('THEIR_PUBKEY_HEX','hex'), true);"
+         cd ${INSTALL_DIR}
+         sudo -u ${MOROK_USER} .venv/bin/python -m morok_relay.scripts.federate \\
+              THEIR_RELAY.example.com
 
-     And they add YOURS:
+     It prints a FINGERPRINT (eight groups of four digits). Compare it
+     with the other operator over a SEPARATE channel — a call, Signal,
+     anything but the relays themselves. If it matches, on both sides:
+
+         sudo -u ${MOROK_USER} .venv/bin/python -m morok_relay.scripts.federate \\
+              --trust THEIR_RELAY.example.com
+
+     Verifying the fingerprint is not a formality: the handshake proves
+     someone holds the key, not that it is the server you meant.
+
+     Your identity, if they ask:
          hostname = ${DOMAIN}
          pubkey   = ${RELAY_PUB}
 
