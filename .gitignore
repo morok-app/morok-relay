@@ -1,0 +1,57 @@
+# ─────────────────────────────────────────────────────────────
+# Секрети — НІКОЛИ не комітити.
+# .env на серверах лежить поруч із кодом і не відстежується git.
+# Саме тому при чистці робочої копії треба:
+#   git clean -fd -e .env -e .venv/ -e .venv
+# а НЕ голий `git clean -fd` — він знесе .env і покладе релей.
+# ─────────────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.keystore
+secrets/
+credentials*.json
+service-account*.json
+
+# Firebase / push
+google-services.json
+firebase-adminsdk*.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# База / логи / тимчасове
+*.db
+*.sqlite
+*.sqlite3
+*.log
+logs/
+*.pid
+
+# Пошта: черга вихідних і тимчасові файли
+mail_out/
+mail_spool/
+*.eml
+
+# Alembic — версії міграцій ПОТРІБНІ в репо,
+# ігноруємо лише локальний конфіг із паролем БД, якщо такий з'явиться
+alembic.local.ini
+
+# ОС / редактори
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
