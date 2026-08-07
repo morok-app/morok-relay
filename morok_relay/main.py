@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from contextlib import asynccontextmanager
 
@@ -106,6 +107,38 @@ async def add_security_headers(request: Request, call_next):
     return response
 
 
+# Шляхи, де сегмент URL сам є обліковим даним. Логувати їх повністю =
+# роздати секрети всім, хто має доступ до журналів, бекапів чи збору логів.
+#
+# K7: burner-токен (багаторазовий, TTL до 30 днів) стоїть у шляху й не
+# має жодної авторизації — токен САМ є доступом. Той, хто прочитає лог,
+# може писати від імені будь-якого анонімного відправника. Те саме менш
+# гостро стосується поштових аліасів (розкриває, які адреси в кого є).
+#
+# Маскуємо ЗА РЕГУЛЯРКАМИ, а не за списком точних шляхів: новий маршрут із
+# токеном у path автоматично підпаде під шаблон, не чекаючи, поки хтось
+# згадає оновити middleware.
+_SENSITIVE_PATH_PATTERNS = [
+    # /api/v1/burner/{token}, /public/{token}, /public/{token}/send
+    (re.compile(r"(/api/v1/burner)(/public)?/[^/]+(/send)?$"),
+     lambda m: f"{m.group(1)}{m.group(2) or ''}/***{m.group(3) or ''}"),
+    # /api/v1/mail/aliases/{alias}[/label|/pause|/resume], /resolve/{alias}
+    (re.compile(r"(/api/v1/mail/(?:aliases|resolve))/[^/]+(/\w+)?$"),
+     lambda m: f"{m.group(1)}/***{m.group(2) or ''}"),
+    # /api/v1/groups/by-slug/{slug}
+    (re.compile(r"(/api/v1/groups/by-slug)/[^/]+$"),
+     lambda m: f"{m.group(1)}/***"),
+]
+
+
+def _sanitize_path(path: str) -> str:
+    for pattern, repl in _SENSITIVE_PATH_PATTERNS:
+        new = pattern.sub(repl, path)
+        if new != path:
+            return new
+    return path
+
+
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     start = time.monotonic()
@@ -114,7 +147,7 @@ async def log_requests(request: Request, call_next):
     logger.info(
         "%s %s -> %d (%.1fms)",
         request.method,
-        request.url.path,
+        _sanitize_path(request.url.path),
         response.status_code,
         elapsed_ms,
     )

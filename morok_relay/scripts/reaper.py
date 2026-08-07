@@ -57,7 +57,6 @@ async def reap_blobs(redis: redis_async.Redis) -> dict:
     """One pass over the blob directory."""
     settings = get_settings()
     now = int(time.time())
-    age_limit_seconds = settings.message_ttl_hard_seconds
 
     stats = {
         "blobs_scanned": 0,
@@ -67,30 +66,58 @@ async def reap_blobs(redis: redis_async.Redis) -> dict:
         "blob_errors": 0,
     }
 
+    # Запасний віковий ліміт: НЕ фіксовані 24 години, а найдовший
+    # можливий TTL у системі. Пошта живе в черзі 7 діб (mail_ttl_seconds),
+    # тому вирізати blob за 24 год означало б знищувати листи, які ще
+    # чекають на отримувача (K8: лист видно у вхідних, але GET дає 404).
+    # Беремо максимум із двох стель + добу фори, щоб покрити ще й
+    # федеративні конверти й розсинхрон годинника.
+    hard_age_limit = max(
+        settings.message_ttl_hard_seconds,
+        settings.mail_ttl_seconds,
+    ) + 86400
+
     for blob_path in _iter_blob_paths(settings.blob_dir):
         stats["blobs_scanned"] += 1
         envelope_id = blob_path.name
 
         try:
-            blob_age = now - int(blob_path.stat().st_mtime)
-            if blob_age > age_limit_seconds:
-                deleted = await secure_delete_blob(envelope_id)
-                if deleted:
-                    stats["blobs_deleted_aged_out"] += 1
-                    logger.info(
-                        "Aged-out blob deleted: %s (age=%ds)",
-                        envelope_id[:16], blob_age,
-                    )
-                continue
-
+            # ПОРЯДОК ВАЖЛИВИЙ: спершу питаємо чергу, потім вік.
+            # Поки конверт лежить у Redis-черзі (тобто отримувач ще не
+            # забрав його), blob чіпати НЕ МОЖНА — незалежно від віку
+            # файлу. Раніше вікова перевірка стояла першою й затирала
+            # поштовий blob на 25-й годині, хоча в черзі він живе 7 діб.
             exists = await redis.exists(f"morok:envelope:{envelope_id}")
             if exists:
                 stats["blobs_still_queued"] += 1
                 continue
 
+            # Конверта в черзі немає. Це означає одне з двох:
+            #   1) отримувач його забрав і ack-нув (доставлено) →
+            #      blob можна прибирати;
+            #   2) конверт протух і випав із черги, а файл лишився сиротою.
+            # Обидва випадки — на видалення. Але додатковий віковий
+            # запобіжник лишаємо: якщо з якоїсь причини Redis відповів
+            # порожньо помилково (флаш, міграція), СВІЖИЙ blob не чіпаємо,
+            # даємо йому дожити до природної стелі.
+            blob_age = now - int(blob_path.stat().st_mtime)
+            if blob_age <= hard_age_limit:
+                # молодший за стелю й не в черзі → доставлений сирота
+                deleted = await secure_delete_blob(envelope_id)
+                if deleted:
+                    stats["blobs_deleted_delivered"] += 1
+                continue
+
+            # старший за будь-який мислимий TTL → гарантовано сміття
             deleted = await secure_delete_blob(envelope_id)
             if deleted:
-                stats["blobs_deleted_delivered"] += 1
+                stats["blobs_deleted_aged_out"] += 1
+                logger.info(
+                    "Aged-out orphan blob deleted: %s (age=%ds)",
+                    envelope_id[:16], blob_age,
+                )
+            continue
+
         except Exception as e:
             stats["blob_errors"] += 1
             logger.exception("Reaper blob error on %s: %s", envelope_id[:16], e)
