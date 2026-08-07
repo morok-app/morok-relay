@@ -44,6 +44,13 @@ from ..sessions import verify_session_token
 
 logger = logging.getLogger(__name__)
 
+# Коди закриття WebSocket у застосунковому діапазоні (4000-4999).
+# Клієнт розрізняє їх, щоб обрати правильну реакцію:
+#   4001 — токен недійсний/протух → перелогінитись і перепідключитись
+#   4002 — вичерпано ліміт паралельних з'єднань → чекати довше, НЕ логінитись
+WS_CLOSE_AUTH_FAILED = 4001
+WS_CLOSE_TOO_MANY_CONNECTIONS = 4002
+
 router = APIRouter(tags=["inbox"])
 
 
@@ -66,9 +73,22 @@ async def inbox_socket(
     redis = get_redis()
 
     # 1. Authenticate via session token
+    #
+    # ВАЖЛИВО: спершу accept(), і лише потім close(code=...).
+    # У Starlette close() ДО accept() не надсилає WebSocket-кадр закриття —
+    # рукостискання завершується як HTTP 403, і клієнт бачить код 1006
+    # (abnormal closure). Через це протухла сесія, вичерпаний ліміт
+    # з'єднань і звичайний обрив мережі виглядали для клієнта ОДНАКОВО:
+    # він не знав, що треба перелогінитись, і мовчки крутив реконекти,
+    # поки застосунок не перезапустять.
+    #
+    # Приймаємо з'єднання на мілісекунди, щоб мати змогу передати причину,
+    # і одразу закриваємо. Коди в діапазоні 4000-4999 зарезервовані для
+    # застосунку саме для таких випадків.
     session = await verify_session_token(redis, token)
     if session is None:
-        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        await websocket.accept()
+        await websocket.close(code=WS_CLOSE_AUTH_FAILED, reason="auth_failed")
         return
 
     pubkey_hex = session.pubkey_hex
@@ -84,7 +104,13 @@ async def inbox_socket(
         settings.rate_limit_ws_connections_per_pubkey,
     )
     if not slot_ok:
-        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        # ОКРЕМИЙ код: це НЕ проблема з автентифікацією. Якщо віддати той
+        # самий 1008/4001, клієнт вирішить, що сесія протухла, піде
+        # перелогінюватись — і повернеться в ту саму стіну, бо слоти
+        # зайняті іншими вкладками/пристроями. Правильна реакція —
+        # зачекати довше, а не оновлювати токен.
+        await websocket.accept()
+        await websocket.close(code=WS_CLOSE_TOO_MANY_CONNECTIONS, reason="too_many_connections")
         return
 
     await websocket.accept()
