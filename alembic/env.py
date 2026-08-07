@@ -16,6 +16,11 @@ from sqlalchemy import engine_from_config, pool
 from morok_relay.config import get_settings
 from morok_relay.db import Base
 from morok_relay import models  # noqa: F401 — load models so metadata sees them
+# mail_models НЕ імпортувався — саме тому mail_aliases/mail_outbound
+# випали з міграцій і на свіжому розгортанні пошта не працювала.
+# Кожен новий модуль з моделями треба додавати сюди, інакше autogenerate
+# його не побачить.
+from morok_relay import mail_models  # noqa: F401
 
 # Alembic Config object — gives access to alembic.ini values.
 config = context.config
