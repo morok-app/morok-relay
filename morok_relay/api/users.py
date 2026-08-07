@@ -153,11 +153,25 @@ async def _cache_remote_user(
     username: str,
     home_relay: str,
 ) -> User | None:
+    settings = get_settings()
     pubkey_bytes = bytes.fromhex(pubkey_hex)
 
     stmt = select(User).where(User.pubkey == pubkey_bytes)
     existing = (await db.execute(stmt)).scalar_one_or_none()
     if existing is not None:
+        # ЗАХИСТ: якщо користувач НАШ (зареєстрований тут), жодна
+        # федеративна відповідь не має права переписати його home_relay.
+        # Інакше чужий релей міг би заявити «цей pubkey живе в мене» — і
+        # ми почали б пересилати його пошту й повідомлення туди.
+        # Свої записи авторитетні локально, крапка.
+        if existing.home_relay == settings.relay_name:
+            if home_relay != settings.relay_name:
+                logger.warning(
+                    "Refusing to move local user %s... to remote relay %s",
+                    pubkey_hex[:8], home_relay,
+                )
+            return existing
+
         # Federation lookup is authoritative about home_relay. Records
         # auto-created at login time may have a stale home_relay (set to
         # our own relay before we knew where this pubkey actually lives).
@@ -350,27 +364,47 @@ async def lookup_username(
         )
 
     # 2. Federation fallback — figure out which peer(s) to query
+    #
+    # БЕЗПЕКА: ?relay= приходить від КЛІЄНТА і НЕ є довіреним. Раніше
+    # довільний хост із параметра підставлявся напряму, і будь-хто ззовні,
+    # без авторизації, міг:
+    #   1) змусити релей робити запити на свій сервер (SSRF-подібне);
+    #   2) отримати у відповідь підроблений pubkey/home_relay для чужого
+    #      імені, які релей потім ЗАПИСУВАВ у власну БД і кеш на 24 год —
+    #      тобто перенаправити чужі повідомлення на сервер зловмисника.
+    #
+    # Тепер ?relay= — це лише ПІДКАЗКА, у якому порядку опитувати peer'ів.
+    # Ходимо виключно на хости зі списку довірених федерацій. Якщо
+    # підказка не серед них — не падаємо, а тихо ігноруємо її й робимо
+    # звичайний fan-out: легітимний пошук працює як раніше.
+    peer_stmt = (
+        select(FederationPeer)
+        .where(FederationPeer.is_trusted.is_(True))
+        .order_by(FederationPeer.last_handshake_at.desc().nullslast())
+    )
+    peers = (await db.execute(peer_stmt)).scalars().all()
+    trusted_hosts = [
+        p.hostname for p in peers if p.hostname != settings.relay_name
+    ]
+
     if relay is not None and relay != settings.relay_name:
-        # Explicit relay specified by caller
-        candidate_relays = [relay]
-    else:
-        # No explicit hint — fan out across all trusted federation peers.
-        # Most recently handshaked first (likeliest to be alive).
-        peer_stmt = (
-            select(FederationPeer)
-            .where(FederationPeer.is_trusted.is_(True))
-            .order_by(FederationPeer.last_handshake_at.desc().nullslast())
-        )
-        peers = (await db.execute(peer_stmt)).scalars().all()
-        candidate_relays = [
-            p.hostname for p in peers if p.hostname != settings.relay_name
-        ]
-        if not candidate_relays:
-            # No peers known — fall through to 404
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="username_not_found",
+        if relay in trusted_hosts:
+            # Підказка валідна — питаємо названий peer першим, решту потім
+            candidate_relays = [relay] + [h for h in trusted_hosts if h != relay]
+        else:
+            logger.warning(
+                "Ignoring untrusted relay hint in lookup: %r", relay,
             )
+            candidate_relays = trusted_hosts
+    else:
+        candidate_relays = trusted_hosts
+
+    if not candidate_relays:
+        # Немає жодного довіреного peer'а — далі йти нікуди
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="username_not_found",
+        )
 
     last_error_status: int | None = None  # remember if any peer was unreachable
 
