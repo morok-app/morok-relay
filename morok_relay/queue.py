@@ -293,6 +293,14 @@ async def enqueue_envelope_for_recipients(
     ceiling = now + hard_ceiling_seconds
     expires_at = min(requested_expires, ceiling)
 
+    # Дзеркало guard'а з enqueue_envelope (див. вище): конверт, що вже
+    # протух (ts близько нижньої межі вікна ±300с і крихітний ttl), дав би
+    # від'ємний EX → помилка Redis → 500 ПІСЛЯ того, як blob уже записано.
+    # Повертаємо (expires_at, 0) — обидва виклики (groups.py, federation.py)
+    # результат ігнорують, тож форма відповіді сумісна.
+    if expires_at - now <= 0:
+        return expires_at, 0
+
     to_value = group_id if group_id else "broadcast"
 
     meta = {

@@ -353,10 +353,10 @@ async def _forward_impl(
         return await _handle_group_delete_to_host(body.envelope, db, redis, settings)
 
     if kind == "group_delete_deliver":
-        return await _handle_group_delete_deliver(body.envelope, db, redis, settings)
+        return await _handle_group_delete_deliver(body.envelope, peer, db, redis, settings)
 
     if kind == "group_gone":
-        return await _handle_group_gone(body.envelope, db, redis, settings)
+        return await _handle_group_gone(body.envelope, peer, db, redis, settings)
 
     if kind == "read_receipt":
         return await _handle_read_receipt(body.envelope, db, redis, settings)
@@ -1081,19 +1081,27 @@ async def _handle_group_delete_to_host(
 
 
 async def _handle_group_delete_deliver(
-    envelope: dict, db, redis, settings,
+    envelope: dict, peer: "FederationPeer", db, redis, settings,
 ) -> "ForwardResponse":
     """
     Host relay tells us: drop this group envelope from these specific
     local member inboxes and push a "deleted" WS event to each.
 
-    The host has already verified the sender's authorization. We
-    independently re-verify the sender's signature on the delete
-    intent — this means a compromised host cannot censor messages
-    in our local users' inboxes by forging deletes.
+    Authorization is TWO independent layers — a valid signature from the
+    claimed key is necessary but NOT sufficient (otherwise anyone mints a
+    one-off keypair, signs with it, and censors arbitrary envelopes):
+
+      1. HOST GATE: the event is only accepted from the group's recorded
+         home_relay (same trust model as group snapshots). If we host the
+         group ourselves (home_relay NULL/self), deliver events must not
+         arrive from outside at all — deletes for our groups go through
+         group_delete_to_host.
+      2. SIGNER AUTHORITY: the signer must be the envelope's original
+         sender (redis meta "from"), or a local admin of the group, or
+         its creator. The signature then proves the request really comes
+         from that authorized key.
     """
-    from ..queue import delete_envelope_for_group
-    from ..models import User
+    from ..queue import delete_envelope_for_group, get_envelope_meta
 
     envelope_id = envelope.get("envelope_id")
     group_id_str = envelope.get("group_id")
@@ -1113,6 +1121,17 @@ async def _handle_group_delete_deliver(
             detail="group_delete_missing_signature",
         )
 
+    try:
+        gid = uuid.UUID(str(group_id_str))
+        caller_pubkey_bytes = bytes.fromhex(caller_pubkey_hex)
+        if len(caller_pubkey_bytes) != 32:
+            raise ValueError("bad_pubkey_length")
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="group_delete_malformed_ids",
+        )
+
     if not _verify_delete_sig(
         kind="group_delete",
         envelope_id=envelope_id,
@@ -1129,6 +1148,66 @@ async def _handle_group_delete_deliver(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="invalid_delete_signature",
         )
+
+    # ── Шар 1: господар. Подію deliver шле лише home_relay групи. ──
+    group_stmt = select(Group).where(Group.id == gid)
+    group = (await db.execute(group_stmt)).scalar_one_or_none()
+
+    meta = await get_envelope_meta(redis, envelope_id)
+    if meta is None:
+        # Конверт уже протух або видалений — операція ідемпотентно порожня.
+        # Приймаємо no-op'ом, щоб ретраї legit-видалень після TTL не сипали
+        # помилками; жодних локальних дій не виконується.
+        return ForwardResponse(
+            accepted=True, envelope_id=envelope_id,
+            reason="envelope_already_gone",
+        )
+
+    if group is None:
+        # Групу локально не знаємо (немає shadow-рядка) — членство і
+        # адмінство перевірити нема чим. Дозволяємо ЄДИНИЙ вузький випадок,
+        # який перевіряється без групи: відправник видаляє власний конверт
+        # (meta["from"] — наш власний запис, зроблений при доставці).
+        if meta.get("from") != caller_pubkey_hex:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="group_delete_unknown_group_signer_not_sender",
+            )
+    else:
+        if not group.home_relay or group.home_relay == settings.relay_name:
+            # NULL/self = хостимо ми. Видалення для наших груп ідуть через
+            # group_delete_to_host, а deliver ззовні для них — підробка.
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="group_delete_deliver_for_locally_hosted_group",
+            )
+        if group.home_relay != peer.hostname:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="group_delete_deliver_from_wrong_host",
+            )
+
+        # ── Шар 2: повноваження підписанта. ──
+        signer_is_sender = meta.get("from") == caller_pubkey_hex
+        if not signer_is_sender:
+            signer_is_creator = bytes(group.creator_pubkey) == caller_pubkey_bytes
+            admin_stmt = (
+                select(GroupMember.id)
+                .where(GroupMember.group_id == gid)
+                .where(GroupMember.pubkey == caller_pubkey_bytes)
+                .where(GroupMember.is_admin.is_(True))
+            )
+            signer_is_admin = (await db.execute(admin_stmt)).first() is not None
+            if not (signer_is_creator or signer_is_admin):
+                logger.warning(
+                    "Rejected group_delete_deliver %s — signer %s is neither "
+                    "sender, admin, nor creator of group %s",
+                    envelope_id[:8], caller_pubkey_hex[:8], group_id_str,
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="group_delete_signer_not_authorized",
+                )
 
     recipient_bytes: list[bytes] = []
     for pk in raw_recipients:
@@ -1178,7 +1257,7 @@ async def _handle_group_delete_deliver(
 
 
 async def _handle_group_gone(
-    envelope: dict, db, redis, settings,
+    envelope: dict, peer: "FederationPeer", db, redis, settings,
 ) -> "ForwardResponse":
     """
     Host relay tells us: a group was deleted by its creator. Push a
@@ -1186,11 +1265,16 @@ async def _handle_group_gone(
     their clients drop the group immediately (instead of only finding
     out lazily on next open).
 
-    We INDEPENDENTLY re-verify the creator's signature — a compromised
-    or malicious host relay must not be able to make our local users'
-    clients silently delete a group by forging "group_gone". This is
-    the same trust model as group_delete_deliver: trusted peer is
-    necessary but NOT sufficient; the cryptographic signature is.
+    Authorization is TWO independent layers (same model as
+    group_delete_deliver — a valid signature from a self-declared key
+    is NOT enough, otherwise any trusted peer can make our users'
+    clients silently delete any group):
+
+      1. HOST GATE: only the group's recorded home_relay may announce
+         its demise; NULL/self home_relay means WE host it and the
+         event can only originate locally, never via federation.
+      2. SIGNER AUTHORITY: the signer must be the group's creator as
+         recorded in OUR database — not whatever key the envelope names.
     """
     from ..queue import publish_group_gone
 
@@ -1211,6 +1295,17 @@ async def _handle_group_gone(
             detail="group_gone_missing_signature",
         )
 
+    try:
+        gid = uuid.UUID(str(group_id_str))
+        by_pubkey_bytes = bytes.fromhex(by_pubkey_hex)
+        if len(by_pubkey_bytes) != 32:
+            raise ValueError("bad_pubkey_length")
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="group_gone_malformed_ids",
+        )
+
     # Independently verify the creator's signature over the gone intent.
     if not _verify_delete_sig(
         kind="group_gone",
@@ -1229,7 +1324,44 @@ async def _handle_group_gone(
             detail="invalid_group_gone_signature",
         )
 
+    # ── Шар 1: господар + Шар 2: творець — обидва проти НАШОЇ БД. ──
+    group_stmt = select(Group).where(Group.id == gid)
+    group = (await db.execute(group_stmt)).scalar_one_or_none()
+    if group is None:
+        # Ми цю групу не знаємо → у наших користувачів нема чого зносити.
+        # Ідемпотентний no-op; головне — НЕ публікувати подій наосліп.
+        return ForwardResponse(
+            accepted=True, envelope_id=group_id_str,
+            reason="unknown_group_noop",
+        )
+    if not group.home_relay or group.home_relay == settings.relay_name:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="group_gone_for_locally_hosted_group",
+        )
+    if group.home_relay != peer.hostname:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="group_gone_from_wrong_host",
+        )
+    if bytes(group.creator_pubkey) != by_pubkey_bytes:
+        logger.warning(
+            "Rejected group_gone %s — signer %s is not the recorded creator",
+            group_id_str, by_pubkey_hex[:8],
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="group_gone_signer_not_creator",
+        )
+
     # Only notify members that are actually local to us, and validate hex.
+    # Додатково: перетинаємо зі СПИСКОМ ЧЛЕНІВ з нашої БД — подія про
+    # смерть групи не повинна долітати до тих, хто в ній не перебуває
+    # (peer міг перерахувати довільні pubkey).
+    member_stmt = select(GroupMember.pubkey).where(GroupMember.group_id == gid)
+    member_pubkeys_hex = {
+        bytes(pk).hex() for (pk,) in (await db.execute(member_stmt)).all()
+    }
     local_recipients: list[str] = []
     for pk in raw_recipients:
         if not isinstance(pk, str) or len(pk) != 64:
@@ -1237,6 +1369,8 @@ async def _handle_group_gone(
         try:
             bytes.fromhex(pk)
         except ValueError:
+            continue
+        if pk not in member_pubkeys_hex:
             continue
         local_recipients.append(pk)
 
