@@ -1,131 +1,162 @@
 # morok-relay
 
-Federated relay server for the [Morok messenger](https://morok.app).
+Бекенд Morok: API, WebSocket-інбокс, федерація між релеями, morok.email.
 
-**Status:** v0.1, in active development. Not for production use.
+**Це робоча пам'ятка, а не презентація.** Тут те, що забувається за півроку:
+де що лежить, як деплоїться і що ламається, якщо зробити неправильно.
 
-## What this does
+---
 
-A relay server is the part of Morok that lives on the internet. Clients
-connect to it to send and receive encrypted messages. Multiple relays
-federate with each other so users on different relays can talk.
+## Стек
 
-The relay never sees plaintext, never has user private keys, and stores
-the absolute minimum needed for delivery. Encrypted message blobs are
-held briefly in a delivery queue and physically destroyed after delivery
-or 48 hours, whichever comes first.
+Python 3.12 · FastAPI (async) · PostgreSQL 16 · Redis 7 · PyNaCl
 
-This is just the relay. The Android client is a separate repository.
+Релей ніколи не бачить відкритого тексту й не має приватних ключів
+користувачів. Зашифровані блоби лежать у черзі доставки й фізично
+затираються після доставки або протермінування.
 
-## Stack
+---
 
-- Python 3.12+
-- FastAPI (async)
-- PostgreSQL 16+ (metadata)
-- Redis 7+ (message queue, challenges, rate limits)
-- PyNaCl (libsodium bindings)
+## Сервери
 
-## Local setup
+| | адреса | що крутиться |
+|---|---|---|
+| **relay1** | `root@62.238.28.107` (Hetzner, hostname `vibra-tor-prod`) | API/WS, веб-клієнт, admin, **morok-mail** (вхідний SMTP) |
+| **relay2** | `root@167.86.120.176` (Contabo, hostname `vmi3308392`) | API/WS, веб-клієнт |
+| **cx23** | `root@77.42.19.151` | **вихідна пошта** (mail_out.py, забирає з `/api/v1/mail/outbound/claim`) |
 
-Requires Python 3.12+, PostgreSQL, Redis.
+Код релея на обох relay-серверах: `/home/morok/morok-relay`
+
+### systemd
+
+Сервіси:
+```
+morok-relay.service     API + WebSocket
+morok-mail.service      вхідний SMTP, порт 25 (тільки relay1)
+```
+
+Таймери (їх **не видно** в `systemctl list-units --type=service`, бо
+`Type=oneshot` — дивитись через `list-timers`):
+```
+morok-reaper.timer             щогодини — затирає доставлені/протухлі блоби
+morok-dms-reaper.timer         «цифровий заповіт»
+morok-federation-worker.timer  щохвилини — черга федерації
+morok-fstrim.timer             щоночі — БЕЗ нього secure-delete на SSD не дотирає
+```
 
 ```bash
-# 1. Clone and enter
-git clone git@github.com:morok-app/morok-relay.git
-cd morok-relay
+systemctl list-timers --all | grep -i morok
+```
 
-# 2. Virtual environment
-python3.12 -m venv .venv
-source .venv/bin/activate
+---
 
-# 3. Dependencies
+## Деплой
+
+```bash
+cd /home/morok/morok-relay && git pull && systemctl restart morok-relay
+```
+
+Якщо була міграція:
+```bash
+.venv/bin/alembic upgrade head && systemctl restart morok-relay
+```
+
+**Обидва relay-сервери оновлювати разом.** Розсинхрон версій ламає федерацію
+тихо й непередбачувано.
+
+### Deploy keys
+
+У кожного сервера **свій** ключ, прив'язаний до цього репозиторія
+(GitHub не дозволяє один deploy key на два репо, але дозволяє два ключі
+на одне). Перевірка:
+
+```bash
+ssh -T git@github.com     # має відповісти "Hi morok-app/morok-relay!"
+```
+
+Якщо відповідає іншим репо — ключ від чужого проєкту. Лікується так:
+
+```bash
+ssh-keygen -t ed25519 -C "relayN-morok-relay" -f ~/.ssh/morok_relay_deploy -N ""
+cat ~/.ssh/morok_relay_deploy.pub    # → GitHub → repo → Settings → Deploy keys
+cat >> ~/.ssh/config <<'EOF'
+
+Host github.com
+    HostName github.com
+    User git
+    IdentityFile ~/.ssh/morok_relay_deploy
+    IdentitiesOnly yes
+EOF
+chmod 600 ~/.ssh/config
+```
+
+`IdentitiesOnly yes` обов'язковий — інакше ssh перебере всі ключі й
+підсуне не той.
+
+---
+
+## Підводні камені
+
+**`.env` не в git і НЕ МАЄ туди потрапити.** Він лежить поруч із кодом на
+серверах. Тому чистка робочої копії тільки так:
+
+```bash
+git clean -fd -e .env -e .venv/
+```
+
+Голий `git clean -fd` зносить `.env` і кладе релей.
+
+**Нові моделі треба реєструвати в `alembic/env.py`.** Якщо цього не зробити,
+autogenerate їх не побачить і таблиці не потраплять у міграції — саме так
+`mail_aliases`/`mail_outbound` колись випали й пошта не працювала на
+свіжому розгортанні.
+
+**Міграції на працюючих серверах мають бути ідемпотентні.** Частина таблиць
+там створена руками; звичайний `CREATE TABLE` упаде й **заблокує всі
+наступні міграції**.
+
+**Секрети в шляхах URL не логувати.** Burner-токен сам є доступом — хто
+прочитає лог, той може писати від імені будь-якого анонімного відправника.
+Маскування в `main.py`, `_sanitize_path()`.
+
+---
+
+## TTL
+
+| що | скільки | де |
+|---|---|---|
+| повідомлення | 24 год | `message_ttl_hard_seconds` |
+| пошта | 7 діб | `mail_ttl_seconds` |
+
+Reaper спершу питає чергу Redis і лише потім дивиться на вік файлу.
+Порядок важливий: навпаки — поштові блоби гинули б на 25-й годині.
+
+---
+
+## Локальний запуск
+
+```bash
+python3.12 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-
-# 4. Config
-cp .env.example .env
-# Edit .env: at minimum set MOROK_DB_DSN to point at your local Postgres.
-
-# 5. Generate this relay's keypair (federation identity)
-python -m morok_relay.scripts.generate_relay_keypair
-# Copy the two lines into .env
-
-# 6. Database
-createdb morok_relay
-# Migrations will be added in a later commit; for now the DB starts empty.
-
-# 7. Redis
-# Make sure redis-server is running locally (default port 6379).
-
-# 8. Run
+cp .env.example .env        # заповнити
+alembic upgrade head
 uvicorn morok_relay.main:app --reload
 ```
 
-Server starts on `http://localhost:8000`. Try:
+Потрібні PostgreSQL і Redis.
+
+---
+
+## Перевірки
 
 ```bash
-curl http://localhost:8000/health
-# {"status":"ok","relay_name":"...","version":"0.1.0"}
+curl -s https://relay1.morok.app/health
+systemctl is-active morok-relay morok-mail
+.venv/bin/alembic current
+sudo -u postgres psql morok_relay -c "SELECT hostname, is_trusted FROM federation_peers;"
+journalctl -u morok-relay --since "10 min ago"
 ```
 
-In dev mode, OpenAPI docs are at `http://localhost:8000/docs`.
-
-## Tests
-
-```bash
-pytest -v
-```
-
-Crypto tests live in `tests/test_crypto.py` and are the most critical —
-if they fail, the server is broken.
-
-## Project layout
-
-```
-morok-relay/
-  morok_relay/
-    __init__.py
-    main.py           # FastAPI app entry point
-    config.py         # Settings (Pydantic)
-    db.py             # DB and Redis connection management
-    models.py         # SQLAlchemy ORM models
-    schemas.py        # Pydantic request/response schemas
-    crypto.py         # Ed25519, X25519, envelope verification
-    scripts/          # CLI utilities (keygen, etc.)
-  tests/
-    test_crypto.py    # crypto verification tests
-  requirements.txt
-  .env.example
-  README.md
-```
-
-## What's NOT here yet (coming in next commits)
-
-- Auth endpoints (challenge / verify)
-- Username registration
-- Message envelope intake
-- Delivery queue (Redis)
-- Blob storage with secure delete
-- WebSocket connection for clients
-- Federation API (relay-to-relay)
-- Group / channel endpoints
-- Database migrations (Alembic)
-- nginx / systemd deploy configs
-
-Each of these is a separate, focused commit on top of the foundation here.
-
-## Security model
-
-See `docs/THREAT_MODEL.md` (TODO) and the main project's [product brief].
-
-Short version:
-- **Threat we mitigate:** plaintext exposure (server-side or in transit),
-  metadata retention, push-notification leakage, MITM at first contact.
-- **Threat we don't yet mitigate:** traffic analysis (cover traffic is v2),
-  endpoint compromise (out of scope for any messenger), social engineering.
-
-If you find a security issue, email `morok.messenger@pm.me`. Do not file a
-public issue.
-
-## License
-
-TBD. Likely AGPL-3.0 once we open-source. Currently private.
+Федеративний пошук ходить **лише** на довірених peer'ів із
+`federation_peers`. Якщо там порожньо або `is_trusted = f` —
+`@user@інший.релей` не знайдеться.
