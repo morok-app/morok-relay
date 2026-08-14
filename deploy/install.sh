@@ -226,8 +226,12 @@ if ! grep -q "morok_relay" "$TORRC" 2>/dev/null; then
   cat >> "$TORRC" <<EOF
 
 # --- Morok relay onion service ---
+# Вказує на ВИДІЛЕНИЙ nginx-listener (127.0.0.1:8081), а НЕ прямо на
+# uvicorn: інакше onion-клієнт спілкується з бекендом з адреси 127.0.0.1,
+# яка вважається довіреним проксі, і може підробляти X-Real-IP,
+# обходячи всі IP-ліміти. nginx перезаписує ці заголовки.
 HiddenServiceDir /var/lib/tor/morok_relay/
-HiddenServicePort 80 127.0.0.1:8000
+HiddenServicePort 80 127.0.0.1:8081
 EOF
 fi
 systemctl enable tor >/dev/null 2>&1 || true
@@ -400,6 +404,51 @@ mkdir -p /var/www/certbot
 cat > "/etc/nginx/sites-available/morok-${DOMAIN}" <<EOF
 upstream morok_backend_${DOMAIN//./_} { server 127.0.0.1:8000; }
 
+# ---------------------------------------------------------------------------
+# Tor onion listener.
+#
+# ЧОМУ ЦЕ ІСНУЄ. Раніше torrc вказував HiddenServicePort прямо на
+# 127.0.0.1:8000, тобто Tor ходив в uvicorn МИНАЮЧИ nginx. А застосунок
+# довіряє forwarded-заголовкам від 127.0.0.1 (це ж нібито nginx) — отже
+# будь-який onion-клієнт міг слати власний X-Real-IP і крутити його на
+# кожному запиті: обхід усіх IP-лімітів (auth, admin login, sealed) плюс
+# отруєння hashed login audit.
+#
+# Тепер увесь трафік (clearnet і onion) проходить через nginx, який
+# ПЕРЕЗАПИСУЄ ці заголовки — підробити їх ззовні неможливо. X-Morok-Via
+# ставить лише nginx; клієнтський заголовок з такою назвою затирається.
+server {
+    listen 127.0.0.1:8081;
+    server_name _;
+
+    # Tor-клієнти не мають осмисленої IP-адреси з нашого боку: усі
+    # приходять із loopback. Позначаємо трафік як onion, а бекет для
+    # rate-limit беремо спільний (див. get_ip_from_request).
+    location / {
+        proxy_pass http://morok_backend_${DOMAIN//./_};
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$remote_addr;
+        proxy_set_header X-Forwarded-Proto http;
+        proxy_set_header X-Morok-Via tor;
+    }
+
+    location /ws/ {
+        # токен сесії їде в query — не пишемо його в лог
+        access_log off;
+        proxy_pass http://morok_backend_${DOMAIN//./_};
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$remote_addr;
+        proxy_set_header X-Morok-Via tor;
+        proxy_read_timeout 3600s;
+    }
+}
+
 server {
     listen 80;
     server_name ${DOMAIN};
@@ -407,11 +456,20 @@ server {
     location /.well-known/acme-challenge/ { root /var/www/certbot; }
 
     location /ws/ {
+        # WebSocket отримує session token у query-рядку, а стандартний
+        # access_log пише \$request разом з URI — тобто робочий bearer
+        # осідав би у файлі лога. Вимикаємо лог саме для /ws/.
+        access_log off;
         proxy_pass http://morok_backend_${DOMAIN//./_};
         proxy_http_version 1.1;
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection "upgrade";
         proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        # Явно порожній: інакше clearnet-клієнт надішле свій
+        # "X-Morok-Via: tor" і потрапить у спільний onion-бакет,
+        # обійшовши власний ліміт по IP.
+        proxy_set_header X-Morok-Via "";
         proxy_read_timeout 3600s;
     }
 
@@ -422,6 +480,7 @@ server {
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header X-Morok-Via "";
     }
 }
 EOF

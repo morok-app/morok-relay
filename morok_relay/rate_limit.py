@@ -69,6 +69,18 @@ def get_ip_from_request(request: Request) -> str:
     proxy_trusted = peer is not None and peer in trusted
 
     if proxy_trusted:
+        # Onion-трафік: nginx (окремий listener для Tor) ставить
+        # X-Morok-Via: tor. Клієнтський заголовок з такою назвою
+        # затирається в обох напрямках, тож підробити його не можна.
+        #
+        # У Tor-клієнтів немає осмисленої IP-адреси з нашого боку — усі
+        # приходять із loopback. Тому вони ділять один бакет "tor".
+        # Це свідомий компроміс: спільний ліміт краще за той, що
+        # обходиться підміною заголовка. Якщо onion-трафік стане
+        # помітним, варто дати йому власний, вищий ліміт.
+        if (request.headers.get("x-morok-via") or "").strip().lower() == "tor":
+            return "tor"
+
         # nginx sets X-Real-IP $remote_addr — reliable here.
         real_ip = request.headers.get("x-real-ip")
         if real_ip:

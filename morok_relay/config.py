@@ -75,6 +75,12 @@ class Settings(BaseSettings):
     # reverse-proxy on the same host).
     trusted_proxy_ips: str = Field(default="127.0.0.1,::1")
     rate_limit_auth_per_minute: int = Field(default=10)
+    # Federation handshake: публічний ендпоінт, кожен новий підписаний
+    # hostname створює рядок у federation_peers. Низький ліміт — легітимні
+    # релеї роблять handshake раз на встановлення, а не пачками.
+    rate_limit_handshake_per_minute: int = Field(default=5)
+    # /users/lookup: публічний, при промаху ходить по trusted-релеях.
+    rate_limit_lookup_per_minute: int = Field(default=30)
     rate_limit_messages_per_minute: int = Field(default=60)
 
     # Sealed Sender: ліміт відправки ПО delivery-токену (релей не знає

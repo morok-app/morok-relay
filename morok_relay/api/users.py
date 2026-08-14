@@ -22,12 +22,13 @@ import json
 import logging
 import time
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 from ..config import get_settings
 from ..deps import CurrentSession, DBSession, RedisClient
+from ..rate_limit import rate_limit_by_ip
 from ..federation_client import remote_lookup
 from ..models import FederationPeer, User, UsernameHistory, UserTier
 from ..schemas import (
@@ -67,6 +68,32 @@ async def _get_lookup_cache(redis, relay: str, username: str) -> dict | None:
     except Exception as e:
         logger.warning("Lookup cache read failed: %s", e)
         return None
+
+
+NEG_LOOKUP_CACHE_TTL_SECONDS = 300  # 5 хв
+
+
+def _negative_lookup_key(username: str) -> str:
+    return f"morok:fed_lookup_miss:{username}"
+
+
+async def _get_negative_lookup_cache(redis, username: str) -> bool:
+    """True, якщо це ім'я нещодавно не знайшлося на жодному релеї."""
+    if redis is None:
+        return False
+    try:
+        return await redis.get(_negative_lookup_key(username)) is not None
+    except Exception:
+        return False
+
+
+async def _set_negative_lookup_cache(redis, username: str) -> None:
+    if redis is None:
+        return
+    try:
+        await redis.setex(_negative_lookup_key(username), NEG_LOOKUP_CACHE_TTL_SECONDS, b"1")
+    except Exception as e:
+        logger.warning("Negative lookup cache write failed: %s", e)
 
 
 async def _set_lookup_cache(redis, relay: str, username: str, data: dict) -> None:
@@ -326,6 +353,16 @@ async def release_username(
     "/lookup/{username}",
     response_model=UserInfo,
     summary="Find a user by @username — with federation cache and retry",
+    # Публічний і без авторизації. При локальному промаху обходить
+    # trusted-релеї зовнішніми HTTPS-запитами — тобто бот, що перебирає
+    # випадкові імена, змушує НАС генерувати вихідний трафік (DNS+TLS на
+    # кожен запит). Успішні лукапи кешуються на добу, а промахи — ні,
+    # тому саме неіснуючі імена й були підсилювачем. Ліміт + negative
+    # cache нижче закривають обидва боки.
+    dependencies=[Depends(rate_limit_by_ip(
+        "users_lookup",
+        get_settings().rate_limit_lookup_per_minute,
+    ))],
 )
 async def lookup_username(
     username: str,
@@ -406,6 +443,18 @@ async def lookup_username(
             detail="username_not_found",
         )
 
+    # Negative cache. Успішні лукапи кешуються на добу, а промахи раніше
+    # не кешувались зовсім — тому бот, що перебирає випадкові імена,
+    # щоразу змушував нас обходити ВСІ trusted-релеї зовнішніми HTTPS.
+    # Тепер відомо-відсутнє ім'я коштує один Redis GET.
+    # TTL коротший за позитивний: ім'я можуть зареєструвати будь-коли,
+    # і людина не має чекати добу, поки її знайдуть.
+    if await _get_negative_lookup_cache(redis, normalized):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="username_not_found",
+        )
+
     last_error_status: int | None = None  # remember if any peer was unreachable
 
     for relay_host in candidate_relays:
@@ -466,6 +515,11 @@ async def lookup_username(
             detail="remote_relay_unreachable_try_later",
             headers={"Retry-After": "30"},
         )
+    # Жоден peer не знає цього імені (і всі були доступні) — запам'ятовуємо
+    # промах ненадовго, щоб перебір випадкових імен не ганяв федерацію.
+    # Кешуємо ТІЛЬКИ якщо помилок зв'язку не було: інакше ми б записали
+    # «немає такого» через тимчасову недоступність сусіда.
+    await _set_negative_lookup_cache(redis, normalized)
     raise HTTPException(
         status_code=status.HTTP_404_NOT_FOUND,
         detail="username_not_found",

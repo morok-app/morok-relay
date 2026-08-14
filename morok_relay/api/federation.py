@@ -35,7 +35,7 @@ import logging
 import time
 import uuid
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
@@ -45,6 +45,7 @@ from ..config import get_settings
 from ..deps import DBSession, RedisClient
 from ..models import FederationPeer, Group, GroupMember, User
 from ..queue import enqueue_envelope, enqueue_envelope_for_recipients, envelope_exists
+from ..rate_limit import rate_limit_by_ip
 from ..push_sender import trigger_push
 
 logger = logging.getLogger(__name__)
@@ -203,6 +204,15 @@ async def _get_or_create_peer(
     "/handshake",
     response_model=HandshakeResponse,
     summary="Federation handshake — peer relay introduces itself",
+    # Ендпоінт публічний за задумом (нові релеї мають якось з'явитись),
+    # але підпис тут НЕ є антиспамом: атакер сам генерує пару ключів,
+    # вигадує новий hostname, підписує — і отримує новий рядок у
+    # federation_peers (is_trusted=False). Без ліміту так набивається
+    # таблиця, а /admin/stats потім послідовно пінгує кожен рядок.
+    dependencies=[Depends(rate_limit_by_ip(
+        "federation_handshake",
+        get_settings().rate_limit_handshake_per_minute,
+    ))],
 )
 async def handshake(
     body: HandshakeRequest,
@@ -409,6 +419,7 @@ async def _forward_impl(
             )
         return await _handle_group_forward(
             envelope=body.envelope,
+            peer=peer,
             db=db,
             redis=redis,
             settings=settings,
@@ -501,6 +512,7 @@ async def _forward_impl(
 
 async def _handle_group_forward(
     envelope: dict,
+    peer: "FederationPeer",
     db,
     redis,
     settings,
@@ -515,6 +527,19 @@ async def _handle_group_forward(
                 specific subset of members that live on this relay.
 
     Any other / missing mode → 400.
+
+    AUTHORIZATION. A valid relay signature + peer.is_trusted gets a peer
+    INTO this function, but is not sufficient to act. Both sub-modes
+    additionally verify against OUR OWN database:
+
+      to_host:  we must actually host the group, and the sender must be
+                a member (this was already the case).
+
+      deliver:  the peer must be the group's recorded home_relay, and
+                both the sender and every recipient must be members.
+                Without these checks a single compromised trusted relay
+                could drop arbitrary group envelopes into any local
+                user's inbox and trigger push notifications for them.
     """
     # Late import to avoid circular: groups.py imports from queue,
     # and we already import enqueue helpers from queue here.
@@ -645,6 +670,45 @@ async def _handle_group_forward(
             detail="missing_deliver_to_pubkeys",
         )
 
+    # ── Шар 1: господар. Deliver шле лише home_relay групи. ──────────
+    # Ми маємо знати цю групу локально (shadow-рядок створюється
+    # снапшот-пушем від хоста). Якщо не знаємо — приймати доставку
+    # нема на яких підставах.
+    group_stmt = (
+        select(Group)
+        .options(selectinload(Group.members))
+        .where(Group.id == gid)
+        .where(Group.deleted_at.is_(None))
+    )
+    group = (await db.execute(group_stmt)).scalar_one_or_none()
+    if group is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="group_not_found_for_deliver",
+        )
+
+    group_home = group.home_relay or settings.relay_name
+    if group_home == settings.relay_name:
+        # Групу хостимо МИ — вхідний deliver для неї неможливий за
+        # протоколом (чужі релеї шлють нам to_host, а фан-аут робимо
+        # самі). Отже це підробка.
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="deliver_for_locally_hosted_group",
+        )
+    if group_home != peer.hostname:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="deliver_from_non_host_relay",
+        )
+
+    # ── Шар 2: відправник має бути членом групи. ────────────────────
+    if not _is_member(group, sender_pubkey):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="deliver_sender_not_a_member",
+        )
+
     # Sanity: every recipient must be a real local user.
     recipient_bytes: list[bytes] = []
     for pk in raw_recipients:
@@ -661,6 +725,10 @@ async def _handle_group_forward(
                 detail="malformed_deliver_pubkey",
             )
 
+    # ── Шар 3: одержувачі — тільки локальні ЧЛЕНИ цієї групи. ───────
+    # Раніше досить було бути локальним користувачем, тож довірений
+    # peer міг адресувати груповий конверт кому завгодно на релеї.
+    member_pubkeys = {bytes(m.pubkey) for m in group.members}
     stmt = (
         select(User.pubkey, User.home_relay)
         .where(User.pubkey.in_(recipient_bytes))
@@ -668,9 +736,24 @@ async def _handle_group_forward(
     )
     rows = (await db.execute(stmt)).all()
     known_local: list[str] = []
+    skipped_non_members = 0
     for pk, hr in rows:
-        if hr == settings.relay_name:
-            known_local.append(bytes(pk).hex())
+        if hr != settings.relay_name:
+            continue
+        if bytes(pk) not in member_pubkeys:
+            skipped_non_members += 1
+            continue
+        known_local.append(bytes(pk).hex())
+
+    if skipped_non_members:
+        # Не 403 на весь запит: склад групи міг щойно змінитись і хост
+        # ще не отримав знімок. Легітимних членів обслуговуємо, чужих
+        # мовчки відкидаємо, факт логуємо — раптова масовість тут
+        # означала б або розсинхрон, або зловмисний peer.
+        logger.warning(
+            "Group deliver %s from %s: %d recipient(s) not members of %s — dropped",
+            envelope_id[:8], peer.hostname, skipped_non_members, str(gid),
+        )
 
     if not known_local:
         raise HTTPException(

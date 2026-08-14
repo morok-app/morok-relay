@@ -46,17 +46,33 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["burner"])
 
-# Anti-spam: rate limit per-IP for public send endpoint
-_send_rl_key = "morok:burner_send_rl:{ip}"
+# Anti-spam: rate limit per (burner token, client IP) for the public
+# send endpoint.
+#
+# ДВА БАГИ, ЯКІ ТУТ БУЛИ (обидва перетворювали ліміт на глобальний DoS):
+#
+#   1. Ключ не містив токена, тож усі burner-скриньки релея ділили один
+#      бакет: 10 повідомлень/хв НА ВЕСЬ СЕРВЕР.
+#   2. IP брався з request.client.host, а за nginx це завжди 127.0.0.1 —
+#      тобто «per-IP» ліміт узагалі не розрізняв клієнтів, і будь-хто,
+#      хто шле 10 запитів/хв, глушив анонімні листи для всіх інших.
+#
+# Тепер: get_ip_from_request (довіряє forwarded-заголовкам лише від
+# trusted proxy) + хеш токена. Хеш, а не сам токен, щоб секрет не
+# осідав у Redis-ключах.
+_send_rl_key = "morok:burner_send_rl:{token_hash}:{ip}"
 SEND_RATE_LIMIT_PER_MINUTE = 10
 
 
-async def _enforce_public_send_rate_limit(redis, request: Request):
+async def _enforce_public_send_rate_limit(redis, request: Request, token: str):
     """
-    Simple sliding-window: count send attempts per IP in the last 60s.
+    Sliding-window: count send attempts per (token, IP) in the last 60s.
     """
-    ip = request.client.host if request.client else "unknown"
-    key = _send_rl_key.format(ip=ip)
+    from ..rate_limit import get_ip_from_request
+
+    ip = get_ip_from_request(request)
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()[:32]
+    key = _send_rl_key.format(token_hash=token_hash, ip=ip)
     now = int(time.time())
     bucket = key + f":{now // 60}"
     count = await redis.incr(bucket)
@@ -199,7 +215,7 @@ async def public_burner_send(
             detail="malformed_token",
         )
 
-    await _enforce_public_send_rate_limit(redis, request)
+    await _enforce_public_send_rate_limit(redis, request, token)
 
     meta = await burner_tokens.get_token(redis, token)
     if meta is None:
