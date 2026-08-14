@@ -15,6 +15,7 @@ morok.email — вихідний відправник (Фаза 3). Крутит
 from __future__ import annotations
 
 import logging
+import os
 import smtplib
 import ssl
 from email.message import EmailMessage
@@ -25,11 +26,15 @@ import dns.resolver
 
 logger = logging.getLogger("morok.mailout")
 
-DKIM_SELECTOR = b"s1"
-DKIM_DOMAIN = b"morok.email"
-DKIM_KEY_PATH = "/etc/morok/dkim/morok.private"
-SOURCE_IP = "77.42.19.151"
-HELO_NAME = "mail-out.morok.email"
+# Конфіг вузла — з оточення, бо це деталі конкретної інсталяції, а не коду.
+# SOURCE_IP порожній => egress не прибивається, ОС вибирає інтерфейс сама
+# (для self-host це нормально; для нашого продакшену він заданий у .env,
+# бо PTR і репутація живуть саме на тому IPv4).
+DKIM_SELECTOR = os.environ.get("MOROK_MAIL_DKIM_SELECTOR", "s1").encode()
+DKIM_DOMAIN = os.environ.get("MOROK_MAIL_DKIM_DOMAIN", "morok.email").encode()
+DKIM_KEY_PATH = os.environ.get("MOROK_MAIL_DKIM_KEY_PATH", "/etc/morok/dkim/morok.private")
+SOURCE_IP = os.environ.get("MOROK_MAIL_SOURCE_IP", "")
+HELO_NAME = os.environ.get("MOROK_MAIL_HELO_NAME", "mail-out.morok.email")
 
 # заголовки, що входять у DKIM-підпис (стабільні, присутні завжди)
 DKIM_HEADERS = [b"From", b"To", b"Subject", b"Date", b"Message-ID", b"MIME-Version", b"Content-Type"]
@@ -117,9 +122,12 @@ def send_external(from_addr: str, to_addr: str, subject: str,
     last_err = "unknown"
     for mx in mxs:
         try:
-            # source_address=(SOURCE_IP, 0) → egress прибитий до нашого IPv4
+            # source_address=(SOURCE_IP, 0) → egress прибитий до нашого IPv4.
+            # Якщо MOROK_MAIL_SOURCE_IP не заданий — не прибиваємо взагалі
+            # (передати ("", 0) у source_address = помилка bind).
+            src = (SOURCE_IP, 0) if SOURCE_IP else None
             smtp = smtplib.SMTP(host=mx, port=25, local_hostname=HELO_NAME,
-                                timeout=30, source_address=(SOURCE_IP, 0))
+                                timeout=30, source_address=src)
             try:
                 smtp.ehlo(HELO_NAME)
                 if smtp.has_extn("starttls"):
