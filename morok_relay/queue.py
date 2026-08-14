@@ -35,6 +35,7 @@ import logging
 import time
 
 import redis.asyncio as redis_async
+from fastapi import HTTPException, status
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +47,33 @@ logger = logging.getLogger(__name__)
 # user. Expired envelopes are pruned before this is checked, so it only
 # counts live, undelivered messages.
 MAX_INBOX_QUEUE_DEPTH = 5000
+
+
+class EnqueueRejected(HTTPException):
+    """
+    Постановку в чергу НЕ виконано, і це не дедуп.
+
+    Раніше всі відмови поверталися як None — тим самим значенням, що й
+    успішна дедуплікація. Викликачі не могли їх розрізнити: /messages
+    трактував None як «ми програли гонку дедупу, повідомлення вже
+    доставляється» і віддавав клієнту псевдо-успіх, а dms_reaper узагалі
+    не дивився на результат і позначав заповіт доставленим. Тобто повна
+    черга одержувача або збій Redis тихо губили повідомлення, а для
+    «цифрового заповіту» — рвали основну гарантію продукту.
+
+    Тепер None означає РІВНО одне: дедуп (конверт із таким id уже в
+    черзі). Будь-яка інша відмова — цей виняток.
+
+    Нащадок HTTPException навмисно: усі API-ендпоінти, що кличуть
+    enqueue_envelope, автоматично віддають коректний код замість
+    вдаваного успіху, без правок у кожному з них. Фонові викликачі
+    (dms_reaper, mail_convert) ловлять його своїм except Exception і
+    НЕ позначають доставку успішною — тобто повторять пізніше.
+    """
+
+    def __init__(self, status_code: int, reason: str):
+        super().__init__(status_code=status_code, detail=reason)
+        self.reason = reason
 
 
 def _inbox_key(recipient_pubkey_hex: str) -> str:
@@ -180,11 +208,17 @@ async def enqueue_envelope(
     in the metadata so the recipient's client can display "@bob" instead of
     a raw pubkey prefix without doing a separate lookup.
 
-    Returns the expires_at timestamp (capped at hard ceiling), or None
-    if the envelope already exists in Redis (dedup hit). The atomic
-    SET NX is the dedup gate — using a separate envelope_exists() check
-    here would leave a TOCTOU window where two concurrent sends with the
-    same envelope_id could both pass the check and double-deliver.
+    Returns the expires_at timestamp (capped at hard ceiling) on success,
+    or None if — and ONLY if — the envelope already exists in Redis
+    (dedup hit). The atomic SET NX is the dedup gate — using a separate
+    envelope_exists() check here would leave a TOCTOU window where two
+    concurrent sends with the same envelope_id could both pass the check
+    and double-deliver.
+
+    Будь-яка інша відмова (протух, черга одержувача переповнена, Redis
+    недоступний) кидає EnqueueRejected — див. коментар до класу. Ніколи
+    не повертай None для цих випадків: викликач не зможе відрізнити їх
+    від дедупу і повідомить про успішну доставку, якої не було.
     """
     now = int(time.time())
     requested_expires = timestamp + ttl_seconds
@@ -192,8 +226,11 @@ async def enqueue_envelope(
     expires_at = min(requested_expires, ceiling)
     ttl_until_expiry = expires_at - now
     if ttl_until_expiry <= 0:
-        # Already expired before it was even queued — nothing to do.
-        return None
+        # Конверт протух ще до постановки в чергу. Це НЕ успіх — раніше
+        # тут повертався None і відправник бачив псевдо-«доставлено».
+        raise EnqueueRejected(
+            status.HTTP_400_BAD_REQUEST, "envelope_already_expired",
+        )
 
     # ── Per-recipient queue cap (anti-flood storage guard) ──
     # Hard physical limit on how many envelopes may wait for one recipient
@@ -205,16 +242,21 @@ async def enqueue_envelope(
     try:
         await redis.zremrangebyscore(_inbox_key(recipient_pubkey_hex), 0, now)
         depth = await redis.zcard(_inbox_key(recipient_pubkey_hex))
-        if depth >= MAX_INBOX_QUEUE_DEPTH:
-            # Recipient's queue is full. Reject — sender (or their relay)
-            # will see this as a delivery failure and can retry later once
-            # the recipient drains their inbox.
-            return None
     except Exception as e:
         # Redis hiccup on the cap check — do NOT fail-open into unbounded
         # growth. Treat as "cannot guarantee headroom" and refuse.
         logger.warning("inbox queue-depth check failed, refusing enqueue: %s", e)
-        return None
+        raise EnqueueRejected(
+            status.HTTP_503_SERVICE_UNAVAILABLE, "queue_backend_unavailable",
+        ) from e
+
+    if depth >= MAX_INBOX_QUEUE_DEPTH:
+        # Recipient's queue is full. Reject — sender (or their relay)
+        # will see this as a delivery failure and can retry later once
+        # the recipient drains their inbox.
+        raise EnqueueRejected(
+            status.HTTP_429_TOO_MANY_REQUESTS, "recipient_queue_full",
+        )
 
     meta = {
         "envelope_id": envelope_id,

@@ -164,10 +164,11 @@ async def send_envelope(
             sender_username=sender_username,
         )
         if expires_at is None:
-            # Lost the dedup race with a concurrent send (or this is a
-            # client retry after a network blip). Same outcome the
-            # envelope_exists() short-circuit above would have given —
-            # the message is delivered, we just weren't the writer.
+            # None тепер означає РІВНО дедуп: конверт із таким id уже в
+            # черзі (наш ретрай або паралельне надсилання). Реальні
+            # відмови — повна черга, протух, Redis лежить — приходять
+            # винятком EnqueueRejected і віддають клієнту 429/400/503
+            # замість цього псевдо-успіху.
             return EnvelopeAck(envelope_id=envelope_id, queued=False, expires_at=0)
         # Best-effort push notification — never blocks the response.
         # The function itself is async-safe and swallows all errors.
