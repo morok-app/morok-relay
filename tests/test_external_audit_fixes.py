@@ -202,3 +202,42 @@ async def test_exception_log_path_is_sanitized():
     src = inspect.getsource(unhandled_exception_handler)
     assert "_sanitize_path" in src, \
         "exception handler логує сирий шлях — capability-токени течуть у журнал"
+
+
+# ── remote-кеш анонімів (зловлено в проді 15.08) ─────────────────────────
+async def test_cleanup_spares_cached_remote_anonymous_users(db, monkeypatch):
+    """
+    ПРОДАКШН-БАГ: cleanup косив кешовані записи користувачів ЧУЖИХ
+    релеїв (username=NULL — анонім; last_seen тут не оновлюється ніколи,
+    бо вони тут не логіняться). Після цього федеративний чат з анонімом
+    ламався назавжди: send → recipient_unknown_call_lookup_first, а
+    lookup для аноніма неможливий. Косити можна лише СВОЇХ анонімів.
+    """
+    from morok_relay.cleanup import ANON_INACTIVE_SECONDS, reap_anonymous_users
+    from morok_relay.config import get_settings
+    from morok_relay.models import User, UserTier
+
+    own = get_settings().relay_name
+    stale = int(time.time()) - ANON_INACTIVE_SECONDS - 86400
+
+    local_anon = User(
+        pubkey=b"\x01" * 32, username=None, home_relay=own,
+        tier=UserTier.FREE, created_at=stale, last_seen_at=stale,
+    )
+    remote_anon_cache = User(
+        pubkey=b"\x02" * 32, username=None, home_relay="relay2.example.com",
+        tier=UserTier.FREE, created_at=stale, last_seen_at=None,
+    )
+    db.add(local_anon)
+    db.add(remote_anon_cache)
+    await db.commit()
+
+    removed = await reap_anonymous_users(db)
+    await db.commit()
+
+    assert removed == 1, "мав піти лише локальний анонім"
+    from sqlalchemy import select
+    left = (await db.execute(select(User))).scalars().all()
+    assert len(left) == 1
+    assert left[0].pubkey == b"\x02" * 32, \
+        "cleanup зніс remote-кеш — федеративний чат з анонімом зламано"

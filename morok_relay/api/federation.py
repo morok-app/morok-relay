@@ -579,6 +579,26 @@ async def _forward_impl(
         signature_hex=body.envelope["sig"],
         hard_ceiling_seconds=settings.message_ttl_hard_seconds,
     )
+    # Кеш відправника (best-effort). Вхідне повідомлення — доказ, що
+    # pubkey живе на relay-відправнику; записуємо/освіжаємо це в User,
+    # інакше наш користувач не зможе ВІДПОВІСТИ анонімному
+    # співрозмовнику: send падає з recipient_unknown_call_lookup_first,
+    # а lookup для аноніма неможливий (немає username). Це і
+    # самолікування після старого бага cleanup'а, що косив remote-кеш.
+    # peer.hostname — перевірена підписом сторона handshake, НЕ поле з
+    # конверта; _cache_remote_user додатково ніколи не перепише
+    # home_relay НАШОГО користувача.
+    try:
+        from .users import _cache_remote_user
+        await _cache_remote_user(
+            db,
+            pubkey_hex=body.envelope["from"],
+            username=body.envelope.get("from_username") or None,
+            home_relay=peer.hostname,
+        )
+    except Exception as e:
+        logger.warning("sender cache refresh (federation DM) failed: %s", e)
+
     # Best-effort push for the local recipient (sender side already pushed
     # any of its own local users; here we cover ours).
     try:

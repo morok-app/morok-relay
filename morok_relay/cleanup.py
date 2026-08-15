@@ -55,10 +55,24 @@ async def reap_anonymous_users(session: AsyncSession) -> int:
     now = int(time.time())
     threshold = now - ANON_INACTIVE_SECONDS
 
+    # КРИТИЧНО (зловлено в проді 15.08): косимо ЛИШЕ СВОЇХ анонімів.
+    # Кешовані записи користувачів ЧУЖИХ релеїв (home_relay != наш) теж
+    # мають username=NULL, якщо той користувач анонімний, і їхній
+    # last_seen_at на нашому релеї не оновлюється НІКОЛИ (вони тут не
+    # логіняться). Старий запит зносив такий кеш через 7 днів — і
+    # федеративний чат з анонімом ламався НАЗАВЖДИ: відправка падає з
+    # recipient_unknown_call_lookup_first, а lookup для аноніма
+    # неможливий (немає username). Рядок кешу — копійки; маршрутизація —
+    # безцінна.
+    from .config import get_settings
+    own_relay = get_settings().relay_name
     stmt = (
         select(User)
         .where(User.username.is_(None))
         .where(User.deleted_at.is_(None))
+        .where(
+            (User.home_relay.is_(None)) | (User.home_relay == own_relay)
+        )
         .where(User.created_at < now - ACCOUNT_MIN_AGE_SECONDS)
         .where(
             (User.last_seen_at.is_(None)) | (User.last_seen_at < threshold)
