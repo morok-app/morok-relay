@@ -21,6 +21,7 @@ login we issue a random bearer token stored in Redis with a TTL.
 from __future__ import annotations
 
 import logging
+import hashlib
 import secrets
 import time
 from typing import Annotated
@@ -64,9 +65,19 @@ def _verify_password(password: str, stored_hash: str) -> bool:
         return False
 
 
+def _admin_token_digest(token: str) -> str:
+    """У Redis лежить лише SHA-256 — так само, як для користувацьких
+    сесій: компрометація Redis (дамп, бекап) не віддає живий токен
+    адмінки. Токен короткоживучий (1 год), але адмінка — найласіша
+    ціль на релеї, тож той самий захист коштує один рядок."""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
 async def _create_admin_token(redis, ttl_seconds: int) -> str:
     token = secrets.token_urlsafe(32)
-    await redis.setex(f"{_ADMIN_TOKEN_PREFIX}{token}", ttl_seconds, "1")
+    await redis.setex(
+        f"{_ADMIN_TOKEN_PREFIX}{_admin_token_digest(token)}", ttl_seconds, "1",
+    )
     return token
 
 
@@ -74,7 +85,9 @@ async def _verify_admin_token(redis, token: str) -> bool:
     if not token:
         return False
     try:
-        return bool(await redis.exists(f"{_ADMIN_TOKEN_PREFIX}{token}"))
+        return bool(await redis.exists(
+            f"{_ADMIN_TOKEN_PREFIX}{_admin_token_digest(token)}"
+        ))
     except Exception:
         return False
 

@@ -109,3 +109,12 @@ async def test_healthy_redis_path_unaffected(redis):
     assert results[limit:] == [False] * 2
     # локальний резерв не задіювався
     assert not rl._local_fallback._counts
+
+
+async def test_backup_restore_is_critical():
+    """
+    Публічний restore віддає зашифрований seed за username. Fail-open
+    при падінні Redis = безлімітне викачування блобів під offline-перебір
+    PIN'а. Тест гарантує, що бакет лишається критичним.
+    """
+    assert "backup_restore" in rl.CRITICAL_BUCKETS

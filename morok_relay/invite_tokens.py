@@ -78,8 +78,12 @@ async def create_token(
     async with redis.pipeline(transaction=True) as pipe:
         pipe.set(_token_key(token), payload, ex=ttl)
         pipe.sadd(_group_invites_key(group_id), token)
-        # No TTL on the SET — individual tokens expire naturally.
-        # Cleanup happens lazily in list_tokens.
+        # TTL на САМ сет: без нього він жив вічно (чистився лише ліниво
+        # в list_tokens, яку для покинутої групи ніхто не викличе) — те
+        # саме сімейство, що inbox-ключі без TTL: volatile-ttl не має що
+        # витісняти. Кожне нове запрошення зсуває TTL уперед, тож живий
+        # сет не помре; MAX_TTL + доба покриває найдовший токен.
+        pipe.expire(_group_invites_key(group_id), MAX_TTL_SECONDS + 86400)
         await pipe.execute()
 
     return {
