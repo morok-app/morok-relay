@@ -171,11 +171,33 @@ async def fire_dms_switches() -> dict:
 
     try:
         async with _session_factory() as db:
-            # Find armed switches that are due
+            # Беремо ЛИШЕ ті, що вже прострочені, і одразу під блокуванням.
+            #
+            # Раніше вибирались усі ARMED, вік рахувався в Python, і між
+            # цим читанням та розсилкою користувач міг зробити check-in:
+            # його транзакція комітилась, а reaper продовжував працювати
+            # зі старим об'єктом і все одно розсилав payload. Людина
+            # підтвердила, що жива — а секрет уже пішов.
+            #
+            # Тепер:
+            #   * умова "прострочено" рахується в SQL на свіжих даних;
+            #   * FOR UPDATE тримає рядок до кінця нашої транзакції, тож
+            #     check-in/cancel чекають і далі бачать уже не-ARMED;
+            #   * SKIP LOCKED пропускає ті DMS, які саме зараз редагує
+            #     користувач — такий просто дочекається наступного
+            #     запуску (щогодини), уже зі свіжим last_check_in_at.
+            #
+            # of=DeadManSwitch — блокуємо лише сам DMS, не рядки
+            # recipients, підтягнуті selectinload.
             stmt = (
                 select(DeadManSwitch)
                 .where(DeadManSwitch.status == DMSStatus.ARMED)
+                .where(
+                    DeadManSwitch.last_check_in_at
+                    + DeadManSwitch.trigger_seconds <= now
+                )
                 .options(selectinload(DeadManSwitch.recipients))
+                .with_for_update(of=DeadManSwitch, skip_locked=True)
             )
             armed = (await db.execute(stmt)).scalars().all()
 

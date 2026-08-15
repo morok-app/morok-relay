@@ -59,12 +59,36 @@ def _parse_dms_id(dms_id: str) -> uuid.UUID:
         )
 
 
-async def _load_dms_for_owner(db, dms_id: uuid.UUID, owner_pubkey: bytes) -> DeadManSwitch:
+async def _load_dms_for_owner(
+    db, dms_id: uuid.UUID, owner_pubkey: bytes, *, for_update: bool = False,
+) -> DeadManSwitch:
+    """
+    for_update=True бере блокування рядка на час транзакції.
+
+    Це критично для check-in і cancel. Без нього виходила гонка з
+    dms_reaper: користувач читав рядок (SELECT не блокує), бачив
+    status=ARMED, проходив перевірку — і лише потім, на записі, ставав у
+    чергу за reaper'ом, який тим часом уже вирішив спрацювати й розіслав
+    payload. Людина підтверджувала, що жива, а секрет уже пішов.
+
+    Блокування має стояти з ОБОХ боків: reaper теж читає due-рядки через
+    FOR UPDATE SKIP LOCKED. Тоді або користувач встиг перший (reaper
+    пропускає цей DMS до наступного запуску і побачить свіжий
+    last_check_in_at), або reaper перший (check-in чекає, а далі бачить
+    уже не-ARMED статус і чесно віддає 409).
+
+    Читання (list/get) блокування не беруть — їм воно не потрібне, і
+    навпаки: зайві локи гальмували б reaper.
+    """
     stmt = (
         select(DeadManSwitch)
         .where(DeadManSwitch.id == dms_id)
         .options(selectinload(DeadManSwitch.recipients))
     )
+    if for_update:
+        # of=DeadManSwitch — блокуємо лише сам DMS, не рядки recipients:
+        # інакше FOR UPDATE зачепив би join'ені таблиці.
+        stmt = stmt.with_for_update(of=DeadManSwitch)
     dms = (await db.execute(stmt)).scalar_one_or_none()
     if dms is None or dms.creator_pubkey != owner_pubkey:
         raise HTTPException(
@@ -178,7 +202,7 @@ async def check_in(
 ) -> DMSCheckInResponse:
     did = _parse_dms_id(dms_id)
     pubkey = bytes.fromhex(current.pubkey_hex)
-    dms = await _load_dms_for_owner(db, did, pubkey)
+    dms = await _load_dms_for_owner(db, did, pubkey, for_update=True)
     if dms.status != DMSStatus.ARMED:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -200,7 +224,7 @@ async def cancel_dms(
 ) -> DMSCancelResponse:
     did = _parse_dms_id(dms_id)
     pubkey = bytes.fromhex(current.pubkey_hex)
-    dms = await _load_dms_for_owner(db, did, pubkey)
+    dms = await _load_dms_for_owner(db, did, pubkey, for_update=True)
     if dms.status == DMSStatus.TRIGGERED:
         return DMSCancelResponse(dms_id=str(dms.id), cancelled=False)
     if dms.status == DMSStatus.CANCELLED:
