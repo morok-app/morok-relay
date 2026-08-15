@@ -109,6 +109,14 @@ async def delete_me(
         delete(DeadManSwitch).where(DeadManSwitch.creator_pubkey == pubkey_bytes)
     )
 
+    # Журнал входів (аудит зовн. №2): «permanently delete» лишав у БД
+    # login-рядки з pubkey, ip_hash і user-agent — при тому, що окремий
+    # ендпоінт /me/sessions їх чистити ВМІЄ. Людина, що видаляє акаунт,
+    # очікує саме зникнення слідів.
+    await db.execute(
+        delete(LoginLog).where(LoginLog.pubkey == pubkey_bytes)
+    )
+
     await db.flush()
 
     # Redis cleanup — inbox queue and ws-active counter.

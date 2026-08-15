@@ -30,7 +30,9 @@ INSTALL_DIR="/home/${MOROK_USER}/morok-relay"
 BLOB_DIR="/var/lib/morok/blobs"
 DB_NAME="morok_relay"
 DB_USER="morok"
-PY_MIN_MINOR=11   # require python3.11+
+PY_MIN_MINOR=12   # require python3.12+ — pyproject каже >=3.12,
+                  # дозволяти тут 3.11 означало «в мене працює, у
+                  # self-host — дивні runtime-проблеми» (аудит зовн. №2)
 
 C_RESET=$'\e[0m'; C_BOLD=$'\e[1m'; C_GREEN=$'\e[32m'
 C_BLUE=$'\e[34m'; C_YELLOW=$'\e[33m'; C_RED=$'\e[31m'; C_DIM=$'\e[2m'

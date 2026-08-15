@@ -40,36 +40,53 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["auth"])
 
 
-def _daily_ip_hash(ip: str) -> str:
+async def _daily_ip_hash(redis, ip: str) -> str:
     """
     Privacy-preserving fingerprint of a client IP.
 
-    Hashes (relay_privkey || YYYY-MM-DD UTC || ip). The date component
-    means the same IP yields different hashes after midnight UTC, so
-    long-term cross-referencing is impossible from the DB alone. The
-    relay_privkey component means anyone who only has DB dumps (no
-    relay key) can't even rainbow-table the day's IPv4 space.
+    ЕФЕМЕРНА добова сіль (аудит зовн. №2): попередня схема рахувала
+    сіль як SHA256(relay_privkey || дата) — детерміновано. Це чудово
+    захищало від «вкрали лише дамп БД», але НЕ від ретроспективної
+    компрометації сервера: маючи privkey, можна через рік відтворити
+    сіль за будь-яку дату з login-рядка й перебрати IPv4-простір.
 
-    If the relay's private key is not configured, falls back to date-only
-    salt and logs a warning — the audit log still works but is less
-    resistant to dictionary attacks if the DB leaks.
+    Тепер сіль — випадкові 32 байти, які генеруються на перший вхід
+    доби (SET NX) і живуть у Redis 48 годин. Після протухання сіль
+    фізично зникає, і хеші за минулі дні стають незворотними ДЛЯ ВСІХ,
+    включно з нами: навіть повна компрометація сервера відкриває
+    щонайбільше сьогодні і вчора.
+
+    Групування в межах доби (навіщо хеш узагалі існує — «5 входів з
+    однієї адреси сьогодні») працює як і раніше.
+
+    Fallback при недоступному Redis: детермінована сіль від privkey —
+    стара схема, гірша за нову, але краща за відсутність журналу.
     """
-    settings = get_settings()
     date_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+    salt_key = f"morok:login_salt:{date_str}"
+
+    salt: bytes | None = None
     try:
-        privkey = bytes.fromhex(settings.relay_privkey_hex or "")
-    except ValueError:
-        privkey = b""
-    if not privkey:
-        # Logged once on first call per process — repeated warnings would
-        # spam the log on every login.
-        if not getattr(_daily_ip_hash, "_warned", False):
+        candidate = secrets.token_bytes(32)
+        # SET NX: перший запит доби кладе свою сіль, решта читає її ж.
+        was_set = await redis.set(salt_key, candidate, nx=True, ex=48 * 3600)
+        salt = candidate if was_set else await redis.get(salt_key)
+    except Exception as e:
+        if not getattr(_daily_ip_hash, "_warned_redis", False):
             logger.warning(
-                "MOROK_RELAY_PRIVKEY_HEX is empty — login_log.ip_hash uses "
-                "date-only salt (weaker against rainbow tables on DB leak)."
+                "login_salt unavailable in Redis (%s) — falling back to "
+                "deterministic salt (weaker retrospective privacy)", e,
             )
-            _daily_ip_hash._warned = True  # type: ignore[attr-defined]
-    salt = hashlib.sha256(privkey + date_str.encode("ascii")).digest()
+            _daily_ip_hash._warned_redis = True  # type: ignore[attr-defined]
+
+    if not salt:
+        settings = get_settings()
+        try:
+            privkey = bytes.fromhex(settings.relay_privkey_hex or "")
+        except ValueError:
+            privkey = b""
+        salt = hashlib.sha256(privkey + date_str.encode("ascii")).digest()
+
     return hashlib.sha256(salt + ip.encode("utf-8", errors="replace")).hexdigest()
 
 
@@ -130,6 +147,7 @@ async def _reactivate_if_deleted(db: DBSession, pubkey_hex: str) -> bool:
 
 async def _record_login(
     db: DBSession,
+    redis,
     pubkey_hex: str,
     ip: str,
     user_agent: str | None,
@@ -145,7 +163,7 @@ async def _record_login(
         entry = LoginLog(
             pubkey=pubkey_bytes,
             created_at=int(time.time()),
-            ip_hash=_daily_ip_hash(ip),
+            ip_hash=await _daily_ip_hash(redis, ip),
             user_agent=ua,
         )
         db.add(entry)
@@ -266,7 +284,7 @@ async def verify_challenge(
     # Audit log: record this successful login. Best-effort, doesn't fail auth.
     client_ip = _extract_client_ip(request)
     user_agent = request.headers.get("user-agent")
-    await _record_login(db, body.pubkey_hex, client_ip, user_agent)
+    await _record_login(db, redis, body.pubkey_hex, client_ip, user_agent)
 
     return AuthResponse(
         session_token=session.token,

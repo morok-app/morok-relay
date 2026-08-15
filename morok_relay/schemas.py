@@ -419,6 +419,46 @@ class BackupCreateRequest(BaseModel):
     kdf_params: dict = Field(default_factory=dict)
     schema_version: int = Field(default=1, ge=1, le=10)
 
+    @field_validator("kdf_params")
+    @classmethod
+    def _kdf_floor(cls, v: dict) -> dict:
+        """
+        Серверний мінімум на KDF (аудит зовн. №2, HIGH→CRITICAL).
+
+        Раніше kdf_params був повністю client-defined — сервер зберігав
+        будь-який JSON. Слабкий/старий/зламаний клієнт міг створити
+        бекап із дешевим KDF, а публічний restore-ендпоінт віддає
+        ciphertext за самим username: один запит — і далі offline-
+        перебір PIN'а зі швидкістю, яку визначає САМ нападник. Приз —
+        seed акаунта.
+
+        Мінімуми нижче — стеля розумного компромісу для мобільних
+        пристроїв (klientський Argon2id у Morok і так сильніший):
+        argon2id, memory >= 64 MiB, iterations >= 2, parallelism >= 1.
+        Бекап зі слабшими параметрами сервер ВІДМОВЛЯЄТЬСЯ зберігати —
+        краще голосно зламатись на створенні, ніж тихо віддати
+        перебираємий seed на restore.
+
+        Наявні в БД бекапи не чіпаємо: перевірка діє на створення/
+        заміну. Порожній dict теж відхиляється — клієнт зобов'язаний
+        задекларувати, чим шифрував.
+        """
+        alg = str(v.get("alg", v.get("algorithm", ""))).lower()
+        if alg not in ("argon2id", "argon2"):
+            raise ValueError(
+                "kdf_params.alg must be argon2id (weak/unknown KDF refused)"
+            )
+        mem_kib = int(v.get("m", v.get("memory_kib", v.get("memory", 0))))
+        iters = int(v.get("t", v.get("iterations", v.get("time", 0))))
+        para = int(v.get("p", v.get("parallelism", 1)))
+        if mem_kib < 64 * 1024:
+            raise ValueError("kdf_params memory must be >= 65536 KiB (64 MiB)")
+        if iters < 2:
+            raise ValueError("kdf_params iterations must be >= 2")
+        if para < 1:
+            raise ValueError("kdf_params parallelism must be >= 1")
+        return v
+
     @field_validator("encrypted_seed_b64")
     @classmethod
     def _enc_size(cls, v: str) -> str:

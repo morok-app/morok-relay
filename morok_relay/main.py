@@ -165,7 +165,14 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, exc: Exception):
-    logger.exception("Unhandled exception on %s %s", request.method, request.url.path)
+    # _sanitize_path обов'язково і ТУТ (аудит зовн. №2): звичайний
+    # request-логер маскує capability-токени в URL, а цей шлях — ні.
+    # Достатньо було unhandled exception на burner-маршруті — і
+    # довгоживучий токен (сам по собі credential) падав у журнал.
+    logger.exception(
+        "Unhandled exception on %s %s",
+        request.method, _sanitize_path(request.url.path),
+    )
     if settings.debug:
         return JSONResponse(
             status_code=500,

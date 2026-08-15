@@ -128,6 +128,15 @@ async def mark_succeeded(db: AsyncSession, row: FederationOutboundQueue) -> None
             status=FedQueueStatus.SUCCEEDED,
             delivered_at=now,
             last_error=None,
+            # SCRUB (аудит зовн. №2, HIGH): раніше payload лишався в JSONB
+            # НАЗАВЖДИ після доставки. База поступово ставала архівом
+            # federated ciphertext + повного графа метаданих (хто→кому→
+            # коли→через який релей) — для privacy-месенджера це
+            # найчутливіше, що взагалі може накопичуватись. README при
+            # цьому обіцяє «видаляється після доставки». Тепер обіцянка
+            # правдива: лишається порожній dict і delivered_at для
+            # статистики; сам рядок приберe cleanup.
+            envelope_data={},
         )
     )
     await db.execute(stmt)

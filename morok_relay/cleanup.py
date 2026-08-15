@@ -127,6 +127,58 @@ async def reap_delivered_outbound(session: AsyncSession) -> int:
     return result.rowcount or 0
 
 
+# Скільки тримати завершені рядки federation-черги.
+# SUCCEEDED: payload уже занулений worker'ом при доставці; сам рядок
+# (маршрут from→to→relay→ts) — це метадані, добу на діагностику досить.
+# DEAD_LETTER: тут payload ЩЕ ПОВНИЙ — оператор має встигнути глянути,
+# чому не доставилось; 72 години і геть разом із ciphertext'ом.
+FED_SUCCEEDED_RETENTION_SECONDS = 86400
+FED_DEAD_LETTER_RETENTION_SECONDS = 72 * 3600
+
+
+async def reap_federation_queue(session) -> int:
+    """
+    Прибрати завершені рядки federation outbound queue.
+
+    Аудит зовн. №2, HIGH — найгірша privacy-знахідка: черга НІКОЛИ не
+    чистилась. Кожен federated DM лишав у Postgres назавжди рядок
+    «Alice → Bob → relay X → timestamp → ciphertext». Plaintext сервер
+    не бачить, але сам граф спілкування — це рівно те, чого privacy-
+    месенджер не має накопичувати. README при цьому обіцяв видалення
+    після доставки.
+
+    Безпека: PENDING та IN_FLIGHT не чіпаємо ніколи — тільки фінальні
+    статуси, і тільки старші за retention.
+    """
+    from .models import FederationOutboundQueue, FedQueueStatus
+
+    now = int(time.time())
+    removed = 0
+
+    result = await session.execute(
+        delete(FederationOutboundQueue).where(
+            FederationOutboundQueue.status == FedQueueStatus.SUCCEEDED,
+            FederationOutboundQueue.delivered_at.is_not(None),
+            FederationOutboundQueue.delivered_at
+            < now - FED_SUCCEEDED_RETENTION_SECONDS,
+        )
+    )
+    removed += result.rowcount or 0
+
+    result = await session.execute(
+        delete(FederationOutboundQueue).where(
+            FederationOutboundQueue.status == FedQueueStatus.DEAD_LETTER,
+            # updated_at у моделі немає; next_attempt_at проставляється
+            # при кожній (у т.ч. останній) спробі — беремо його як
+            # момент фіналізації.
+            FederationOutboundQueue.next_attempt_at
+            < now - FED_DEAD_LETTER_RETENTION_SECONDS,
+        )
+    )
+    removed += result.rowcount or 0
+    return removed
+
+
 async def cleanup_task_loop():
     """
     Background coroutine that wakes once per day and runs cleanup.
@@ -142,6 +194,7 @@ async def cleanup_task_loop():
                     try:
                         count = await reap_anonymous_users(session)
                         mail_count = await reap_delivered_outbound(session)
+                        fed_count = await reap_federation_queue(session)
                         await session.commit()
                         if count > 0:
                             logger.info(
@@ -152,7 +205,12 @@ async def cleanup_task_loop():
                                 "Cleanup: reaped %d finished outbound-mail rows",
                                 mail_count,
                             )
-                        if count == 0 and mail_count == 0:
+                        if fed_count > 0:
+                            logger.info(
+                                "Cleanup: reaped %d finished federation rows",
+                                fed_count,
+                            )
+                        if count == 0 and mail_count == 0 and fed_count == 0:
                             logger.debug("Cleanup: nothing to reap")
                     except Exception:
                         await session.rollback()

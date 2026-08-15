@@ -45,6 +45,16 @@ import redis.asyncio as redis_async
 logger = logging.getLogger(__name__)
 
 SESSION_TTL_SECONDS = 7 * 24 * 60 * 60          # 7 days
+
+# Абсолютна стеля життя сесії (аудит зовн. №2, HIGH). Sliding-вікно
+# означало: токен, яким користуються хоч раз на 7 днів, живе ВІЧНО.
+# Для месенджера це просто довша компрометація, а для Dead Man's
+# Switch — злам самої гарантії: викрадений bearer + один тихий запит
+# на тиждень = вічний check-in «власник живий», DMS ніколи не спрацює.
+# Тепер сесія помирає не пізніше ніж за 30 днів від видачі НЕЗАЛЕЖНО
+# від активності: власник (має seed) просто перелогінюється, злодій
+# без seed випадає — і DMS нарешті бачить справжню тишу.
+SESSION_ABSOLUTE_MAX_SECONDS = 30 * 24 * 60 * 60
 SESSION_KEY_PREFIX = "morok:session:"
 USER_SESSIONS_KEY_PREFIX = "morok:user_sessions:"
 
@@ -93,7 +103,9 @@ async def create_session(redis: redis_async.Redis, pubkey_hex: str) -> Session:
     await redis.setex(
         _session_key(digest),
         SESSION_TTL_SECONDS,
-        pubkey_hex.encode("utf-8"),
+        # У value — pubkey|created_at: момент ВИДАЧІ потрібен verify,
+        # щоб застосувати абсолютну стелю (SESSION_ABSOLUTE_MAX_SECONDS).
+        f"{pubkey_hex}|{int(time.time())}".encode("utf-8"),
     )
 
     # Track in reverse index so we can revoke all sessions for a user.
@@ -129,7 +141,7 @@ async def verify_session_token(
         value = await redis.get(legacy_key)
         if value is None:
             return None
-        pubkey_legacy = value.decode("utf-8")
+        pubkey_legacy = value.decode("utf-8").partition("|")[0]
         async with redis.pipeline(transaction=True) as pipe:
             pipe.setex(key, SESSION_TTL_SECONDS, value)
             pipe.delete(legacy_key)
@@ -137,7 +149,24 @@ async def verify_session_token(
             pipe.sadd(_user_sessions_key(pubkey_legacy), digest.encode("utf-8"))
             await pipe.execute()
 
-    pubkey_hex = value.decode("utf-8")
+    # Формат value: "pubkey|created_at" (новий) або голий pubkey
+    # (сесії, видані до цього патчу — стелю для них рахуємо від «зараз
+    # мінус 0», тобто вони отримують повні 30 днів з моменту деплою;
+    # через 30 днів легасі-гілка стає мертвим кодом).
+    raw = value.decode("utf-8")
+    pubkey_hex, _, created_str = raw.partition("|")
+    if created_str:
+        try:
+            created_at = int(created_str)
+        except ValueError:
+            created_at = int(time.time())
+        if time.time() - created_at > SESSION_ABSOLUTE_MAX_SECONDS:
+            # Стеля вичерпана: прибираємо сесію так само, як revoke.
+            await redis.delete(key)
+            await redis.srem(
+                _user_sessions_key(pubkey_hex), _token_digest(token).encode()
+            )
+            return None
 
     # Sliding window: every use extends TTL by full 7 days from now.
     await redis.expire(key, SESSION_TTL_SECONDS)
@@ -169,7 +198,7 @@ async def revoke_session(redis: redis_async.Redis, token: str) -> bool:
         if value is None:
             return False
 
-    pubkey_hex = value.decode("utf-8")
+    pubkey_hex = value.decode("utf-8").partition("|")[0]
 
     # Delete forward and reverse — прибираємо ОБИДВІ форми члена
     # reverse-індексу, бо не знаємо, якого покоління ця сесія.
