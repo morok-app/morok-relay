@@ -13,6 +13,7 @@ import uuid
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy import text as sa_text
 
 from ..config import get_settings
@@ -116,7 +117,15 @@ async def create_alias(
     row = MailAlias(alias=alias, owner_pubkey=pubkey, is_primary=want_primary,
                     label=label)
     db.add(row)
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError:
+        # Те саме, що з @username: SELECT-потім-INSERT це check-then-act,
+        # два паралельні запити на один аліас обидва бачать «вільно».
+        # UNIQUE на mail_aliases.alias не дає дублів, але без цього
+        # користувач отримував 500 замість 409.
+        await db.rollback()
+        raise HTTPException(409, "Адреса зайнята")
     s = get_settings()
     logger.info("mail: alias created (primary=%s)", want_primary)
     return {"alias": alias, "address": f"{alias}@{s.mail_domain}",

@@ -176,3 +176,44 @@ async def test_group_fanout_sets_inbox_ttl(redis):
     )
     for pk in members:
         assert await redis.ttl(f"morok:inbox:{pk}") > 0
+
+
+# ── temp-сироти (аудит 5) ────────────────────────────────────────────────
+def test_reaper_removes_stale_temp_files(tmp_path):
+    """
+    write_blob пише в УНІКАЛЬНИЙ temp на кожен виклик. Якщо процес помер
+    між створенням temp і os.replace (SIGKILL/OOM), сирота лишається — і
+    кожен збій додає НОВИЙ файл. _iter_blob_paths їх свідомо пропускає,
+    тож без reap_stale_temp_files їх не прибирає ніхто: диск тече.
+    """
+    import os
+
+    from morok_relay.scripts.reaper import (
+        STALE_TMP_AGE_SECONDS,
+        reap_stale_temp_files,
+    )
+
+    now = int(time.time())
+    eid = "ab" * 32
+
+    fresh = tmp_path / f".{eid}.111.aaaa.tmp"
+    fresh.write_bytes(b"x")
+    stale = tmp_path / f".{eid}.222.bbbb.tmp"
+    stale.write_bytes(b"x")
+    old_mtime = now - STALE_TMP_AGE_SECONDS - 60
+    os.utime(stale, (old_mtime, old_mtime))
+    real = tmp_path / eid
+    real.write_bytes(b"payload")
+
+    stats = reap_stale_temp_files(tmp_path, now)
+
+    assert stats["tmp_deleted"] == 1
+    assert not stale.exists(), "покинутий temp не прибрано"
+    assert fresh.exists(), "знесено temp запису, що може тривати"
+    assert real.exists(), "знесено справжній блоб!"
+
+
+def test_reaper_temp_cleanup_handles_missing_dir(tmp_path):
+    from morok_relay.scripts.reaper import reap_stale_temp_files
+    stats = reap_stale_temp_files(tmp_path / "nope", int(time.time()))
+    assert stats == {"tmp_scanned": 0, "tmp_deleted": 0, "tmp_errors": 0}

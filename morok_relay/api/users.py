@@ -305,7 +305,16 @@ async def claim_username(
         ))
 
     user.username = username
-    await db.flush()
+    try:
+        await db.flush()
+    except IntegrityError:
+        # Гонка: між нашим SELECT і flush хтось інший забрав це ім'я.
+        # UNIQUE-констрейнт на users.username не дає зіпсувати дані, але
+        # без цього перехоплення користувач отримував 500 замість
+        # зрозумілого 409 (check-then-act: два паралельні claim на одне
+        # ім'я обидва бачать «вільно»).
+        await db.rollback()
+        raise HTTPException(status.HTTP_409_CONFLICT, detail="username_taken")
 
     return MeInfo(
         pubkey_hex=current.pubkey_hex,

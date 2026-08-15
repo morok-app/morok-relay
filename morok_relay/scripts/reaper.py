@@ -53,6 +53,54 @@ def _iter_blob_paths(blob_dir: Path):
         yield path
 
 
+# Скільки чекати, перш ніж вважати temp-файл покинутим. Запис блоба —
+# операція на мілісекунди, тож година це величезний запас; менше брати
+# небезпечно (можна знести temp запису, що саме йде).
+STALE_TMP_AGE_SECONDS = 3600
+
+
+def reap_stale_temp_files(blob_dir: Path, now: int) -> dict:
+    """
+    Прибирає покинуті temp-файли запису блобів.
+
+    ЧОМУ ЦЕ ПОТРІБНО. write_blob пише в УНІКАЛЬНИЙ temp
+    (`.{envelope_id}.{pid}.{random}.tmp`), щоб два паралельні записи
+    одного конверта не лізли в один файл. Зворотний бік: якщо процес
+    помирає між створенням temp і os.replace() (SIGKILL, OOM, падіння
+    диска), сирота лишається — і кожен наступний збій додає НОВИЙ файл,
+    а не перезаписує старий. `_iter_blob_paths` їх свідомо пропускає
+    (щоб не знести запис, що триває), тож без цієї функції їх не
+    прибирає ніхто, і місце на диску тече.
+
+    Видаляємо звичайним unlink, без перезапису: temp-сирота — це
+    ЗАШИФРОВАНИЙ блоб, який ніколи не був доступний користувачам;
+    гарантії secure-delete тут не сильніші за FDE (див. blob_storage).
+    """
+    stats = {"tmp_scanned": 0, "tmp_deleted": 0, "tmp_errors": 0}
+    if not blob_dir.exists():
+        return stats
+
+    for path in blob_dir.rglob("*.tmp"):
+        if not path.is_file():
+            continue
+        stats["tmp_scanned"] += 1
+        try:
+            age = now - int(path.stat().st_mtime)
+            if age < STALE_TMP_AGE_SECONDS:
+                continue          # запис може тривати просто зараз
+            path.unlink()
+            stats["tmp_deleted"] += 1
+            logger.info("Removed stale temp blob %s (age %ds)", path.name, age)
+        except FileNotFoundError:
+            # Хтось прибрав раніше (нормальна гонка з успішним записом).
+            continue
+        except OSError as e:
+            stats["tmp_errors"] += 1
+            logger.warning("Failed to remove stale temp %s: %s", path.name, e)
+
+    return stats
+
+
 async def reap_blobs(redis: redis_async.Redis) -> dict:
     """One pass over the blob directory."""
     settings = get_settings()
@@ -65,6 +113,8 @@ async def reap_blobs(redis: redis_async.Redis) -> dict:
         "blobs_deleted_aged_out": 0,
         "blob_errors": 0,
     }
+    # Покинуті temp-файли: інакше їх не прибирає ніхто (див. функцію).
+    stats.update(reap_stale_temp_files(settings.blob_dir, now))
 
     # Запасний віковий ліміт: НЕ фіксовані 24 години, а найдовший
     # можливий TTL у системі. Пошта живе в черзі 7 діб (mail_ttl_seconds),
