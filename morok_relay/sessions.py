@@ -23,11 +23,16 @@ Why not JWT?
 """
 from __future__ import annotations
 
+import hashlib
+import json
+import logging
 import secrets
 import time
 from dataclasses import dataclass
 
 import redis.asyncio as redis_async
+
+logger = logging.getLogger(__name__)
 
 SESSION_TTL_SECONDS = 7 * 24 * 60 * 60          # 7 days
 SESSION_KEY_PREFIX = "morok:session:"
@@ -133,7 +138,51 @@ async def revoke_session(redis: redis_async.Redis, token: str) -> bool:
     deleted = await redis.delete(key)
     await redis.srem(_user_sessions_key(pubkey_hex), token.encode("utf-8"))
 
+    # Розриваємо сокет САМЕ цієї сесії — інші пристрої користувача
+    # лишаються підключеними (token задано, не None).
+    await _publish_session_revoked(redis, pubkey_hex, token)
+
     return deleted > 0
+
+
+async def _publish_session_revoked(
+    redis: redis_async.Redis, pubkey_hex: str, token: str | None,
+) -> None:
+    """
+    Сказати живим WebSocket'ам цього користувача, що сесію відкликано.
+
+    ЧОМУ ЦЕ ПОТРІБНО. Токен перевіряється лише під час handshake — далі
+    сокет живе сам по собі. Тобто видалення ключів із Redis закривало
+    двері тільки для НОВИХ підключень, а вже відкрите з'єднання
+    продовжувало приймати ack і видаляти конверти з інбокса.
+
+    Сценарій, який це ламало: у зловмисника вкрадений токен і відкритий
+    сокет → власник помічає і тисне «вийти з усіх пристроїв» → ключі в
+    Redis знищено → чужий сокет живий і далі ack-ає нові повідомлення,
+    через що справжній клієнт їх уже не отримує. Тобто revoke означав
+    «нові підключення заборонені», а не «сесію знищено».
+
+    token=None → закрити всі сокети користувача (logout-everywhere,
+    видалення акаунта). token задано → закрити лише сокет цієї сесії,
+    решту пристроїв не чіпати.
+
+    Публікуємо в той самий канал, який WS уже слухає, — окрема
+    інфраструктура не потрібна. Best-effort: якщо Redis саме зараз
+    недоступний, ключі сесій усе одно видалені, тож новий handshake не
+    пройде; гірший наслідок — сокет доживе до наступного ping/reconnect.
+    """
+    try:
+        payload = json.dumps({
+            "kind": "session_revoked",
+            # Хеш, а не сам токен: канал слухають усі пристрої
+            # користувача, і чужому токену там робити нічого.
+            "token_hash": (
+                hashlib.sha256(token.encode("utf-8")).hexdigest() if token else None
+            ),
+        })
+        await redis.publish(f"morok:inbox:channel:{pubkey_hex}", payload)
+    except Exception as e:  # noqa: BLE001 — best-effort, не валимо revoke
+        logger.warning("session revoke publish failed for %s: %s", pubkey_hex[:8], e)
 
 
 async def revoke_all_sessions(
@@ -147,6 +196,9 @@ async def revoke_all_sessions(
     reverse_key = _user_sessions_key(pubkey_hex)
     tokens = await redis.smembers(reverse_key)
     if not tokens:
+        # Живих сесій у Redis нема — але сокет міг лишитись відкритим із
+        # ключем, що протух саме зараз. Сповіщаємо однаково.
+        await _publish_session_revoked(redis, pubkey_hex, None)
         return 0
 
     # Build the list of forward-keys to delete.
@@ -157,6 +209,9 @@ async def revoke_all_sessions(
         pipe.delete(*forward_keys)
         pipe.delete(reverse_key)
         results = await pipe.execute()
+
+    # Ключі вже видалено — тепер розриваємо живі з'єднання.
+    await _publish_session_revoked(redis, pubkey_hex, None)
 
     # results[0] is count of forward keys deleted
     return int(results[0])

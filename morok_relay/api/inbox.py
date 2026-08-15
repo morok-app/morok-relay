@@ -30,6 +30,8 @@ Client should:
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import hashlib
 import json
 import logging
 import uuid
@@ -92,6 +94,10 @@ async def inbox_socket(
         return
 
     pubkey_hex = session.pubkey_hex
+    # Хеш власного токена: за ним відрізняємо адресовану саме нам подію
+    # session_revoked від такої ж події для іншого пристрою користувача
+    # (канал pub/sub спільний на весь акаунт).
+    _my_token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
 
     # Enforce the per-pubkey concurrent-connection cap. The helper and
     # the setting existed since day one but were never wired in — without
@@ -218,6 +224,31 @@ async def inbox_socket(
                             "group_id": event.get("group_id"),
                             "by": event.get("by"),
                         })
+                    elif kind == "session_revoked":
+                        # Сесію відкликано (logout, logout-everywhere,
+                        # видалення акаунта). Токен перевірявся лише під
+                        # час handshake, тож без цієї гілки сокет жив би
+                        # далі й приймав ack — вкрадений токен переживав
+                        # би «вийти з усіх пристроїв».
+                        #
+                        # token_hash=None → закрити всі сокети власника.
+                        # Інакше — лише той, чий токен збігається, щоб
+                        # звичайний logout не рвав інші пристрої.
+                        th = event.get("token_hash")
+                        if th is not None and th != _my_token_hash:
+                            continue
+                        logger.info(
+                            "inbox WS: session revoked for %s, closing",
+                            pubkey_hex[:8],
+                        )
+                        # 4001 — той самий код, що й «немає токена»:
+                        # клієнт трактує його як auth-fail і піде
+                        # логінитись наново. Власник із seed'ом мовчки
+                        # перепідключиться, а зловмисник, у якого лише
+                        # токен, — ні.
+                        with contextlib.suppress(Exception):
+                            await websocket.close(code=4001, reason="session_revoked")
+                        return
                     else:
                         logger.warning("inbox WS: unknown event kind %s", kind)
                     continue

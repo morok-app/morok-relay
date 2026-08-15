@@ -19,6 +19,7 @@ from fastapi import APIRouter
 from sqlalchemy import delete, select
 
 from ..deps import CurrentSession, DBSession, RedisClient
+from ..sessions import revoke_all_sessions
 from ..models import (
     DeadManSwitch,
     EncryptedBackup,
@@ -117,6 +118,23 @@ async def delete_me(
         await redis.delete(f"morok:ws:active:{current.pubkey_hex}")
     except Exception as e:
         logger.warning("Redis cleanup on account delete failed: %s", e)
+
+    # Знищуємо всі сесії й рвемо живі WebSocket'и.
+    #
+    # Без цього видалення акаунта лишало користувача… авторизованим:
+    # валідність сесії визначається виключно токеном у Redis, а
+    # deleted_at у цій перевірці не бере участі. Тобто після «видалити
+    # акаунт» будь-який раніше виданий токен (у тому числі вкрадений)
+    # продовжував працювати до кінця свого 7-денного вікна, а відкритий
+    # сокет — приймати ack.
+    try:
+        revoked = await revoke_all_sessions(redis, current.pubkey_hex)
+        logger.info(
+            "Account delete %s: revoked %d session(s)",
+            current.pubkey_hex[:8], revoked,
+        )
+    except Exception as e:
+        logger.warning("Session revoke on account delete failed: %s", e)
 
     logger.info("Account deleted: pubkey=%s...", current.pubkey_hex[:8])
     return {"deleted": True}
