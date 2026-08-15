@@ -24,11 +24,28 @@ Disable
 -------
 Set `RATE_LIMIT_ENABLED=false` in .env to disable entirely (e.g. for
 running the test client locally without hitting limits).
+
+Поведінка при збої Redis (аудит 4, MEDIUM-2)
+--------------------------------------------
+Раніше ВСІ бакети при недоступності Redis робили fail-open. Для спаму це
+прийнятно, але означало: хто завалить або пригальмує Redis, той
+одночасно знімає ліміти з автентифікації — тобто відкриває вільний
+перебір на /auth/verify і /admin/login. Гірше, це підсилює саме себе:
+навантаження → Redis гальмує → ліміти зникають → ще більше навантаження.
+
+Тепер бакети розділені за критичністю (CRITICAL_BUCKETS). Для критичних
+при збої Redis вмикається ЛОКАЛЬНИЙ in-process лічильник (див.
+_LocalFallbackLimiter): він не такий точний (у кожного воркера свій, тож
+фактичний ліміт множиться на кількість воркерів), але перетворює
+«лімітів немає взагалі» на «ліміт у кілька разів слабший» — різниця між
+вільним перебором і сповільненим. Некритичні бакети лишаються fail-open,
+щоб блимок Redis не ламав доставку повідомлень.
 """
 from __future__ import annotations
 
 import logging
 import time
+from collections import defaultdict
 from typing import Annotated
 
 from fastapi import Depends, HTTPException, Request, status
@@ -38,6 +55,56 @@ from .config import get_settings
 from .db import get_redis
 
 logger = logging.getLogger(__name__)
+
+
+# ============================================================================
+# Fail-mode policy
+# ============================================================================
+
+# Бакети, де fail-open = відкритий перебір облікових даних або
+# безкоштовне засмічення таблиць. Для них при збої Redis працює
+# локальний резерв замість «пропускати все».
+CRITICAL_BUCKETS = frozenset({
+    "auth_challenge",
+    "auth_verify",
+    "admin_login",
+    "federation_handshake",
+})
+
+
+class _LocalFallbackLimiter:
+    """
+    Аварійний лічильник у пам'яті процесу на випадок недоступності Redis.
+
+    НАВМИСНІ ОБМЕЖЕННЯ. Стан не спільний між воркерами (кожен має свій
+    словник), тож реальний ліміт множиться на кількість воркерів; після
+    рестарту процесу лічильники обнуляються. Це не заміна Redis, а
+    аварійний резерв: мета — не пропустити тисячі спроб перебору, поки
+    Redis лежить, а не забезпечити точний QoS.
+
+    Пам'ять обмежена: вікно живе одну хвилину, старі вікна викидаються
+    при кожному новому, тож словник не росте нескінченно навіть під
+    атакою з багатьох IP.
+    """
+
+    __slots__ = ("_counts", "_window")
+
+    def __init__(self) -> None:
+        self._counts: dict[tuple[str, str], int] = defaultdict(int)
+        self._window: int = 0
+
+    def hit(self, bucket: str, identifier: str, limit: int) -> tuple[bool, int]:
+        window = int(time.time()) // 60
+        if window != self._window:
+            self._counts.clear()
+            self._window = window
+        key = (bucket, identifier)
+        self._counts[key] += 1
+        count = self._counts[key]
+        return count <= limit, count
+
+
+_local_fallback = _LocalFallbackLimiter()
 
 
 # ============================================================================
@@ -135,9 +202,17 @@ async def check_rate_limit(
             results = await pipe.execute()
         count = results[0]
     except Exception as e:
-        # Redis hiccup — fail OPEN. Rate limiting is defense-in-depth, not
-        # a hard auth boundary. Failing closed would DoS ourselves whenever
-        # Redis blips.
+        # Redis недоступний. Поведінка залежить від критичності бакета.
+        if bucket in CRITICAL_BUCKETS:
+            allowed, count = _local_fallback.hit(bucket, identifier, limit_per_minute)
+            # ERROR, а не WARNING: це стан, який має бути видно в
+            # моніторингу — ліміти зараз працюють гірше, ніж заявлено.
+            logger.error(
+                "Rate limit Redis failure on CRITICAL bucket %s — "
+                "using in-process fallback (allowed=%s, count=%d): %s",
+                bucket, allowed, count, e,
+            )
+            return allowed, count, retry_after
         logger.warning("Rate limit check failed (failing open): %s", e)
         return True, 0, 0
 
