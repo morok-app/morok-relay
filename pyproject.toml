@@ -25,6 +25,9 @@ select = [
 ]
 ignore = [
     "E501",  # line too long (black handles)
+    # Кирилиця в коментарях/рядках — це українська, а не «ambiguous
+    # characters». Без цього ruff завалює проєкт сотнями хибних RUF00x.
+    "RUF001", "RUF002", "RUF003",
 ]
 
 [tool.ruff.lint.per-file-ignores]
@@ -44,6 +47,7 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "session"
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 addopts = "-ra --strict-markers"

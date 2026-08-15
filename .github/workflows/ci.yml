@@ -1,0 +1,70 @@
+# CI morok-relay: тести (Redis + Postgres), лінт нового коду, installer.
+#
+# Про scope ruff: основний код (morok_relay/) НАВМИСНО поки не лінтується —
+# там ~740 накопичених зауважень; вмикати їх у CI зараз = вічно червоний
+# бейдж. Лінтуємо tests/ і tools/ (нове — чисте), поступове розширення на
+# morok_relay/ — окрема задача.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    services:
+      redis:
+        image: redis:7
+        ports: ["6399:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+      postgres:
+        image: postgres:16
+        ports: ["5432:5432"]
+        env:
+          POSTGRES_USER: morok_test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: morok_test
+        options: >-
+          --health-cmd "pg_isready -U morok_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest pytest-asyncio pytest-timeout ruff
+
+      - name: Ruff (tests + tools)
+        run: ruff check tests/ tools/
+
+      - name: Shellcheck installer
+        run: |
+          sudo apt-get install -y shellcheck
+          bash -n deploy/install.sh
+          shellcheck -S warning deploy/install.sh
+
+      - name: .env.example ↔ Settings sync
+        run: python -m tools.check_env_example
+
+      - name: Pytest
+        env:
+          MOROK_TEST_REDIS_URL: redis://localhost:6399/0
+          MOROK_TEST_DB_DSN: postgresql+asyncpg://morok_test:test@localhost:5432/morok_test
+        run: pytest tests/ --timeout=30 -q
