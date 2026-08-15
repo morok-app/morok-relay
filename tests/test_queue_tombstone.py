@@ -134,3 +134,45 @@ async def test_sealed_gets_no_tombstone(redis):
         delete_key_hash="aa" * 32,
     )
     assert await redis.get(f"morok:env_tomb:{eid}") is None
+
+
+# ── TTL на inbox-ключі (аудит 4, MEDIUM-3) ───────────────────────────────
+async def test_inbox_key_has_ttl(redis):
+    """
+    Сам ZSET inbox'а мусить мати TTL. Без нього `maxmemory-policy
+    volatile-ttl` не може витіснити жодного inbox'а під тиском пам'яті —
+    policy стає декоративною, і Redis іде в OOM. (Знайдено на бойовому
+    relay1: усі morok:inbox:* мали TTL = -1.)
+    """
+    eid = "e1" * 32
+    await q.enqueue_envelope(redis, **_mk(eid))
+    ttl = await redis.ttl(f"morok:inbox:{RCP}")
+    assert ttl > 0, "inbox-ключ без TTL — volatile-ttl не спрацює"
+    assert ttl >= 3600, "TTL коротший за життя конверта — втратимо конверти"
+
+
+async def test_inbox_ttl_extends_with_new_envelopes(redis):
+    """Живий inbox не помирає передчасно: TTL зсувається з кожним конвертом."""
+    await q.enqueue_envelope(redis, **_mk("e2" * 32))
+    await redis.expire(f"morok:inbox:{RCP}", 100)  # імітуємо майже протухлий
+    await q.enqueue_envelope(redis, **_mk("e3" * 32))
+    ttl = await redis.ttl(f"morok:inbox:{RCP}")
+    assert ttl > 1000, "новий конверт не подовжив життя inbox-ключа"
+
+
+async def test_group_fanout_sets_inbox_ttl(redis):
+    """Груповий шлях теж має виставляти TTL (окремий код від DM)."""
+    members = [f"{i:064x}" for i in range(1, 4)]
+    await q.enqueue_envelope_for_recipients(
+        redis,
+        envelope_id="e4" * 32,
+        sender_pubkey_hex=SND,
+        recipient_pubkeys_hex=members,
+        timestamp=int(time.time()),
+        ttl_seconds=3600,
+        signature_hex="ff" * 64,
+        hard_ceiling_seconds=86400,
+        group_id="11111111-2222-3333-4444-555555555555",
+    )
+    for pk in members:
+        assert await redis.ttl(f"morok:inbox:{pk}") > 0

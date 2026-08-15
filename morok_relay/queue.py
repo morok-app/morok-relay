@@ -48,6 +48,11 @@ logger = logging.getLogger(__name__)
 # counts live, undelivered messages.
 MAX_INBOX_QUEUE_DEPTH = 5000
 
+# Запас понад життя найдовшого конверта в inbox'і. Ключ має пережити
+# СВІЙ вміст (інакше ми втратимо ще не забрані конверти при рестарті
+# клієнта), але не жити вічно — інакше volatile-ttl не має що витісняти.
+INBOX_KEY_TTL_SLACK_SECONDS = 3600
+
 
 class EnqueueRejected(HTTPException):
     """
@@ -325,6 +330,19 @@ async def enqueue_envelope(
 
     async with redis.pipeline(transaction=True) as pipe:
         pipe.zadd(_inbox_key(recipient_pubkey_hex), {envelope_id: expires_at})
+        # TTL на САМ inbox-ключ. Без нього ZSET жив вічно: елементи
+        # всередині мали score=expires_at і прибирались лише при явному
+        # zremrangebyscore (тобто коли одержувач наступного разу
+        # з'явиться), а сам ключ у Redis лишався БЕЗ TTL. Наслідок:
+        # `maxmemory-policy volatile-ttl` не могла витіснити жодного
+        # inbox'а під тиском пам'яті — policy була декоративною, і Redis
+        # ішов би в OOM. EXPIRE зсувається вперед з кожним новим
+        # конвертом, тож живий inbox не помре передчасно, а покинутий
+        # зникне сам за hard-стелею.
+        pipe.expire(
+            _inbox_key(recipient_pubkey_hex),
+            max(ttl_until_expiry, 60) + INBOX_KEY_TTL_SLACK_SECONDS,
+        )
         pipe.publish(_inbox_channel(recipient_pubkey_hex), _new_event(envelope_id))
         # Tombstone для майбутнього sender-delete: переживає meta на
         # TOMBSTONE_EXTRA_TTL_SECONDS, щоб «видалити після ack/протухання»
@@ -447,6 +465,11 @@ async def enqueue_envelope_for_recipients(
         )
         for recipient in eligible:
             pipe.zadd(_inbox_key(recipient), {envelope_id: expires_at})
+            # Той самий TTL на ключ, що й у DM-шляху (див. коментар там).
+            pipe.expire(
+                _inbox_key(recipient),
+                max(expires_at - now, 60) + INBOX_KEY_TTL_SLACK_SECONDS,
+            )
             pipe.publish(_inbox_channel(recipient), new_event)
         await pipe.execute()
 
