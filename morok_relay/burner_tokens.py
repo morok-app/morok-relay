@@ -59,8 +59,11 @@ def _token_key(token: str) -> str:
     return f"morok:burner_token:{token}"
 
 
+_OWNER_KEY_PREFIX = "morok:burner_owner:"
+
+
 def _owner_key(pubkey_hex: str) -> str:
-    return f"morok:burner_owner:{pubkey_hex}"
+    return f"{_OWNER_KEY_PREFIX}{pubkey_hex}"
 
 
 def generate_token() -> str:
@@ -118,37 +121,63 @@ async def get_token(redis: redis_async.Redis, token: str) -> dict | None:
         return None
 
 
+# Атомарний інкремент лічильника повідомлень.
+#
+# ЧОМУ LUA. Стара реалізація робила GET → decode → +1 → SET: дві паралельні
+# відправки читали 99 і обидві писали 100 (обхід ліміту), а гонка з revoke
+# могла «воскресити» токен — потік A прочитав metadata, потік B видалив
+# ключ (revoke), потік A записав metadata назад. Lua виконується в Redis
+# як одна неподільна операція, тож обидві гонки зникають: revoke або
+# відбувся ДО (GET поверне nil → відмова), або ПІСЛЯ (перемагає revoke).
+#
+# Ключ власника (SREM при auto-revoke) будується всередині скрипта з
+# meta.owner_pubkey — це нормально для одиночного Redis; для Redis Cluster
+# довелося б передавати його через KEYS[2] (у нас кластера немає).
+_INCR_LUA = """
+local raw = redis.call('GET', KEYS[1])
+if not raw then
+    return {0, 0}
+end
+local ok, meta = pcall(cjson.decode, raw)
+if not ok then
+    return {0, 0}
+end
+local count = (tonumber(meta['message_count']) or 0) + 1
+if count > tonumber(ARGV[1]) then
+    -- Auto-revoke: ліміт вичерпано, токен знищується атомарно.
+    redis.call('DEL', KEYS[1])
+    if meta['owner_pubkey'] then
+        redis.call('SREM', ARGV[3] .. meta['owner_pubkey'], ARGV[2])
+    end
+    return {0, count}
+end
+meta['message_count'] = count
+-- KEEPTTL: зберігаємо залишок життя токена (Redis >= 6.0).
+redis.call('SET', KEYS[1], cjson.encode(meta), 'KEEPTTL')
+return {1, count}
+"""
+
+
 async def increment_message_count(
     redis: redis_async.Redis, token: str,
 ) -> tuple[bool, int]:
     """
-    Atomically increment message count for a token.
+    Atomically increment message count for a token (single Lua script).
 
     Returns (allowed, new_count). If new_count exceeds MAX_MESSAGES_PER_TOKEN
-    we return (False, count) and DON'T deliver the message.
+    the token is auto-revoked inside the same atomic operation and we return
+    (False, count) — the message must NOT be delivered.
     """
-    raw = await redis.get(_token_key(token))
-    if raw is None:
-        return False, 0
-    try:
-        meta = json.loads(raw)
-    except json.JSONDecodeError:
-        return False, 0
-
-    count = int(meta.get("message_count", 0)) + 1
-    if count > MAX_MESSAGES_PER_TOKEN:
-        # Auto-revoke
-        await revoke_token(redis, meta["owner_pubkey"], token)
-        return False, count
-
-    meta["message_count"] = count
-
-    # Preserve remaining TTL
-    ttl = await redis.ttl(_token_key(token))
-    if ttl is None or ttl < 0:
-        return False, count
-    await redis.set(_token_key(token), json.dumps(meta), ex=ttl)
-    return True, count
+    result = await redis.eval(
+        _INCR_LUA,
+        1,
+        _token_key(token),
+        str(MAX_MESSAGES_PER_TOKEN),
+        token,
+        _OWNER_KEY_PREFIX,
+    )
+    allowed, count = int(result[0]), int(result[1])
+    return bool(allowed), count
 
 
 async def revoke_token(

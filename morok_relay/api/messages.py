@@ -528,6 +528,11 @@ async def delete_dm_message(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="recipient_mismatch",
         )
+    # err == "not_found" (ні meta, ні tombstone) НЕ відхиляємо одразу:
+    # для федеративного одержувача конверт локально ніколи не enqueue-
+    # вався — це нормальний випадок, авторизацію робить домашній релей
+    # одержувача (перевіряє підпис deleter'а і СВІЙ tombstone). Рішення —
+    # нижче, після визначення federated_to.
 
     # Cross-relay propagation: if the recipient lives on a peer relay,
     # forward the delete event so that peer's Redis (and any online
@@ -586,6 +591,15 @@ async def delete_dm_message(
                 await db.flush()
             federated_to = target_relay
 
+    if err == "not_found" and federated_to is None:
+        # Одержувач локальний (або невідомий), а ні metadata, ні
+        # tombstone немає — конверт не існував чи видалення прийшло
+        # надто пізно. Відмова БЕЗ delete-події в канал: раніше цей
+        # шлях був spam-примітивом для довільних envelope_id.
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="envelope_not_found",
+        )
     logger.info(
         "DM %s... deleted by sender %s... (queue_hit=%s, meta_existed=%s, fed=%s)",
         envelope_id[:8], current.pubkey_hex[:8],

@@ -222,6 +222,12 @@ fi
 # ===========================================================================
 step "Configuring Tor hidden service"
 TORRC="/etc/tor/torrc"
+# МІГРАЦІЯ, а не "додати, якщо відсутній": стара версія installer'а
+# вказувала HiddenServicePort прямо на uvicorn (:8000). Релей,
+# встановлений до фіксу, після git pull отримував безпечний
+# nginx-listener, але torrc лишався з :8000 — Tor ходив ПОВЗ nginx,
+# і спуфінг X-Real-IP з onion жив далі. Тепер завжди приводимо порт
+# СВОГО блока до поточного значення.
 if ! grep -q "morok_relay" "$TORRC" 2>/dev/null; then
   cat >> "$TORRC" <<EOF
 
@@ -233,6 +239,19 @@ if ! grep -q "morok_relay" "$TORRC" 2>/dev/null; then
 HiddenServiceDir /var/lib/tor/morok_relay/
 HiddenServicePort 80 127.0.0.1:8081
 EOF
+  ok "Tor onion block added to torrc"
+elif grep -qE "^HiddenServicePort 80 127\.0\.0\.1:8000" "$TORRC"; then
+  cp -a "$TORRC" "${TORRC}.bak.$(date +%s)"
+  # Мігруємо лише рядок одразу ПІСЛЯ нашого HiddenServiceDir — чужі
+  # onion-сервіси на цьому ж хості не чіпаємо.
+  sed -i '\|^HiddenServiceDir /var/lib/tor/morok_relay/|{n;s|^HiddenServicePort 80 127\.0\.0\.1:8000$|HiddenServicePort 80 127.0.0.1:8081|}' "$TORRC"
+  if grep -A1 "^HiddenServiceDir /var/lib/tor/morok_relay/" "$TORRC" | grep -q ":8081"; then
+    ok "torrc MIGRATED: morok onion now points at nginx listener :8081"
+  else
+    warn "torrc migration did not apply — edit $TORRC manually: morok block must point at 127.0.0.1:8081"
+  fi
+else
+  ok "torrc morok block already current"
 fi
 systemctl enable tor >/dev/null 2>&1 || true
 systemctl restart tor
@@ -252,31 +271,45 @@ done
 # ===========================================================================
 step "Writing configuration (.env)"
 ENV_FILE="${INSTALL_DIR}/.env"
-# страховка: зберігаємо копію попереднього .env перед перезаписом
+# UPSERT, а не перезапис: installer знає лише СВОЇ ключі. Реальний бойовий
+# .env містить значно більше (mail, admin credentials, proxy trust,
+# кастомні ліміти, push) — стара версія генерувала файл "з нуля" і
+# повторний запуск тихо скидав ці налаштування до дефолтів (README при
+# цьому подає installer як re-runnable). Тепер: відомий ключ — оновлюємо
+# значення на місці; відсутній — дописуємо; НЕВІДОМІ РЯДКИ НЕ ЧІПАЄМО.
 if [[ -f "$ENV_FILE" ]]; then
   cp -a "$ENV_FILE" "${ENV_FILE}.bak.$(date +%s)"
   ok "Previous .env backed up"
+else
+  touch "$ENV_FILE"
 fi
+
+# upsert_env KEY VALUE — замінити рядок KEY=... або дописати в кінець.
 # NOTE: never put a comment '#' on the same line as a secret without a
-# leading space — pydantic reads the whole line otherwise. We keep it
-# simple: no inline comments next to values.
-cat > "$ENV_FILE" <<EOF
-MOROK_IS_PRODUCTION=true
-MOROK_DEBUG=false
-MOROK_RELAY_NAME=${DOMAIN}
+# leading space — pydantic reads the whole line otherwise.
+upsert_env() {
+  local key="$1" value="$2"
+  if grep -qE "^${key}=" "$ENV_FILE"; then
+    # sed з | як роздільником; значення у нас без | (hex, url, шляхи)
+    sed -i "s|^${key}=.*|${key}=${value}|" "$ENV_FILE"
+  else
+    printf '%s=%s\n' "$key" "$value" >> "$ENV_FILE"
+  fi
+}
 
-MOROK_DB_DSN=postgresql+asyncpg://${DB_USER}:${DB_PASS}@localhost:5432/${DB_NAME}
-MOROK_REDIS_URL=redis://localhost:6379/0
+upsert_env MOROK_IS_PRODUCTION true
+upsert_env MOROK_DEBUG false
+upsert_env MOROK_RELAY_NAME "${DOMAIN}"
+upsert_env MOROK_DB_DSN "postgresql+asyncpg://${DB_USER}:${DB_PASS}@localhost:5432/${DB_NAME}"
+upsert_env MOROK_REDIS_URL "redis://localhost:6379/0"
+upsert_env MOROK_BLOB_DIR "${BLOB_DIR}"
+upsert_env MOROK_RELAY_PUBKEY_HEX "${RELAY_PUB}"
+upsert_env MOROK_RELAY_PRIVKEY_HEX "${RELAY_PRIV}"
+[[ -n "$ONION" ]] && upsert_env MOROK_TOR_ONION_ADDRESS "${ONION}"
 
-MOROK_BLOB_DIR=${BLOB_DIR}
-
-MOROK_RELAY_PUBKEY_HEX=${RELAY_PUB}
-MOROK_RELAY_PRIVKEY_HEX=${RELAY_PRIV}
-EOF
-[[ -n "$ONION" ]] && echo "MOROK_TOR_ONION_ADDRESS=${ONION}" >> "$ENV_FILE"
 chown "${MOROK_USER}:${MOROK_USER}" "$ENV_FILE"
 chmod 600 "$ENV_FILE"
-ok "Wrote $ENV_FILE (mode 600)"
+ok "Wrote $ENV_FILE (mode 600, operator keys preserved)"
 
 # ===========================================================================
 # 11. Database migrations
@@ -381,12 +414,44 @@ emit_timer "federation-worker" "Morok federation outbound worker" "federation_wo
 emit_timer "reaper"            "Morok expired-message reaper"      "reaper"            "5min" "true"
 emit_timer "dms-reaper"        "Morok dead-man-switch reaper"      "dms_reaper"        "1min" "true"
 
+# fstrim: юніти лежали в deploy/, але installer їх НЕ ставив — тобто
+# коментар у blob_storage.py про "fstrim-таймер" був порожньою обіцянкою
+# навіть на власних релеях. TRIM скорочує вікно життя стертих блобів на
+# SSD (гарантії все одно не дає — див. blob_storage.py, LUKS).
+cat > /etc/systemd/system/morok-fstrim.service <<EOF
+[Unit]
+Description=Run fstrim on Morok blob storage filesystem
+Documentation=man:fstrim(8)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/fstrim -v /
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=morok-fstrim
+EOF
+cat > /etc/systemd/system/morok-fstrim.timer <<EOF
+[Unit]
+Description=Daily fstrim for SSD secure-delete completeness
+Requires=morok-fstrim.service
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+Persistent=true
+RandomizedDelaySec=10min
+Unit=morok-fstrim.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
 systemctl daemon-reload
 systemctl enable --now morok-relay.service >/dev/null 2>&1
 systemctl enable --now morok-federation-worker.timer >/dev/null 2>&1
 systemctl enable --now morok-reaper.timer >/dev/null 2>&1
 systemctl enable --now morok-dms-reaper.timer >/dev/null 2>&1
-ok "Services enabled and started"
+systemctl enable --now morok-fstrim.timer >/dev/null 2>&1
+ok "Services enabled and started (incl. fstrim.timer)"
 
 # Give uvicorn a moment, then health-check locally
 sleep 3

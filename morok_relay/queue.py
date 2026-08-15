@@ -84,6 +84,26 @@ def _envelope_meta_key(envelope_id: str) -> str:
     return f"morok:envelope:{envelope_id}"
 
 
+# ── Tombstone відправника ───────────────────────────────────────────────
+# Живе ДОВШЕ за metadata конверта. Потрібен для sender-delete: коли meta
+# вже протухла/ack-нута, релей раніше не мав проти чого авторизувати
+# запит і «вірив на слово» — можна було генерувати delete-події для
+# довільних envelope_id у чужі WS-канали (spam-примітив + неправильна
+# межа довіри). Зберігаємо НЕ пару (from, to), а її хеш: компрометація
+# Redis не розкриває графа спілкування довше, ніж живуть самі конверти.
+TOMBSTONE_EXTRA_TTL_SECONDS = 7 * 86400
+
+
+def _sender_tombstone_key(envelope_id: str) -> str:
+    return f"morok:env_tomb:{envelope_id}"
+
+
+def _sender_tombstone_value(sender_pubkey_hex: str, recipient_pubkey_hex: str) -> str:
+    return hashlib.sha256(
+        f"{sender_pubkey_hex}|{recipient_pubkey_hex}".encode("utf-8")
+    ).hexdigest()
+
+
 def _inbox_channel(recipient_pubkey_hex: str) -> str:
     return f"morok:inbox:channel:{recipient_pubkey_hex}"
 
@@ -298,6 +318,15 @@ async def enqueue_envelope(
     async with redis.pipeline(transaction=True) as pipe:
         pipe.zadd(_inbox_key(recipient_pubkey_hex), {envelope_id: expires_at})
         pipe.publish(_inbox_channel(recipient_pubkey_hex), _new_event(envelope_id))
+        # Tombstone для майбутнього sender-delete: переживає meta на
+        # TOMBSTONE_EXTRA_TTL_SECONDS, щоб «видалити після ack/протухання»
+        # досі можна було авторизувати. Sealed не потребує — там preimage.
+        if not sealed and sender_pubkey_hex:
+            pipe.set(
+                _sender_tombstone_key(envelope_id),
+                _sender_tombstone_value(sender_pubkey_hex, recipient_pubkey_hex),
+                ex=ttl_until_expiry + TOMBSTONE_EXTRA_TTL_SECONDS,
+            )
         await pipe.execute()
 
     return expires_at
@@ -484,10 +513,11 @@ async def delete_envelope_by_sender(
     Sender removes their DM envelope from the recipient's inbox.
 
     If metadata is still in Redis we authorize via meta.from. If it has
-    already expired or been acked by the recipient, we accept the
-    caller's claim and publish a delete event into the recipient's
-    channel anyway — the recipient client is expected to sanity-check
-    that the envelope_id really belongs to a chat with `caller`.
+    already expired or been acked, we authorize against the sender
+    TOMBSTONE (sha256 of "from|to", written at enqueue, outlives meta by
+    TOMBSTONE_EXTRA_TTL_SECONDS). No tombstone → refuse: раніше тут ми
+    «вірили на слово» і публікували delete-подію для довільного
+    envelope_id у чужий канал.
 
     The blob file is left for the reaper to clean up once no inbox row
     references it.
@@ -525,12 +555,31 @@ async def delete_envelope_by_sender(
                 "ok": False, "deleted_from_queue": False,
                 "meta_existed": True, "error": "recipient_mismatch",
             }
+    else:
+        # Meta вже нема — перевіряємо tombstone. Хеш звіряємо в constant
+        # time; відсутність tombstone означає, що конверт або ніколи не
+        # існував, або видалення прийшло надто пізно — в обох випадках
+        # відмовляємо БЕЗ публікації події в канал одержувача.
+        tomb = await redis.get(_sender_tombstone_key(envelope_id))
+        if tomb is None:
+            return {
+                "ok": False, "deleted_from_queue": False,
+                "meta_existed": False, "error": "not_found",
+            }
+        tomb_str = tomb.decode("utf-8") if isinstance(tomb, bytes) else tomb
+        expected = _sender_tombstone_value(caller_pubkey_hex, recipient_pubkey_hex)
+        if not hmac.compare_digest(tomb_str, expected):
+            return {
+                "ok": False, "deleted_from_queue": False,
+                "meta_existed": False, "error": "not_sender",
+            }
 
     event_payload = _deleted_event(envelope_id, caller_pubkey_hex)
 
     async with redis.pipeline(transaction=True) as pipe:
         pipe.zrem(_inbox_key(recipient_pubkey_hex), envelope_id)
         pipe.delete(_envelope_meta_key(envelope_id))
+        pipe.delete(_sender_tombstone_key(envelope_id))
         pipe.publish(_inbox_channel(recipient_pubkey_hex), event_payload)
         results = await pipe.execute()
 

@@ -8,8 +8,12 @@ Design principles
 3. Filename is the envelope_id (sha256 of sender || recipient || ts || hash(blob)).
 4. Sharded into subdirectories to avoid having millions of files in one dir.
 5. Delete is physical: overwrite with random bytes, then unlink, then fsync.
-   This is the "secure delete" we promise in the threat model — not a logical
-   DELETE that leaves the data recoverable from the underlying SSD blocks.
+   ВАЖЛИВО ПРО МЕЖІ: це BEST EFFORT, а не гарантоване стирання. На CoW-ФС
+   (btrfs, ZFS) overwrite пише в НОВІ блоки — старі лишаються до GC. На SSD
+   wear-leveling/FTL так само може зберегти старі блоки до TRIM. Реальна
+   гарантія — full-disk encryption (LUKS) + знищення ключа; fstrim-таймер
+   (deploy/morok-fstrim.*) лише скорочує вікно на SSD. Не обіцяємо "true
+   erasure" ніде в публічних матеріалах.
 
 Layout
 ------
@@ -46,21 +50,33 @@ async def write_blob(envelope_id: str, blob: bytes) -> Path:
     """
     Write a blob to disk. Creates parent directories if needed.
 
-    Atomic via temp+rename: writes to .tmp first, then renames into place.
-    A failed write leaves a .tmp behind, never a partial real blob.
+    Atomic via temp+rename. Ім'я temp-файлу УНІКАЛЬНЕ на кожен виклик:
+    детермінований `path.with_suffix(".tmp")` дозволяв двом паралельним
+    POST одного конверта писати в ОДИН temp-файл (interleaved-вміст,
+    падіння на rename). Тепер кожен writer має власний файл, а
+    os.replace() атомарно кладе переможця на місце (програвший просто
+    перезапише тим самим вмістом — envelope_id є хешем вмісту).
     """
     path = _blob_path(envelope_id)
-    tmp_path = path.with_suffix(".tmp")
+    tmp_path = path.parent / f".{envelope_id}.{os.getpid()}.{secrets.token_hex(4)}.tmp"
 
     # Run blocking I/O in a thread so we don't stall the event loop
     def _write_sync():
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        with open(tmp_path, "wb") as f:
-            f.write(blob)
-            f.flush()
-            os.fsync(f.fileno())
-        os.chmod(tmp_path, 0o600)
-        tmp_path.rename(path)
+        try:
+            with open(tmp_path, "wb") as f:
+                f.write(blob)
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(tmp_path, 0o600)
+            os.replace(tmp_path, path)
+        except BaseException:
+            # Не лишаємо сироту-temp при збої.
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
 
     await asyncio.to_thread(_write_sync)
     return path
@@ -84,10 +100,10 @@ async def secure_delete_blob(envelope_id: str) -> bool:
 
     Returns True if a blob was deleted, False if it didn't exist.
 
-    Security note: On a typical filesystem, overwrite+unlink is best-effort.
-    On SSDs with wear-leveling, the original bytes may persist in unused
-    blocks until fstrim runs. We schedule fstrim hourly via cron (separate
-    deployment step) for true erasure.
+    Security note: overwrite+unlink is BEST-EFFORT everywhere. На CoW-ФС
+    (btrfs/ZFS) overwrite не чіпає старих блоків; на SSD блоки живуть до
+    TRIM (systemd-таймер morok-fstrim, добовий). Гарантоване стирання дає
+    лише FDE (LUKS). Клієнтські обіцянки формулюємо відповідно.
     """
     path = _blob_path(envelope_id)
 

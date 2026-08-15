@@ -13,6 +13,7 @@ import uuid
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
 from sqlalchemy import func, select
+from sqlalchemy import text as sa_text
 
 from ..config import get_settings
 from ..deps import CurrentSession, DBSession, RedisClient
@@ -353,7 +354,16 @@ async def _queue_external(body: dict, session, db, to_addr: str):
         clean_atts.append({"filename": fn, "content_type": ct, "b64": b64})
 
     now = int(time.time())
-    # добовий ліміт на акаунт (анти-абуза)
+    # добовий ліміт на акаунт (анти-абуза).
+    # pg_advisory_xact_lock серіалізує compose ОДНОГО акаунта: без нього
+    # COUNT → INSERT це класичний check-then-act — два паралельні запити
+    # обидва бачать 19 і обидва вставляють (21 при ліміті 20). Лок
+    # тримається до кінця транзакції (commit нижче), різні акаунти не
+    # блокують одне одного.
+    await db.execute(
+        sa_text("SELECT pg_advisory_xact_lock(hashtext(:pk))"),
+        {"pk": pubkey.hex() if isinstance(pubkey, (bytes, bytearray)) else str(pubkey)},
+    )
     sent_today = (await db.execute(
         select(func.count()).select_from(MailOutbound).where(
             MailOutbound.owner_pubkey == pubkey,
@@ -397,20 +407,27 @@ async def outbound_claim(
     limit = min(int(body.get("limit", 5)), 20)
     now = int(time.time())
 
-    # протухлі queued (48h, CX23 лежав) → failed без вмісту
+    # протухлі queued (48h, CX23 лежав) → failed без вмісту.
+    # with_for_update(skip_locked): другий воркер не чекає і не бере
+    # ті самі рядки.
     stale = (await db.execute(select(MailOutbound).where(
         MailOutbound.status == OutboundStatus.QUEUED,
         MailOutbound.created_at < now - 172800,
-    ))).scalars().all()
+    ).with_for_update(skip_locked=True))).scalars().all()
     for r in stale:
         r.status = OutboundStatus.FAILED
         r.last_error = "expired in queue"
         r.body_text = None; r.subject = None; r.attachments_json = None
         r.updated_at = now
 
+    # SELECT ... FOR UPDATE SKIP LOCKED — два воркери, що claim-лять
+    # одночасно, отримують НЕПЕРЕТИННІ пачки. Раніше обидва читали ті
+    # самі queued-рядки і лист ішов двічі (перехід у SENDING робився
+    # python-кодом уже після SELECT, commit — ще пізніше).
     rows = (await db.execute(select(MailOutbound).where(
         MailOutbound.status == OutboundStatus.QUEUED,
-    ).order_by(MailOutbound.created_at).limit(limit))).scalars().all()
+    ).order_by(MailOutbound.created_at).limit(limit)
+     .with_for_update(skip_locked=True))).scalars().all()
     out = []
     for r in rows:
         r.status = OutboundStatus.SENDING

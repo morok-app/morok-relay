@@ -4,12 +4,22 @@ Session token management.
 Tokens are random 32-byte values, hex-encoded for transport.
 Stored in Redis as:
 
-    morok:session:{token_hex}  →  {pubkey_hex}
+    morok:session:{sha256(token_hex)}  →  {pubkey_hex}
     TTL: 7 days, refreshed on each use (sliding window)
+
+ЧОМУ ХЕШ, А НЕ САМ ТОКЕН. Компрометація Redis (RDB-дамп, бекап, читання
+пам'яті) раніше означала крадіжку ВСІХ активних сесій у відкритому
+вигляді. Тепер у Redis лежить лише SHA-256 — токен неможливо відновити,
+а перевірка йде за digest'ом. Міграція м'яка: verify спершу шукає
+хешований ключ, при промаху — старий плаintext-ключ, і на льоту
+переносить його на нову схему. Через 7 днів (sliding TTL) старих ключів
+не лишиться — цю fallback-гілку тоді можна прибрати.
 
 Also maintain a reverse lookup:
 
-    morok:user_sessions:{pubkey_hex}  →  SET of {token_hex}
+    morok:user_sessions:{pubkey_hex}  →  SET of {sha256(token_hex)}
+    (старі члени — сирі токени — обробляються однаково: forward-ключ
+    завжди prefix + member, тож revoke_all працює для обох поколінь)
 
 This lets us revoke all sessions for a user (logout-everywhere) without
 scanning all tokens. The reverse index is best-effort — if a token expires
@@ -47,8 +57,14 @@ class Session:
     expires_at: int
 
 
-def _session_key(token: str) -> str:
-    return f"{SESSION_KEY_PREFIX}{token}"
+def _token_digest(token: str) -> str:
+    """SHA-256 hex токена — єдине, що потрапляє в Redis."""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _session_key(identifier: str) -> str:
+    """identifier — digest (нова схема) або сирий токен (легасі)."""
+    return f"{SESSION_KEY_PREFIX}{identifier}"
 
 
 def _user_sessions_key(pubkey_hex: str) -> str:
@@ -71,9 +87,11 @@ async def create_session(redis: redis_async.Redis, pubkey_hex: str) -> Session:
     now = int(time.time())
     expires_at = now + SESSION_TTL_SECONDS
 
-    # Store the session forward-lookup with TTL.
+    digest = _token_digest(token)
+
+    # Store the session forward-lookup with TTL — ключем є ХЕШ токена.
     await redis.setex(
-        _session_key(token),
+        _session_key(digest),
         SESSION_TTL_SECONDS,
         pubkey_hex.encode("utf-8"),
     )
@@ -83,7 +101,7 @@ async def create_session(redis: redis_async.Redis, pubkey_hex: str) -> Session:
     # refreshed on each verify — so a naturally-expired session's token
     # doesn't linger in the index forever (it would otherwise accumulate
     # dead tokens and bloat Redis / slow revoke_all).
-    await redis.sadd(_user_sessions_key(pubkey_hex), token.encode("utf-8"))
+    await redis.sadd(_user_sessions_key(pubkey_hex), digest.encode("utf-8"))
     await redis.expire(_user_sessions_key(pubkey_hex), SESSION_TTL_SECONDS + 86400)
 
     return Session(token=token, pubkey_hex=pubkey_hex, expires_at=expires_at)
@@ -100,10 +118,24 @@ async def verify_session_token(
     if not token:
         return None
 
-    key = _session_key(token)
+    digest = _token_digest(token)
+    key = _session_key(digest)
     value = await redis.get(key)
+
     if value is None:
-        return None
+        # Легасі-fallback: сесія, створена до переходу на хешовані ключі.
+        # Знайшли — мігруємо на льоту (нова схема + чистка старих слідів).
+        legacy_key = _session_key(token)
+        value = await redis.get(legacy_key)
+        if value is None:
+            return None
+        pubkey_legacy = value.decode("utf-8")
+        async with redis.pipeline(transaction=True) as pipe:
+            pipe.setex(key, SESSION_TTL_SECONDS, value)
+            pipe.delete(legacy_key)
+            pipe.srem(_user_sessions_key(pubkey_legacy), token.encode("utf-8"))
+            pipe.sadd(_user_sessions_key(pubkey_legacy), digest.encode("utf-8"))
+            await pipe.execute()
 
     pubkey_hex = value.decode("utf-8")
 
@@ -125,18 +157,28 @@ async def revoke_session(redis: redis_async.Redis, token: str) -> bool:
 
     Returns True if the token existed and was deleted.
     """
-    key = _session_key(token)
+    digest = _token_digest(token)
+    key = _session_key(digest)
 
     # Look up the pubkey first so we can clean the reverse index.
     value = await redis.get(key)
     if value is None:
-        return False
+        # Легасі-сесія на старій схемі.
+        key = _session_key(token)
+        value = await redis.get(key)
+        if value is None:
+            return False
 
     pubkey_hex = value.decode("utf-8")
 
-    # Delete forward and reverse.
+    # Delete forward and reverse — прибираємо ОБИДВІ форми члена
+    # reverse-індексу, бо не знаємо, якого покоління ця сесія.
     deleted = await redis.delete(key)
-    await redis.srem(_user_sessions_key(pubkey_hex), token.encode("utf-8"))
+    await redis.srem(
+        _user_sessions_key(pubkey_hex),
+        token.encode("utf-8"),
+        digest.encode("utf-8"),
+    )
 
     # Розриваємо сокет САМЕ цієї сесії — інші пристрої користувача
     # лишаються підключеними (token задано, не None).
