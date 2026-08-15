@@ -13,12 +13,12 @@ import secrets
 import time
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 
 from ..config import get_settings
 from ..crypto import canonical_json, ed25519_verify
 from ..deps import CurrentSession, DBSession, RedisClient
-from ..models import LoginLog
+from ..models import LoginLog, User
 from ..rate_limit import rate_limit_by_ip
 from ..schemas import (
     AuthRequest,
@@ -82,6 +82,50 @@ def _extract_client_ip(request: Request) -> str:
     """
     from ..rate_limit import get_ip_from_request
     return get_ip_from_request(request)
+
+
+async def _reactivate_if_deleted(db: DBSession, pubkey_hex: str) -> bool:
+    """
+    Успішний вхід знімає позначку видалення, якщо вона стояла.
+
+    СЕМАНТИКА ВИДАЛЕННЯ: «видалити акаунт» = стерти дані на сервері
+    (звільнити username, знести бекапи, push-підписки, заповіти) і
+    відкликати сесії. Це НЕ надгробок на ключі.
+
+    Чому саме так. Особа в Morok — це пара ключів, згенерована на
+    пристрої; релей її не видає і не може «заборонити». Хто завгодно
+    робить нову мнемоніку за десять секунд, тож вічна заборона не
+    заважає зловмиснику взагалі, а карає лише того, хто передумав і
+    відновився зі старої фрази. Гірше: без цього виклику така людина
+    отримувала б акаунт, що мовчки поводиться як напів-видалений —
+    найнеприємніший клас багів, бо виглядає як поломка, а не як задум.
+
+    Повертається саме ПОРОЖНІЙ акаунт: username уже звільнено при
+    видаленні й міг бути зайнятий іншим, дані стерті. Тобто це
+    реєстрація наново тим самим ключем.
+
+    Best-effort, як і _record_login: збій тут не має валити вхід. У
+    найгіршому разі поведінка лишається такою, як була до цього патчу.
+    """
+    try:
+        pubkey_bytes = bytes.fromhex(pubkey_hex)
+        stmt = (
+            update(User)
+            .where(User.pubkey == pubkey_bytes)
+            .where(User.deleted_at.is_not(None))
+            .values(deleted_at=None, last_seen_at=int(time.time()))
+        )
+        result = await db.execute(stmt)
+        if result.rowcount:
+            logger.info(
+                "Reactivated previously deleted account %s on login",
+                pubkey_hex[:8],
+            )
+            return True
+        return False
+    except Exception as e:
+        logger.warning("Reactivate-on-login failed for %s: %s", pubkey_hex[:8], e)
+        return False
 
 
 async def _record_login(
@@ -210,6 +254,11 @@ async def verify_challenge(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="invalid_signature_or_stale_timestamp",
         )
+
+    # Якщо акаунт був позначений видаленим — вхід тим самим ключем
+    # знімає позначку (див. _reactivate_if_deleted). Робимо ДО видачі
+    # сесії, щоб не лишалося вікна «сесія є, а рядок ще видалений».
+    await _reactivate_if_deleted(db, body.pubkey_hex)
 
     # Issue session — returns a Session(token, pubkey_hex, expires_at)
     session = await create_session(redis, body.pubkey_hex)
