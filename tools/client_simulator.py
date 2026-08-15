@@ -382,7 +382,7 @@ class TestClient:
                         if frame.get("type") == "new" and frame.get("envelope", {}).get("envelope_id") == env2_id:
                             got_new = True
                             break
-                    except asyncio.TimeoutError:
+                    except TimeoutError:
                         continue
 
                 if got_new:

@@ -161,14 +161,22 @@ async def publish_group_gone(
     the event is lost — but that's fine, because clients also detect
     deleted groups lazily (GET /groups/{id} -> 404 on next open).
     """
+    # Одна пачка замість N послідовних publish: для великої групи це
+    # був ще один N-round-trip шлях (те саме сімейство, що depth-check
+    # у enqueue_envelope_for_recipients).
     event = _group_gone_event(group_id, by_pubkey_hex)
-    for pk in recipient_pubkeys_hex:
-        try:
-            await redis.publish(_inbox_channel(pk), event)
-        except Exception as e:
-            logger.warning(
-                "publish_group_gone failed for %s: %s", pk[:8], e,
-            )
+    if not recipient_pubkeys_hex:
+        return
+    try:
+        async with redis.pipeline(transaction=False) as pipe:
+            for pk in recipient_pubkeys_hex:
+                pipe.publish(_inbox_channel(pk), event)
+            await pipe.execute()
+    except Exception as e:
+        logger.warning(
+            "publish_group_gone failed for %d recipients: %s",
+            len(recipient_pubkeys_hex), e,
+        )
 
 
 async def publish_read_receipt(
@@ -392,21 +400,44 @@ async def enqueue_envelope_for_recipients(
     # inbox is already at the depth limit. Unlike the DM path we DON'T
     # refuse the whole send — other group members must still get the
     # message; only the flooded inbox is skipped.
+    # ЧОМУ PIPELINE. Раніше тут було ДВА послідовні await на КОЖНОГО
+    # одержувача (zremrangebyscore + zcard). Для групи на 500 осіб це
+    # 1000 послідовних round-trip до Redis у межах одного запиту на
+    # відправку повідомлення — латентність, що серіалізується на event
+    # loop і б'є по всьому релею. Тепер обидві операції для ВСІХ
+    # одержувачів ідуть однією пачкою: один round-trip замість 2×N.
     eligible: list[str] = []
-    for recipient in recipient_pubkeys_hex:
-        try:
-            await redis.zremrangebyscore(_inbox_key(recipient), 0, now)
-            if await redis.zcard(_inbox_key(recipient)) < MAX_INBOX_QUEUE_DEPTH:
+    try:
+        async with redis.pipeline(transaction=False) as pipe:
+            for recipient in recipient_pubkeys_hex:
+                pipe.zremrangebyscore(_inbox_key(recipient), 0, now)
+                pipe.zcard(_inbox_key(recipient))
+            depth_results = await pipe.execute()
+    except Exception as e:
+        # Fail-open, як і раніше: перевірка глибини — захист сховища, а не
+        # межа безпеки. Краще доставити, ніж мовчки загубити групову
+        # розсилку через блимок Redis.
+        logger.warning("group fan-out depth check failed (allowing all): %s", e)
+        depth_results = []
+
+    if depth_results:
+        # Результати йдуть парами (zremrangebyscore, zcard) у порядку
+        # одержувачів.
+        for idx, recipient in enumerate(recipient_pubkeys_hex):
+            zcard_result = depth_results[idx * 2 + 1]
+            if not isinstance(zcard_result, int):
+                # Помилка на цьому конкретному ключі — не караємо одержувача.
+                eligible.append(recipient)
+                continue
+            if zcard_result < MAX_INBOX_QUEUE_DEPTH:
                 eligible.append(recipient)
             else:
                 logger.warning(
                     "inbox full for %s — skipping in group fan-out",
                     recipient[:8],
                 )
-        except Exception as e:
-            # On a check error, skip this recipient rather than risk
-            # unbounded growth. They'll catch up via a later message.
-            logger.warning("queue-depth check failed for %s: %s", recipient[:8], e)
+    else:
+        eligible = list(recipient_pubkeys_hex)
 
     async with redis.pipeline(transaction=True) as pipe:
         pipe.set(

@@ -31,6 +31,7 @@ For v0.3 we keep federation minimal:
 from __future__ import annotations
 
 import base64
+import hashlib
 import logging
 import time
 import uuid
@@ -109,6 +110,17 @@ def _forward_message(envelope: dict, relay_pubkey_hex: str, forwarded_at: int) -
     })
 
 
+# ── Вікна свіжості для підписаних федеративних подій ──────────────────
+#
+# Раніше всі чотири типи подій мали спільне вікно 7 днів. Для delete
+# конкретного конверта це мало сенс (конверт міг довго йти через
+# офлайн-релей), але для group_gone — ні: тижневе вікно означало, що
+# валідно підписану «група померла» можна переграти будь-коли протягом
+# тижня. Розділяємо: дані — широке вікно, control-plane — вузьке.
+DELETE_SIG_WINDOW_SECONDS = 7 * 86400      # dm_delete / group_delete
+CONTROL_SIG_WINDOW_SECONDS = 3600          # group_gone
+
+
 def _verify_delete_sig(
     *,
     kind: str,
@@ -117,7 +129,7 @@ def _verify_delete_sig(
     sig_hex: str,
     signer_pubkey_hex: str,
     group_id: str | None = None,
-    ts_window_seconds: int = 7 * 86400,
+    ts_window_seconds: int = DELETE_SIG_WINDOW_SECONDS,
 ) -> bool:
     """
     Verify a sender's Ed25519 signature on a delete request that was
@@ -161,6 +173,77 @@ def _verify_delete_sig(
         return crypto.ed25519_verify(message, sig_bytes, pubkey_bytes)
     except Exception:  # noqa: BLE001 — verification failures must not 500
         return False
+
+
+async def _claim_federated_event(
+    redis,
+    *,
+    kind: str,
+    signer_pubkey_hex: str,
+    ts,
+    envelope_id: str = "",
+    group_id: str | None = None,
+    window_seconds: int = DELETE_SIG_WINDOW_SECONDS,
+) -> bool:
+    """
+    Anti-replay для підписаних федеративних подій.
+
+    ЧОМУ ЦЕ ІСНУЄ. Перевірки підпису недостатньо: підпис лишається
+    валідним стільки, скільки дозволяє вікно ts. Дедупу не було, тож
+    будь-яку валідно підписану ДЕСТРУКТИВНУ подію (group_gone,
+    dm_delete, group_delete_deliver) скомпрометований або зловмисний
+    trusted-peer міг переграти повторно — і клієнти локальних членів
+    знову зносили групу / знову втрачали конверт. Прочитати нічого не
+    можна, але цілісність стану ламається, і вікно було 7 днів.
+
+    Тепер кожна подія «витрачається» рівно один раз: ключ ставиться
+    через SET NX з TTL, рівним вікну підпису, тож повтор у межах вікна
+    не пройде, а після вікна його відсіче сама перевірка ts.
+
+    Ключ — хеш від (kind, signer, ts, envelope_id, group_id). Саме ці
+    поля підписані, тож зловмисник не може змінити жодне з них, не
+    зламавши підпис. Зберігаємо ХЕШ, а не самі значення: компрометація
+    Redis не розкриває, хто що видаляв.
+
+    Returns
+    -------
+    True  — подія нова, її щойно «застовпили», можна виконувати.
+    False — це повтор; викликач має відповісти ідемпотентним no-op і
+            НЕ публікувати подій у канали користувачів.
+
+    Fail-open при збої Redis: втрата доступності федерації гірша за
+    ризик повтору, який і так вимагає скомпрометованого довіреного peer.
+    """
+    fingerprint = hashlib.sha256(
+        "|".join([
+            kind,
+            signer_pubkey_hex or "",
+            str(ts),
+            envelope_id or "",
+            group_id or "",
+        ]).encode("utf-8")
+    ).hexdigest()
+
+    try:
+        claimed = await redis.set(
+            f"morok:fed_seen:{fingerprint}",
+            b"1",
+            nx=True,
+            ex=max(window_seconds, 60),
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "fed replay-guard unavailable (failing open) for %s: %s", kind, e,
+        )
+        return True
+
+    if not claimed:
+        logger.warning(
+            "REPLAY blocked: federated %s from %s... (ts=%s) already processed",
+            kind, (signer_pubkey_hex or "?")[:8], ts,
+        )
+        return False
+    return True
 
 
 async def _get_or_create_peer(
@@ -908,6 +991,18 @@ async def _handle_dm_delete_forward(envelope: dict, redis) -> "ForwardResponse":
             detail="invalid_delete_signature",
         )
 
+    # Anti-replay: подія витрачається один раз (див. _claim_federated_event).
+    if not await _claim_federated_event(
+        redis,
+        kind="dm_delete",
+        signer_pubkey_hex=caller_pubkey_hex,
+        ts=deleter_ts,
+        envelope_id=envelope_id,
+    ):
+        return ForwardResponse(
+            accepted=True, envelope_id=envelope_id, reason="duplicate_replay_noop",
+        )
+
     result = await delete_envelope_by_sender(
         redis=redis,
         envelope_id=envelope_id,
@@ -1049,6 +1144,20 @@ async def _handle_group_delete_to_host(
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="invalid_delete_signature",
+        )
+
+    # Anti-replay перед фан-аутом до інших релеїв: повтор інакше
+    # розсилався б усій федерації повторно.
+    if not await _claim_federated_event(
+        redis,
+        kind="group_delete",
+        signer_pubkey_hex=caller_pubkey_hex,
+        ts=deleter_ts,
+        envelope_id=envelope_id,
+        group_id=str(gid),
+    ):
+        return ForwardResponse(
+            accepted=True, envelope_id=envelope_id, reason="duplicate_replay_noop",
         )
 
     group = await _load_group(db, gid)
@@ -1232,6 +1341,20 @@ async def _handle_group_delete_deliver(
             detail="invalid_delete_signature",
         )
 
+    # Anti-replay: повтор інакше вдруге публікував би "deleted" у WS
+    # локальних членів.
+    if not await _claim_federated_event(
+        redis,
+        kind="group_delete_deliver",
+        signer_pubkey_hex=caller_pubkey_hex,
+        ts=deleter_ts,
+        envelope_id=envelope_id,
+        group_id=str(group_id_str),
+    ):
+        return ForwardResponse(
+            accepted=True, envelope_id=envelope_id, reason="duplicate_replay_noop",
+        )
+
     # ── Шар 1: господар. Подію deliver шле лише home_relay групи. ──
     group_stmt = select(Group).where(Group.id == gid)
     group = (await db.execute(group_stmt)).scalar_one_or_none()
@@ -1397,6 +1520,10 @@ async def _handle_group_gone(
         sig_hex=sig_hex,
         signer_pubkey_hex=by_pubkey_hex,
         group_id=group_id_str,
+        # Вузьке вікно: 7 днів мали сенс для delete конверта, що довго йшов
+        # через офлайн-релей. «Група померла» такої відстрочки не потребує,
+        # а тижневе вікно давало тижневий простір для повтору.
+        ts_window_seconds=CONTROL_SIG_WINDOW_SECONDS,
     ):
         logger.warning(
             "Rejected federated group_gone %s — bad signature from claimed creator %s",
@@ -1405,6 +1532,20 @@ async def _handle_group_gone(
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="invalid_group_gone_signature",
+        )
+
+    # Anti-replay: без цього валідно підписаний group_gone можна було
+    # переграти й змусити клієнти локальних членів знову знести групу.
+    if not await _claim_federated_event(
+        redis,
+        kind="group_gone",
+        signer_pubkey_hex=by_pubkey_hex,
+        ts=gone_ts,
+        group_id=group_id_str,
+        window_seconds=CONTROL_SIG_WINDOW_SECONDS,
+    ):
+        return ForwardResponse(
+            accepted=True, envelope_id=group_id_str, reason="duplicate_replay_noop",
         )
 
     # ── Шар 1: господар + Шар 2: творець — обидва проти НАШОЇ БД. ──
