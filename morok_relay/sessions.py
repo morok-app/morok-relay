@@ -114,7 +114,15 @@ async def create_session(redis: redis_async.Redis, pubkey_hex: str) -> Session:
     # doesn't linger in the index forever (it would otherwise accumulate
     # dead tokens and bloat Redis / slow revoke_all).
     await redis.sadd(_user_sessions_key(pubkey_hex), digest.encode("utf-8"))
-    await redis.expire(_user_sessions_key(pubkey_hex), SESSION_TTL_SECONDS + 86400)
+    # TTL reverse-індексу = АБСОЛЮТНА стеля + доба, не sliding-вікно.
+    # Інакше (стара помилка): forward-ключ ковзає при кожному verify, а
+    # reverse протухав через 8 днів БЕЗ освіження — і revoke_all
+    # (logout-everywhere, а головне delete /me) бачив ПОРОЖНЬО, лишаючи
+    # живі сесії видаленого акаунта. Reverse мусить жити не менше за
+    # найдовшу можливу сесію.
+    await redis.expire(
+        _user_sessions_key(pubkey_hex), SESSION_ABSOLUTE_MAX_SECONDS + 86400
+    )
 
     return Session(token=token, pubkey_hex=pubkey_hex, expires_at=expires_at)
 
@@ -170,10 +178,10 @@ async def verify_session_token(
 
     # Sliding window: every use extends TTL by full 7 days from now.
     await redis.expire(key, SESSION_TTL_SECONDS)
-    # Keep the reverse index alive alongside, so logout-everywhere stays
-    # accurate and the SET doesn't expire out from under an active user.
+    # Освіжаємо і reverse-індекс: він має переживати forward-ключ, щоб
+    # revoke_all завжди бачив усі живі сесії (див. коментар у create).
     await redis.expire(
-        _user_sessions_key(pubkey_hex), SESSION_TTL_SECONDS + 86400
+        _user_sessions_key(pubkey_hex), SESSION_ABSOLUTE_MAX_SECONDS + 86400
     )
 
     expires_at = int(time.time()) + SESSION_TTL_SECONDS
