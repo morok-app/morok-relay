@@ -130,3 +130,27 @@ async def test_revoke_publishes_ws_kill_event(redis):
     assert event["token_hash"] is None  # закрити ВСІ сокети
 
     await ch.aclose()
+
+
+async def test_reverse_index_survives_as_long_as_session(redis):
+    """
+    Reverse-індекс мусить жити ≥ найдовшої сесії. Стара помилка: forward
+    ковзав при кожному verify, а reverse протухав через 8 днів без
+    освіження — і revoke_all (logout-everywhere, delete /me) бачив
+    порожньо, лишаючи живі сесії видаленого акаунта.
+    """
+    s = await ss.create_session(redis, "cc" * 32)
+    rk = f"morok:user_sessions:{'cc' * 32}"
+    ttl_created = await redis.ttl(rk)
+    assert ttl_created > ss.SESSION_ABSOLUTE_MAX_SECONDS, \
+        "reverse коротший за стелю сесії — revoke_all осліпне"
+
+    # verify освіжає reverse так само, як forward
+    await redis.expire(rk, 100)
+    assert await ss.verify_session_token(redis, s.token) is not None
+    assert await redis.ttl(rk) > ss.SESSION_ABSOLUTE_MAX_SECONDS
+
+    # і revoke_all після цього справді бачить сесію
+    revoked = await ss.revoke_all_sessions(redis, "cc" * 32)
+    assert revoked == 1
+    assert await ss.verify_session_token(redis, s.token) is None
