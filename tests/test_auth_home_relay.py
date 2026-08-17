@@ -116,3 +116,46 @@ async def test_session_still_issued_on_foreign_relay(redis, db):
     assert resp.session_token and len(resp.session_token) == 64
     await db.execute(delete(LoginLog))
     await db.commit()
+
+
+# ── /me несе is_home_relay (для збережених сесій) ────────────────────────
+async def test_me_reports_foreign_home(redis, db):
+    """
+    Auth клієнт може не проходити до 30 днів (збережена сесія) — тож
+    «ти не вдома» мусить бути видно і в /me, який смикається при
+    кожному відкритті. Саме цей кейс зловили наживо: повторний вхід
+    honduras'а на relay2 НЕ дав non-home рядка в лозі, бо auth не
+    відбувався — сесія відновилась із localStorage.
+    """
+    from morok_relay.api.users import get_me
+    from morok_relay.sessions import Session
+
+    pk = b"\x55" * 32
+    db.add(User(pubkey=pk, username="roamer",
+                home_relay="relay-other.example.com",
+                tier=UserTier.FREE, last_seen_at=int(time.time()),
+                created_at=int(time.time())))
+    await db.commit()
+
+    session = Session(token="t" * 64, pubkey_hex=pk.hex(), expires_at=2**31)
+    me = await get_me(session, db)
+    assert me.is_home_relay is False
+    assert me.home_relay == "relay-other.example.com"
+    await db.commit()
+
+
+async def test_me_home_user_true(redis, db):
+    from morok_relay.api.users import get_me
+    from morok_relay.sessions import Session
+
+    settings = get_settings()
+    pk = b"\x66" * 32
+    db.add(User(pubkey=pk, home_relay=settings.relay_name,
+                tier=UserTier.FREE, last_seen_at=int(time.time()),
+                created_at=int(time.time())))
+    await db.commit()
+
+    me = await get_me(Session(token="t" * 64, pubkey_hex=pk.hex(),
+                              expires_at=2**31), db)
+    assert me.is_home_relay is True
+    await db.commit()

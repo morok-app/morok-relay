@@ -151,6 +151,11 @@ async def _remote_lookup_with_retry(relay: str, username: str) -> dict | None:
 # Helpers
 # ============================================================================
 
+def _is_home(user: User) -> bool:
+    """Дім акаунта == цей релей? (для MeInfo.is_home_relay)"""
+    return user.home_relay is None or user.home_relay == get_settings().relay_name
+
+
 async def _get_or_create_user(db: DBSession, pubkey_hex: str) -> User:
     settings = get_settings()
     pubkey_bytes = bytes.fromhex(pubkey_hex)
@@ -249,6 +254,7 @@ async def get_me(current: CurrentSession, db: DBSession) -> MeInfo:
         home_relay=user.home_relay,
         tier=user.tier.value,
         created_at=user.created_at,
+        is_home_relay=_is_home(user),
     )
 
 
@@ -274,6 +280,7 @@ async def claim_username(
             home_relay=user.home_relay,
             tier=user.tier.value,
             created_at=user.created_at,
+            is_home_relay=_is_home(user),
         )
 
     stmt = select(User).where(User.username == username)
@@ -322,6 +329,7 @@ async def claim_username(
         home_relay=user.home_relay,
         tier=user.tier.value,
         created_at=user.created_at,
+        is_home_relay=_is_home(user),
     )
 
 
