@@ -278,6 +278,24 @@ async def verify_challenge(
     # сесії, щоб не лишалося вікна «сесія є, а рядок ще видалений».
     await _reactivate_if_deleted(db, body.pubkey_hex)
 
+    # Дім акаунта — щоб клієнт міг попередити про логін «не туди»
+    # (auth сесію видає будь-де, але inbox живе лише на home_relay).
+    # ВАЖЛИВО: existing-рядок НЕ чіпаємо і НЕ створюємо — auth не має
+    # права «всиновлювати» чужого користувача; рядок з home_relay=наш
+    # створюється рівно там, де й раніше (_get_or_create_user на
+    # перших діях). Тут — тільки читання.
+    settings = get_settings()
+    row = (await db.execute(
+        select(User.home_relay).where(User.pubkey == bytes.fromhex(body.pubkey_hex))
+    )).scalar_one_or_none()
+    account_home = row if row else None
+    is_home = account_home is None or account_home == settings.relay_name
+    if not is_home:
+        logger.info(
+            "Login to non-home relay: %s... home=%s here=%s",
+            body.pubkey_hex[:8], account_home, settings.relay_name,
+        )
+
     # Issue session — returns a Session(token, pubkey_hex, expires_at)
     session = await create_session(redis, body.pubkey_hex)
 
@@ -290,6 +308,8 @@ async def verify_challenge(
         session_token=session.token,
         expires_at=session.expires_at,
         pubkey_hex=session.pubkey_hex,
+        home_relay=account_home,
+        is_home_relay=is_home,
     )
 
 
