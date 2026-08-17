@@ -13,6 +13,8 @@ from __future__ import annotations
 import logging
 import time
 
+import asyncio
+
 import httpx
 
 from . import crypto
@@ -47,6 +49,82 @@ def _is_public_ip(ip_str: str) -> bool:
         ip.is_private or ip.is_loopback or ip.is_link_local
         or ip.is_multicast or ip.is_reserved or ip.is_unspecified
     )
+
+
+async def resolve_pinned_peer(hostname: str) -> str | None:
+    """
+    Резолвить hostname, валідує ВСІ адреси як публічні й повертає ОДНУ
+    перевірену адресу для pin-to-IP підключення.
+
+    ЧОМУ (аудит зовн. №2, П.8 — DNS rebinding TOCTOU). Стара схема:
+    getaddrinfo → перевірили IP → httpx конектиться ЗА HOSTNAME, тобто
+    робить ДРУГИЙ resolve. Attacker-controlled DNS міг відповісти двічі
+    по-різному: перша відповідь публічна (guard пропустив), друга —
+    127.0.0.1/169.254.169.254 (запит пішов у внутрішню мережу). Тепер
+    з'єднання йде саме на ту адресу, яку перевірили; другого resolve
+    не існує.
+
+    Заодно: getaddrinfo синхронний і раніше викликався прямо в async-
+    потоці — повільний DNS блокував увесь event loop. Тепер у to_thread.
+
+    Fail closed: будь-яка помилка/приватна адреса → None.
+    """
+    if not hostname or not _HOSTNAME_RE.match(hostname):
+        return None
+    try:
+        infos = await asyncio.to_thread(
+            socket.getaddrinfo, hostname, 443, proto=socket.IPPROTO_TCP,
+        )
+    except (socket.gaierror, UnicodeError, OSError):
+        return None
+    if not infos:
+        return None
+    ips = []
+    for info in infos:
+        ip_str = info[4][0]
+        if not _is_public_ip(ip_str):
+            return None          # хоч одна приватна — відмова повністю
+        ips.append(ip_str)
+    return ips[0]
+
+
+async def _pinned_post(
+    hostname: str, path: str, payload: dict,
+) -> httpx.Response | None:
+    """
+    POST на peer із pin-to-IP: TCP — на перевірену адресу, TLS SNI і
+    верифікація сертифіката — за hostname (httpx-розширення
+    sni_hostname), Host-заголовок — hostname. Повертає Response або
+    None, якщо host небезпечний.
+    """
+    ip = await resolve_pinned_peer(hostname)
+    if ip is None:
+        logger.warning("Blocked federation call to unsafe host: %r", hostname)
+        return None
+    # IPv6 у URL — в квадратних дужках
+    host_for_url = f"[{ip}]" if ":" in ip else ip
+    url = f"https://{host_for_url}{path}"
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
+        return await client.post(
+            url, json=payload,
+            headers={"Host": hostname},
+            extensions={"sni_hostname": hostname},
+        )
+
+
+async def _pinned_get(hostname: str, path: str) -> httpx.Response | None:
+    ip = await resolve_pinned_peer(hostname)
+    if ip is None:
+        logger.warning("Blocked federation call to unsafe host: %r", hostname)
+        return None
+    host_for_url = f"[{ip}]" if ":" in ip else ip
+    url = f"https://{host_for_url}{path}"
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
+        return await client.get(
+            url,
+            headers={"Host": hostname},
+            extensions={"sni_hostname": hostname},
+        )
 
 
 def is_safe_peer_hostname(hostname: str) -> bool:
@@ -96,15 +174,14 @@ async def remote_handshake(peer_hostname: str) -> dict | None:
         "timestamp": timestamp,
         "signature_hex": signature.hex(),
     }
-    url = f"https://{peer_hostname}/api/v1/federation/handshake"
-    if not is_safe_peer_hostname(peer_hostname):
-        logger.warning("Blocked federation call to unsafe host: %r", peer_hostname)
-        return None
     try:
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
-            response = await client.post(url, json=payload)
-            response.raise_for_status()
-            return response.json()
+        response = await _pinned_post(
+            peer_hostname, "/api/v1/federation/handshake", payload,
+        )
+        if response is None:
+            return None
+        response.raise_for_status()
+        return response.json()
     except httpx.HTTPError as e:
         logger.warning("Handshake to %s failed: %s", peer_hostname, e)
         return None
@@ -138,13 +215,12 @@ async def remote_forward(peer_hostname: str, envelope: dict) -> dict | None:
         "relay_signature_hex": signature.hex(),
         "forwarded_at": forwarded_at,
     }
-    url = f"https://{peer_hostname}/api/v1/federation/forward"
-    if not is_safe_peer_hostname(peer_hostname):
-        logger.warning("Blocked federation call to unsafe host: %r", peer_hostname)
-        return None
     try:
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
-            response = await client.post(url, json=payload)
+        response = await _pinned_post(
+            peer_hostname, "/api/v1/federation/forward", payload,
+        )
+        if response is None:
+            return None
             response.raise_for_status()
             return response.json()
     except httpx.HTTPError as e:
@@ -154,17 +230,16 @@ async def remote_forward(peer_hostname: str, envelope: dict) -> dict | None:
 
 async def remote_lookup(peer_hostname: str, username: str) -> dict | None:
     """Look up a username on a remote relay. Public API, no signing needed."""
-    url = f"https://{peer_hostname}/api/v1/federation/users/lookup/{username}"
-    if not is_safe_peer_hostname(peer_hostname):
-        logger.warning("Blocked federation call to unsafe host: %r", peer_hostname)
-        return None
     try:
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
-            response = await client.get(url)
-            if response.status_code == 404:
-                return None
-            response.raise_for_status()
-            return response.json()
+        response = await _pinned_get(
+            peer_hostname, f"/api/v1/federation/users/lookup/{username}",
+        )
+        if response is None:
+            return None
+        if response.status_code == 404:
+            return None
+        response.raise_for_status()
+        return response.json()
     except httpx.HTTPError as e:
         logger.warning("Lookup on %s failed: %s", peer_hostname, e)
         return None
@@ -206,17 +281,16 @@ async def remote_pull_group_snapshot(
         "relay_signature_hex": signature.hex(),
         "timestamp": timestamp,
     }
-    url = f"https://{peer_hostname}/api/v1/federation/group_snapshot/pull"
-    if not is_safe_peer_hostname(peer_hostname):
-        logger.warning("Blocked federation call to unsafe host: %r", peer_hostname)
-        return None
     try:
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
-            response = await client.post(url, json=payload)
-            if response.status_code == 404:
-                return None
-            response.raise_for_status()
-            return response.json()
+        response = await _pinned_post(
+            peer_hostname, "/api/v1/federation/group_snapshot/pull", payload,
+        )
+        if response is None:
+            return None
+        if response.status_code == 404:
+            return None
+        response.raise_for_status()
+        return response.json()
     except httpx.HTTPError as e:
         logger.warning("Pull snapshot from %s failed: %s", peer_hostname, e)
         return None

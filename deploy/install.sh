@@ -346,7 +346,11 @@ StartLimitBurst=3
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=${INSTALL_DIR} /var/lib/morok
+# ЗВУЖЕНО (аудит зовн. №2, П.11): раніше тут був увесь \${INSTALL_DIR} —
+# тобто процес міг писати у ВЛАСНИЙ python-код і .env. Після RCE це
+# готовий persistence: переписав файл → дочекався рестарту. Тепер код,
+# venv і .env для процесу read-only; писати можна лише в дані.
+ReadWritePaths=/var/lib/morok
 PrivateTmp=true
 PrivateDevices=true
 ProtectKernelTunables=true
@@ -382,6 +386,23 @@ WorkingDirectory=${INSTALL_DIR}
 EnvironmentFile=${INSTALL_DIR}/.env
 ExecStart=${INSTALL_DIR}/.venv/bin/python -m morok_relay.scripts.${module}
 SyslogIdentifier=morok-${name}
+# Той самий hardening, що й у основного сервісу (аудит зовн. №2, П.11):
+# воркери читають той самий .env з ключами і ходять у ту саму БД, але
+# раніше не мали ЖОДНОГО із цих обмежень.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/morok
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
 EOF
   if [[ "$interval" == "true" ]]; then
     cat > "/etc/systemd/system/morok-${name}.timer" <<EOF
@@ -516,39 +537,23 @@ server {
     }
 }
 
+# HTTP-ФАЗА НАВМИСНО ПОРОЖНЯ (аудит зовн. №2, П.10). Стара версія
+# проксіювала весь API на :80 «щоб certbot пройшов» — але якщо certbot
+# падав (DNS не готовий, ліміти Let's Encrypt), installer лише
+# попереджав і ЛИШАВ повноцінний API з bearer-сесіями на голому HTTP.
+# Тепер до отримання сертифіката порт 80 віддає тільки ACME-челендж і
+# /health; решта — 503. Після certbot --redirect цей блок замінюється
+# на HTTPS-конфіг із редіректом.
 server {
     listen 80;
     server_name ${DOMAIN};
 
     location /.well-known/acme-challenge/ { root /var/www/certbot; }
-
-    location /ws/ {
-        # WebSocket отримує session token у query-рядку, а стандартний
-        # access_log пише \$request разом з URI — тобто робочий bearer
-        # осідав би у файлі лога. Вимикаємо лог саме для /ws/.
-        access_log off;
+    location = /health {
         proxy_pass http://morok_backend_${DOMAIN//./_};
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
         proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        # Явно порожній: інакше clearnet-клієнт надішле свій
-        # "X-Morok-Via: tor" і потрапить у спільний onion-бакет,
-        # обійшовши власний ліміт по IP.
-        proxy_set_header X-Morok-Via "";
-        proxy_read_timeout 3600s;
     }
-
-    location / {
-        proxy_pass http://morok_backend_${DOMAIN//./_};
-        proxy_http_version 1.1;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_set_header X-Morok-Via "";
-    }
+    location / { return 503; }
 }
 EOF
 ln -sf "/etc/nginx/sites-available/morok-${DOMAIN}" "/etc/nginx/sites-enabled/morok-${DOMAIN}"
@@ -559,14 +564,109 @@ ok "nginx serving ${DOMAIN} on :80"
 # 14. TLS certificate
 # ===========================================================================
 step "Obtaining TLS certificate"
+# СХЕМА (аудит зовн. №2, П.10): certonly --webroot замість --nginx.
+# --nginx редагував би наш bootstrap-конфіг (де API навмисно 503) і
+# скопіював 503 у HTTPS. Натомість: сертифікат окремо, фінальний конфіг
+# (80 = ACME+redirect, 443 = повний API) пишемо самі й ДЕТЕРМІНОВАНО.
+# Якщо certbot падає — bootstrap лишається, тобто API не світиться на
+# HTTP ані секунди; це і є суть фікса.
+write_tls_nginx_config() {
+  # Фінальний конфіг збираємо З НУЛЯ, включно з tor-listener'ом —
+  # жодних sed-правок bootstrap'а, стан детермінований.
+  cat > "/etc/nginx/sites-available/morok-${DOMAIN}" <<NGINXEOF
+upstream morok_backend_${DOMAIN//./_} {
+    server 127.0.0.1:8000;
+    keepalive 32;
+}
+
+# Tor onion listener — див. коментар у попередній версії: onion-трафік
+# мусить іти через nginx, інакше 127.0.0.1 вважається довіреним проксі
+# і X-Real-IP можна підробити.
+server {
+    listen 127.0.0.1:8081;
+    location /ws/ {
+        access_log off;
+        proxy_pass http://morok_backend_${DOMAIN//./_};
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$remote_addr;
+        proxy_set_header X-Morok-Via tor;
+        proxy_read_timeout 3600s;
+    }
+    location / {
+        proxy_pass http://morok_backend_${DOMAIN//./_};
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$remote_addr;
+        proxy_set_header X-Morok-Via tor;
+    }
+}
+
+server {
+    listen 80;
+    server_name ${DOMAIN};
+    location /.well-known/acme-challenge/ { root /var/www/certbot; }
+    location / { return 301 https://\$host\$request_uri; }
+}
+
+server {
+    listen 443 ssl http2;
+    server_name ${DOMAIN};
+
+    ssl_certificate     /etc/letsencrypt/live/${DOMAIN}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${DOMAIN}/privkey.pem;
+    include /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+
+    add_header Strict-Transport-Security "max-age=31536000" always;
+
+    location /ws/ {
+        # session token їде в query — не пишемо його в access_log
+        access_log off;
+        proxy_pass http://morok_backend_${DOMAIN//./_};
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        # Явно порожній: clearnet-клієнт не має потрапити в onion-бакет
+        proxy_set_header X-Morok-Via "";
+        proxy_read_timeout 3600s;
+    }
+
+    location / {
+        proxy_pass http://morok_backend_${DOMAIN//./_};
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Morok-Via "";
+    }
+}
+NGINXEOF
+  nginx -t && systemctl reload nginx
+}
+
 if curl -fsS --max-time 5 "http://${DOMAIN}/health" >/dev/null 2>&1; then
-  certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos -m "$EMAIL" --redirect \
-    && ok "HTTPS enabled for ${DOMAIN}" \
-    || warn "certbot failed — fix DNS, then run: certbot --nginx -d ${DOMAIN}"
+  if certbot certonly --webroot -w /var/www/certbot -d "$DOMAIN" \
+       --non-interactive --agree-tos -m "$EMAIL" \
+       --deploy-hook "systemctl reload nginx"; then
+    write_tls_nginx_config \
+      && ok "HTTPS enabled for ${DOMAIN} (HTTP redirects, API is TLS-only)" \
+      || warn "cert obtained but nginx config write failed — check nginx -t"
+  else
+    warn "certbot failed — API stays LOCKED on :80 (ACME+health only)."
+    warn "Fix DNS, then: certbot certonly --webroot -w /var/www/certbot -d ${DOMAIN} -m ${EMAIL} --agree-tos"
+    warn "and re-run this installer (re-runnable) to write the TLS config."
+  fi
 else
-  warn "DNS for ${DOMAIN} does not point here yet."
-  warn "Add an A-record → this server's IP, then run:"
-  warn "    certbot --nginx -d ${DOMAIN} --agree-tos -m ${EMAIL} --redirect"
+  warn "DNS for ${DOMAIN} does not point here yet. API stays LOCKED on :80."
+  warn "Add an A-record → this server's IP, then re-run this installer."
 fi
 
 # ===========================================================================
