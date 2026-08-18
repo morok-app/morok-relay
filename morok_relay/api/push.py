@@ -13,14 +13,17 @@ from __future__ import annotations
 
 import logging
 import time
+from urllib.parse import urlsplit
 
 from fastapi import APIRouter, HTTPException, status
-from pydantic import BaseModel, Field
-from sqlalchemy import delete, select
+from pydantic import BaseModel, Field, field_validator
+from sqlalchemy import delete, func, select
 
 from ..config import get_settings
-from ..deps import CurrentSession, DBSession
+from ..deps import CurrentSession, DBSession, RedisClient
+from ..federation_client import resolve_pinned_peer
 from ..models import PushSubscription
+from ..rate_limit import check_rate_limit
 
 logger = logging.getLogger(__name__)
 
@@ -46,10 +49,61 @@ class PushKeys(BaseModel):
     auth: str = Field(..., min_length=1, max_length=255)
 
 
+# Реальні провайдери web push, з якими має справу браузерний PushManager.
+# Endpoint від будь-якого іншого хоста — не «ще один провайдер», а
+# довільна URL, куди relay зробить authenticated POST на наш кошт.
+_ALLOWED_PUSH_HOST_SUFFIXES = (
+    ".push.services.mozilla.com",
+    ".notify.windows.com",
+    "fcm.googleapis.com",
+    "android.googleapis.com",
+    "web.push.apple.com",
+)
+
+
 class PushSubscribeRequest(BaseModel):
     endpoint: str = Field(..., min_length=1, max_length=4096)
     keys: PushKeys
     user_agent: str | None = Field(default=None, max_length=255)
+
+    @field_validator("endpoint")
+    @classmethod
+    def _endpoint_must_be_known_push_provider(cls, v: str) -> str:
+        """
+        Аудит зовн. №3, HIGH — authenticated SSRF + DoS-amplifier.
+
+        endpoint приймався як довільний рядок до 4096 символів без
+        перевірки схеми/host/IP. pywebpush пізніше робить на нього
+        звичайний HTTP POST — тобто залогінений користувач міг змусити
+        релей стукати куди завгодно, включно з внутрішньою мережею
+        (blind SSRF), якщо egress окремо не відфільтрований.
+
+        Дозволяємо ЛИШЕ https на відомі хости push-провайдерів. Це не
+        рівень захисту "приблизно" — браузерний PushManager фізично не
+        видає endpoint поза цим списком, тож звуження нічого легітимного
+        не ламає.
+        """
+        try:
+            parsed = urlsplit(v)
+        except ValueError:
+            raise ValueError("malformed endpoint URL")
+        if parsed.scheme != "https" or not parsed.hostname:
+            raise ValueError("endpoint must be an https:// URL")
+        host = parsed.hostname.lower()
+        if not any(
+            host == suf.lstrip(".") or host.endswith(suf)
+            for suf in _ALLOWED_PUSH_HOST_SUFFIXES
+        ):
+            raise ValueError("endpoint host is not a recognized push provider")
+        return v
+
+
+# Максимум підписок на акаунт. Без цього один pubkey міг накопичити
+# необмежену кількість рядків (усі "легітимні" за схемою — allowlist
+# перевіряє ТІЛЬКИ host, а не унікальність): кожна подальша push-подія
+# фан-аутиться на весь список, отже необмежена кількість = необмежений
+# амплiфікований трафік з relay на push-провайдери за одну вхідну подію.
+MAX_PUSH_SUBSCRIPTIONS_PER_ACCOUNT = 10
 
 
 @router.post(
@@ -60,12 +114,24 @@ async def post_subscribe(
     body: PushSubscribeRequest,
     current: CurrentSession,
     db: DBSession,
+    redis: RedisClient,
 ) -> dict:
     settings = get_settings()
     if not settings.vapid_public_key_b64:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="push_not_configured",
+        )
+
+    # Rate limit: ендпоінт раніше не мав ЖОДНОГО обмеження.
+    allowed, _, retry_after = await check_rate_limit(
+        redis, "push_subscribe", current.pubkey_hex, limit_per_minute=10,
+    )
+    if not allowed:
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="rate_limited",
+            headers={"Retry-After": str(retry_after)},
         )
 
     pubkey = bytes.fromhex(current.pubkey_hex)
@@ -87,6 +153,16 @@ async def post_subscribe(
             existing.user_agent = body.user_agent[:255]
         await db.flush()
         return {"ok": True, "created": False}
+
+    count = (await db.execute(
+        select(func.count()).select_from(PushSubscription)
+        .where(PushSubscription.pubkey == pubkey)
+    )).scalar_one()
+    if count >= MAX_PUSH_SUBSCRIPTIONS_PER_ACCOUNT:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail="too_many_push_subscriptions",
+        )
 
     sub = PushSubscription(
         pubkey=pubkey,

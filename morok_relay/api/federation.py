@@ -47,7 +47,7 @@ from ..deps import DBSession, RedisClient
 from ..models import FederationPeer, Group, GroupMember, User
 from ..queue import enqueue_envelope, enqueue_envelope_for_recipients, envelope_exists
 from ..rate_limit import rate_limit_by_ip
-from ..push_sender import trigger_push
+from ..push_sender import schedule_push
 
 logger = logging.getLogger(__name__)
 
@@ -530,7 +530,16 @@ async def _forward_impl(
 
     stmt = select(User).where(User.pubkey == recipient_pubkey)
     recipient = (await db.execute(stmt)).scalar_one_or_none()
-    if recipient is None or recipient.home_relay != settings.relay_name:
+    if (
+        recipient is None
+        or recipient.home_relay != settings.relay_name
+        # Аудит зовн. №3, MEDIUM: group-шлях цю умову вже мав, DM-шлях —
+        # ні. Без неї trusted federation peer міг після видалення
+        # акаунта знову покласти blob/queue дані на видалений pubkey
+        # (акаунт видаляється, але pubkey лишається технічно вільним
+        # для запису, доки хтось не переісконструє User-рядок).
+        or recipient.deleted_at is not None
+    ):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="recipient_not_on_this_relay",
@@ -601,14 +610,11 @@ async def _forward_impl(
 
     # Best-effort push for the local recipient (sender side already pushed
     # any of its own local users; here we cover ours).
-    try:
-        await trigger_push(
-            db=db, redis=redis,
-            recipient_pubkeys_hex=[body.envelope["to"]],
-            sender_username=body.envelope.get("from_username"),
-        )
-    except Exception as e:
-        logger.warning("trigger_push (federation DM) failed: %s", e)
+    schedule_push(
+        redis=redis,
+        recipient_pubkeys_hex=[body.envelope["to"]],
+        sender_username=body.envelope.get("from_username"),
+    )
 
     return ForwardResponse(accepted=True, envelope_id=envelope_id)
 
@@ -879,15 +885,12 @@ async def _handle_group_forward(
     )
     # Push fanout to local offline members. The peer relay (sender side)
     # already pushed its own local members; we cover ours.
-    try:
-        await trigger_push(
-            db=db, redis=redis,
-            recipient_pubkeys_hex=known_local,
-            sender_username=envelope.get("from_username"),
-            group_id=str(gid),
-        )
-    except Exception as e:
-        logger.warning("trigger_push (federation group deliver) failed: %s", e)
+    schedule_push(
+        redis=redis,
+        recipient_pubkeys_hex=known_local,
+        sender_username=envelope.get("from_username"),
+        group_id=str(gid),
+    )
     logger.info(
         "Group forward deliver %s: enqueued for %d local recipients",
         envelope_id[:8], len(known_local),

@@ -38,7 +38,7 @@ from .. import blob_storage
 from ..config import get_settings
 from ..deps import CurrentSession, DBSession, RedisClient
 from ..models import InboxToken, User
-from ..push_sender import trigger_push
+from ..push_sender import schedule_push
 from ..queue import (
     delete_sealed_envelope,
     enqueue_envelope,
@@ -266,14 +266,11 @@ async def send_sealed_envelope(
     if expires_at is None:
         return SealedAck(envelope_id=envelope_id, queued=False, expires_at=0)
 
-    try:
-        await trigger_push(
-            db=db, redis=redis,
-            recipient_pubkeys_hex=[body.to],
-            sender_username=None,      # generic push, нуль метаданих
-        )
-    except Exception as e:
-        logger.warning("trigger_push (sealed) failed: %s", e)
+    schedule_push(
+        redis=redis,
+        recipient_pubkeys_hex=[body.to],
+        sender_username=None,      # generic push, нуль метаданих
+    )
 
     return SealedAck(
         envelope_id=envelope_id, queued=True, expires_at=expires_at,

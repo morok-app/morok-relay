@@ -29,7 +29,7 @@ from sqlalchemy.exc import IntegrityError
 from ..config import get_settings
 from ..deps import CurrentSession, DBSession, RedisClient
 from ..rate_limit import rate_limit_by_ip
-from ..federation_client import remote_lookup
+from ..federation_client import LookupOutcome, remote_lookup
 from ..models import FederationPeer, User, UsernameHistory, UserTier
 from ..schemas import (
     MeInfo,
@@ -111,13 +111,23 @@ async def _set_lookup_cache(redis, relay: str, username: str, data: dict) -> Non
 
 async def _remote_lookup_with_retry(relay: str, username: str) -> dict | None:
     """
-    Try remote_lookup up to 3 times with backoff. Returns:
-    - dict with user info on success
-    - None on network failure (all attempts failed)
-    - {"__not_found": True} marker if peer responded but said "no such user"
+    Try remote_lookup up to 3 times with backoff, but ONLY retries on
+    genuine transient failures — a real 404 stops immediately.
 
-    The marker is to distinguish between "peer is down" (None) and "peer
-    says user doesn't exist" — the latter shouldn't trigger 503.
+    Returns:
+    - dict with user info on success
+    - None on exhausted retries (peer stayed unreachable) — caller
+      treats this as "unknown, try again later" (503), NOT "no such user"
+    - {"__not_found": True} marker if peer explicitly said "no such user"
+
+    ВИПРАВЛЕНО (аудит зовн. №3, MEDIUM): раніше remote_lookup повертав
+    голий None і на справжній 404, і на мережевий збій — ця функція не
+    могла їх розрізнити (код сам це визнавав коментарем "we can't tell
+    from here") і трактувала БУДЬ-ЯКИЙ збій як підтверджену відсутність
+    користувача, ставлячи негативний кеш на основі тимчасово мертвого
+    peer. Тепер remote_lookup повертає typed LookupOutcome: NOT_FOUND
+    зупиняє ретраї одразу (це не помилка, а відповідь), TRANSIENT_ERROR
+    ретраїться як і раніше.
     """
     last_err: Exception | None = None
 
@@ -125,15 +135,13 @@ async def _remote_lookup_with_retry(relay: str, username: str) -> dict | None:
         if delay > 0:
             await asyncio.sleep(delay)
         try:
-            result = await remote_lookup(relay, username)
-            if result is None:
-                # remote_lookup returns None on 404 OR HTTP error — we
-                # can't tell from here. But its httpx wrapper only logs
-                # warnings on real errors. For now, treat None as "no user".
-                # In a more robust impl we'd extend remote_lookup to
-                # distinguish these two cases.
+            outcome, data = await remote_lookup(relay, username)
+            if outcome is LookupOutcome.FOUND:
+                return data
+            if outcome is LookupOutcome.NOT_FOUND:
+                # Peer explicitly answered — це не привід ретраїти.
                 return {"__not_found": True}
-            return result
+            # TRANSIENT_ERROR: падаємо в цикл ретраю нижче.
         except Exception as e:
             last_err = e
             logger.info(

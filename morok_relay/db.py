@@ -85,7 +85,9 @@ async def init_redis() -> None:
 
     # Validate connection now, not at first use
     await _redis.ping()
-    logger.info("Redis connected: %s", settings.redis_url)
+    # Аудит зовн. №3, MEDIUM: DSN Postgres тут редагувався, Redis URL —
+    # ні. redis://user:пароль@host потрапляв у journald повністю.
+    logger.info("Redis connected: %s", _redact_dsn(settings.redis_url))
 
 
 async def close_db() -> None:

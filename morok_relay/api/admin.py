@@ -184,7 +184,11 @@ async def admin_logout(
     if authorization:
         _, _, token = authorization.partition(" ")
         if token:
-            await redis.delete(f"{_ADMIN_TOKEN_PREFIX}{token.strip()}")
+            # Було: видалявся ключ f"{prefix}{СИРИЙ token}", а login/verify
+            # зберігають f"{prefix}{SHA256(token)}" (аудит зовн. №3,
+            # MEDIUM — logout був фейковим: відповідав revoked:true, але
+            # реальний токен лишався живим до TTL 1 год).
+            await redis.delete(f"{_ADMIN_TOKEN_PREFIX}{_admin_token_digest(token.strip())}")
     return {"revoked": True}
 
 
@@ -193,28 +197,27 @@ async def admin_logout(
 # ============================================================================
 
 async def _ping_relay(hostname: str) -> dict:
-    # Hostnames come from federation_peers (operator-managed), but keep
-    # the same SSRF guard as every other outbound federation call — a
-    # row planted via a malicious handshake hostname must not turn the
-    # admin dashboard into an internal-network prober.
-    from ..federation_client import is_safe_peer_hostname
-    if not is_safe_peer_hostname(hostname):
-        return {"hostname": hostname, "up": False, "latency_ms": None,
-                "version": None}
-    url = f"https://{hostname}/health"
+    """
+    ЗАМІНЕНО на _pinned_get (аудит зовн. №3, MEDIUM). Було: check
+    is_safe_peer_hostname() → окремий httpx.AsyncClient().get(url), тобто
+    ДРУГИЙ DNS resolve під час фактичного з'єднання — той самий
+    rebinding TOCTOU, що ми вже закрили в federation_client.py, просто
+    в іншому файлі. _pinned_get конектиться саме на перевірену адресу
+    (TLS SNI/verify лишається за іменем).
+    """
+    from ..federation_client import _pinned_get
     t0 = time.monotonic()
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            r = await client.get(url)
-            latency_ms = round((time.monotonic() - t0) * 1000, 1)
-            if r.status_code == 200:
-                data = r.json()
-                return {
-                    "hostname": hostname,
-                    "up": True,
-                    "latency_ms": latency_ms,
-                    "version": data.get("version"),
-                }
+        r = await _pinned_get(hostname, "/health")
+        latency_ms = round((time.monotonic() - t0) * 1000, 1)
+        if r is not None and r.status_code == 200:
+            data = r.json()
+            return {
+                "hostname": hostname,
+                "up": True,
+                "latency_ms": latency_ms,
+                "version": data.get("version"),
+            }
     except Exception:
         pass
     return {"hostname": hostname, "up": False, "latency_ms": None, "version": None}

@@ -317,12 +317,9 @@ async def send_internal(
     if expires is None:
         return {"status": "duplicate"}
 
-    try:
-        from ..push_sender import trigger_push
-        await trigger_push(db, redis, [bytes(row.owner_pubkey).hex()],
-                           sender_username=None, kind="mail")
-    except Exception as e:
-        logger.warning("mail push (internal) failed: %s", e)
+    from ..push_sender import schedule_push
+    schedule_push(redis, [bytes(row.owner_pubkey).hex()],
+                  sender_username=None, kind="mail")
 
     logger.info("mail: internal send delivered")
     return {"status": "sent"}

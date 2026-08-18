@@ -184,6 +184,66 @@ def _send_fcm_blocking(token: str) -> str:
         return "error"
 
 
+def schedule_push(
+    redis,
+    recipient_pubkeys_hex: list[str],
+    *,
+    sender_username: str | None,
+    group_id: str | None = None,
+    kind: str | None = None,
+) -> None:
+    """
+    Fire-and-forget обгортка над trigger_push (аудит зовн. №3, HIGH).
+
+    Кожен виклик `await trigger_push(...)` у api/ стояв на critical
+    path запиту — попри власний докстрінг trigger_push, що прямо каже
+    "caller must never await this". webpush() б'є на endpoint зовнішнім
+    HTTP-запитом; клієнт, що відправляє повідомлення, чекав на цю
+    мережеву round-trip перш ніж отримати підтвердження власної
+    відправки.
+
+    НЕ приймає db-сесію ззовні: FastAPI-шний DBSession — request-scoped
+    і закривається одразу після відповіді. Передати його в
+    create_task() означало б, що фонова задача працює з СЕСІЄЮ ПІСЛЯ
+    ЇЇ ЗАКРИТТЯ — гонка з фіналізацією запиту й падіння на закритому
+    з'єднанні. Замість цього відкриваємо ОКРЕМУ сесію з того самого
+    _session_factory, яким користується deps.get_session, — з чітким
+    життєвим циклом, прив'язаним до самої задачі.
+    """
+    task = asyncio.create_task(_run_push_in_own_session(
+        redis, recipient_pubkeys_hex,
+        sender_username=sender_username, group_id=group_id, kind=kind,
+    ))
+    task.add_done_callback(_log_push_task_error)
+
+
+async def _run_push_in_own_session(
+    redis,
+    recipient_pubkeys_hex: list[str],
+    *,
+    sender_username: str | None,
+    group_id: str | None,
+    kind: str | None,
+) -> None:
+    from .db import _session_factory
+    if _session_factory is None:
+        logger.warning("schedule_push: db not initialized, dropping push")
+        return
+    async with _session_factory() as db:
+        await trigger_push(
+            db, redis, recipient_pubkeys_hex,
+            sender_username=sender_username, group_id=group_id, kind=kind,
+        )
+
+
+def _log_push_task_error(task: "asyncio.Task") -> None:
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.warning("Background push task failed: %s", exc)
+
+
 async def trigger_push(
     db: AsyncSession,
     redis,

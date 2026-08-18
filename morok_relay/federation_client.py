@@ -14,6 +14,7 @@ import logging
 import time
 
 import asyncio
+import enum
 
 import httpx
 
@@ -221,28 +222,47 @@ async def remote_forward(peer_hostname: str, envelope: dict) -> dict | None:
         )
         if response is None:
             return None
-            response.raise_for_status()
-            return response.json()
+        response.raise_for_status()
+        return response.json()
     except httpx.HTTPError as e:
         logger.warning("Forward to %s failed: %s", peer_hostname, e)
         return None
 
 
-async def remote_lookup(peer_hostname: str, username: str) -> dict | None:
+class LookupOutcome(str, enum.Enum):
+    """
+    Типізований результат remote_lookup (аудит зовн. №3, MEDIUM).
+
+    Раніше і "peer каже 404 — юзера нема" і "peer недоступний/помилка"
+    поверталися однаковим None — верхній рівень (_remote_lookup_with_
+    retry) не міг їх розрізнити і трактував БУДЬ-ЯКИЙ None як
+    підтверджену відсутність користувача, ставлячи негативний кеш на
+    основі мережевого збою. Власний коментар коду це визнавав: "we
+    can't tell from here". Тимчасово мертвий peer виглядав як "такого
+    юзернейма не існує".
+    """
+    FOUND = "found"
+    NOT_FOUND = "not_found"        # peer відповів: юзера немає (справжній 404)
+    TRANSIENT_ERROR = "transient"  # мережа/timeout/5xx — стан невідомий
+
+
+async def remote_lookup(
+    peer_hostname: str, username: str,
+) -> tuple["LookupOutcome", dict | None]:
     """Look up a username on a remote relay. Public API, no signing needed."""
     try:
         response = await _pinned_get(
             peer_hostname, f"/api/v1/federation/users/lookup/{username}",
         )
         if response is None:
-            return None
+            return LookupOutcome.TRANSIENT_ERROR, None
         if response.status_code == 404:
-            return None
+            return LookupOutcome.NOT_FOUND, None
         response.raise_for_status()
-        return response.json()
+        return LookupOutcome.FOUND, response.json()
     except httpx.HTTPError as e:
         logger.warning("Lookup on %s failed: %s", peer_hostname, e)
-        return None
+        return LookupOutcome.TRANSIENT_ERROR, None
 
 
 async def remote_pull_group_snapshot(
