@@ -19,7 +19,7 @@ from ..config import get_settings
 from ..crypto import canonical_json, ed25519_verify
 from ..deps import CurrentSession, DBSession, RedisClient
 from ..models import LoginLog, User
-from ..rate_limit import rate_limit_by_ip
+from ..rate_limit import rate_limit_tor_aware_by_body_pubkey
 from ..schemas import (
     AuthRequest,
     AuthResponse,
@@ -196,7 +196,7 @@ async def _record_login(
     "/challenge",
     response_model=ChallengeResponse,
     summary="Request a challenge to sign",
-    dependencies=[Depends(rate_limit_by_ip(
+    dependencies=[Depends(rate_limit_tor_aware_by_body_pubkey(
         "auth_challenge",
         get_settings().rate_limit_auth_per_minute,
     ))],
@@ -219,7 +219,7 @@ async def request_challenge(
     "/verify",
     response_model=AuthResponse,
     summary="Verify a signed challenge, receive session token",
-    dependencies=[Depends(rate_limit_by_ip(
+    dependencies=[Depends(rate_limit_tor_aware_by_body_pubkey(
         "auth_verify",
         get_settings().rate_limit_auth_per_minute,
     ))],

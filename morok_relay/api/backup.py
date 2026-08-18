@@ -29,7 +29,7 @@ from sqlalchemy import select
 from ..config import get_settings
 from ..deps import CurrentSession, DBSession
 from ..models import EncryptedBackup, User, UserTier
-from ..rate_limit import rate_limit_by_ip, rate_limit_by_pubkey
+from ..rate_limit import rate_limit_tor_aware_by_path_param, rate_limit_by_pubkey
 from ..schemas import (
     BackupCreateRequest,
     BackupDeleted,
@@ -173,11 +173,12 @@ async def delete_my_backup(
     "/by-username/{username}",
     response_model=BackupRestoreResponse,
     summary="Public restore lookup — heavily rate-limited",
-    dependencies=[Depends(rate_limit_by_ip(
+    dependencies=[Depends(rate_limit_tor_aware_by_path_param(
         "backup_restore",
         # Tight: 3 per 60s per IP. Defense against online brute-force.
         # Offline brute-force depends on client PIN strength.
         3,
+        "username",
     ))],
 )
 async def restore_by_username(

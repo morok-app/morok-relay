@@ -238,6 +238,130 @@ def _raise_rate_limited(retry_after: int, bucket: str, current: int, limit: int)
 # FastAPI dependency factory
 # ============================================================================
 
+# ============================================================================
+# Tor-aware rate limiting (аудит зовн. №3, HIGH)
+# ============================================================================
+#
+# ПРОБЛЕМА. Усі onion-клієнти ділять один ідентифікатор "tor" (див.
+# get_ip_from_request) — навмисно, бо в них немає осмисленої IP-адреси
+# з нашого боку. Наслідок: ОДИН зловмисний Tor-клієнт міг вичерпати
+# auth_challenge/auth_verify/backup_restore для ВСІХ Tor-користувачів
+# одразу — доступ через onion практично зупинявся до нового вікна.
+#
+# РІШЕННЯ — два незалежні шари, не один:
+#
+#   1. Підвищена ГЛОБАЛЬНА стеля для бакету "tor" (× TOR_GLOBAL_
+#      MULTIPLIER). Захищає сам relay від навантаження, дозволяючи
+#      пропорційно більше — бо "tor" це не один клієнт, а весь
+#      onion-трафік разом.
+#
+#   2. М'ЯКШИЙ SUB-LIMIT на "заявлений ідентифікатор" (pubkey з тіла
+#      запиту для auth, username зі шляху для lookup/restore) — щоб
+#      один клієнт не міг забрати весь глобальний пул одним заявленим
+#      ідентифікатором.
+#
+# ЧОМУ НЕ ПРОСТО "прив'язати до pubkey" (як міг би виглядати наївний
+# фікс). Заявлений pubkey на цій стадії НЕ верифікований — переходити
+# на нього як на ЄДИНИЙ ідентифікатор відкриває targeted DoS: знаючи
+# чийсь pubkey (публічний lookup його видає), зловмисник міг би через
+# Tor спамити САМЕ під цей pubkey і заблокувати конкретну жертву від
+# входу. Тому pubkey-шар — ДОДАТКОВИЙ до глобальної стелі, не заміна
+# їй, а жертва завжди має фолбек через clearnet (де ліміт per-IP, не
+# per-identity).
+TOR_GLOBAL_MULTIPLIER = 20
+
+
+async def _tor_aware_check(
+    request: Request,
+    redis,
+    bucket: str,
+    limit_per_minute: int,
+    *,
+    claimed_identity: str | None,
+) -> tuple[bool, int, int]:
+    """
+    Обгортка над check_rate_limit: для звичайного трафіку — без змін
+    (той самий виклик, що й завжди). Для Tor — обидва шари; повертає
+    результат СУВОРІШОЇ з двох перевірок (перша, що впаде).
+    """
+    ip = get_ip_from_request(request)
+    if ip != "tor":
+        return await check_rate_limit(redis, bucket, ip, limit_per_minute)
+
+    allowed, count, retry_after = await check_rate_limit(
+        redis, bucket, "tor", limit_per_minute * TOR_GLOBAL_MULTIPLIER,
+    )
+    if not allowed:
+        return allowed, count, retry_after
+
+    if claimed_identity:
+        return await check_rate_limit(
+            redis, bucket, f"tor:{claimed_identity}", limit_per_minute,
+        )
+    return allowed, count, retry_after
+
+
+def rate_limit_tor_aware_by_body_pubkey(bucket: str, limit_per_minute: int):
+    """
+    Для pre-auth ендпоінтів (auth/challenge, auth/verify), де заявлений
+    pubkey_hex лежить у JSON-тілі запиту. Starlette кешує сире тіло,
+    тож повторне read() тут не заважає подальшому Pydantic-парсингу
+    того самого тіла в самому ендпоінті.
+    """
+    async def _dep(
+        request: Request,
+        redis: Annotated[Redis, Depends(get_redis)],
+    ) -> None:
+        claimed = None
+        try:
+            payload = await request.json()
+            candidate = payload.get("pubkey_hex")
+            if isinstance(candidate, str) and len(candidate) == 64:
+                claimed = candidate.lower()
+        except Exception:
+            pass  # немає валідного JSON/поля — працює лише глобальна стеля
+
+        allowed, count, retry_after = await _tor_aware_check(
+            request, redis, bucket, limit_per_minute,
+            claimed_identity=claimed,
+        )
+        if not allowed:
+            logger.info(
+                "Rate-limited (tor-aware) on bucket=%s (%d/min, limit=%d)",
+                bucket, count, limit_per_minute,
+            )
+            _raise_rate_limited(retry_after, bucket, count, limit_per_minute)
+    return _dep
+
+
+def rate_limit_tor_aware_by_path_param(
+    bucket: str, limit_per_minute: int, param_name: str,
+):
+    """Те саме, але ідентичність — параметр шляху (username у restore/
+    lookup), а не поле JSON-тіла."""
+    async def _dep(
+        request: Request,
+        redis: Annotated[Redis, Depends(get_redis)],
+    ) -> None:
+        claimed = request.path_params.get(param_name)
+        if isinstance(claimed, str):
+            claimed = claimed.lower()[:64]  # той самий здоровий глузд, що auth
+        else:
+            claimed = None
+
+        allowed, count, retry_after = await _tor_aware_check(
+            request, redis, bucket, limit_per_minute,
+            claimed_identity=claimed,
+        )
+        if not allowed:
+            logger.info(
+                "Rate-limited (tor-aware) on bucket=%s (%d/min, limit=%d)",
+                bucket, count, limit_per_minute,
+            )
+            _raise_rate_limited(retry_after, bucket, count, limit_per_minute)
+    return _dep
+
+
 def rate_limit_by_ip(bucket: str, limit_per_minute: int):
     """
     Dependency factory for IP-based rate limiting (unauthenticated endpoints).

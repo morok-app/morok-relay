@@ -28,7 +28,7 @@ from sqlalchemy.exc import IntegrityError
 
 from ..config import get_settings
 from ..deps import CurrentSession, DBSession, RedisClient
-from ..rate_limit import rate_limit_by_ip
+from ..rate_limit import rate_limit_tor_aware_by_path_param
 from ..federation_client import LookupOutcome, remote_lookup
 from ..models import FederationPeer, User, UsernameHistory, UserTier
 from ..schemas import (
@@ -384,9 +384,10 @@ async def release_username(
     # кожен запит). Успішні лукапи кешуються на добу, а промахи — ні,
     # тому саме неіснуючі імена й були підсилювачем. Ліміт + negative
     # cache нижче закривають обидва боки.
-    dependencies=[Depends(rate_limit_by_ip(
+    dependencies=[Depends(rate_limit_tor_aware_by_path_param(
         "users_lookup",
         get_settings().rate_limit_lookup_per_minute,
+        "username",
     ))],
 )
 async def lookup_username(
