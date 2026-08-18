@@ -423,7 +423,6 @@ async def lookup_username(
             pubkey_hex=user.pubkey.hex(),
             username=user.username,
             home_relay=user.home_relay,
-            last_seen_at=user.last_seen_at,
         )
 
     # 2. Federation fallback — figure out which peer(s) to query
@@ -492,7 +491,6 @@ async def lookup_username(
                 pubkey_hex=cached["pubkey_hex"],
                 username=cached["username"],
                 home_relay=cached["home_relay"],
-                last_seen_at=cached.get("last_seen_at"),
             )
 
         # 2b. Federation lookup with retry
@@ -530,7 +528,6 @@ async def lookup_username(
             pubkey_hex=result["pubkey_hex"],
             username=result["username"],
             home_relay=result["home_relay"],
-            last_seen_at=cached_user.last_seen_at if cached_user else None,
         )
 
     # 3. Not found on any peer

@@ -114,10 +114,22 @@ class UsernameClaim(BaseModel):
 
 
 class UserInfo(BaseModel):
+    """
+    Публічна відповідь /users/lookup — БЕЗ last_seen_at (аудит зовн.
+    №3, HIGH — privacy). Раніше поле віддавалось будь-кому, хто знає
+    @username, без авторизації: регулярний polling перетворював релей
+    на presence oracle ("коли ця людина востаннє була активна"). Для
+    месенджера, README якого explicit наголошує на мінімізації
+    метаданих, це прямий витік.
+
+    Колонка User.last_seen_at у БД лишається (потрібна для cleanup,
+    reap_anonymous_users тощо) — прибирається саме публічна видача,
+    не сам факт зберігання. Власний профіль (MeInfo) last_seen_at і
+    надалі показує — людина має право бачити власну активність.
+    """
     pubkey_hex: str
     username: str | None
     home_relay: str
-    last_seen_at: int | None
 
 
 class MeInfo(BaseModel):
