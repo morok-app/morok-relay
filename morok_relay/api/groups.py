@@ -24,7 +24,7 @@ from sqlalchemy.orm import selectinload
 from .. import blob_storage, crypto, invite_tokens
 from ..config import get_settings
 from ..deps import CurrentSession, DBSession, RedisClient
-from ..models import FederationOutboundQueue, FedQueueStatus, Group, GroupMember, User, UserTier
+from ..models import FederationOutboundQueue, FederationPeer, FedQueueStatus, Group, GroupMember, User, UserTier
 from ..queue import (
     publish_group_gone,
     delete_envelope_for_group,
@@ -33,7 +33,7 @@ from ..queue import (
     get_envelope_meta,
 )
 from ..push_sender import schedule_push
-from ..rate_limit import rate_limit_by_pubkey
+from ..rate_limit import check_rate_limit, rate_limit_by_pubkey
 from ..schemas import (
     GroupAddMemberRequest,
     GroupCreate,
@@ -1424,6 +1424,7 @@ async def sync_group_from_host(
     group_id: str,
     current: CurrentSession,
     db: DBSession,
+    redis: RedisClient,
     host_relay: str = Query(..., min_length=3, max_length=255,
                              description="Host relay hostname where the group lives"),
 ) -> dict:
@@ -1438,16 +1439,45 @@ async def sync_group_from_host(
 
     Authentication: caller must be the eventually-included member — but
     we can't verify that without already having the group. So we just
-    require an authenticated session (any logged-in user) and rate-limit.
-    The host relay returns 404 if the caller isn't a member of the
-    requested group, so we can't fetch arbitrary groups.
+    require an authenticated session (any logged-in user), rate-limit,
+    AND (аудит зовн. №3, HIGH) require host_relay to be a KNOWN TRUSTED
+    peer. The host relay's own /group_snapshot/pull handler still 404s
+    if the caller isn't a member — but that check happens on a server
+    we've already decided to trust; without the is_trusted gate here, a
+    caller could point host_relay at their OWN public HTTPS server,
+    which would happily answer our signed pull request with an
+    arbitrary snapshot (an attacker doesn't need our federation trust
+    to run *some* server on a public IP — pin-to-IP only blocks
+    internal/private targets, not "attacker's own legitimate box").
     """
     settings = get_settings()
+
+    allowed, _, retry_after = await check_rate_limit(
+        redis, "group_sync", current.pubkey_hex, limit_per_minute=10,
+    )
+    if not allowed:
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="rate_limited",
+            headers={"Retry-After": str(retry_after)},
+        )
 
     if host_relay == settings.relay_name:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="host_is_self_no_sync_needed",
+        )
+
+    # Trust gate: host_relay must be a peer we've handshaken with AND
+    # explicitly marked trusted — the same bar as any other federation
+    # write path. This is the actual fix for the vulnerability: without
+    # it, host_relay was fully attacker-chosen.
+    peer_stmt = select(FederationPeer).where(FederationPeer.hostname == host_relay)
+    peer = (await db.execute(peer_stmt)).scalar_one_or_none()
+    if peer is None or not peer.is_trusted:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="host_relay_not_a_trusted_peer",
         )
 
     try:
@@ -1468,6 +1498,23 @@ async def sync_group_from_host(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="snapshot_unavailable_from_host",
+        )
+
+    # Bind the response to the request: the snapshot's own group_id
+    # field must match what we asked for. Without this, a malicious (or
+    # confused) response for a DIFFERENT group_id would silently upsert
+    # some other local group instead of a 404/mismatch.
+    try:
+        snapshot_gid = uuid.UUID(str(snapshot.get("group_id", "")))
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="host_returned_malformed_group_id",
+        )
+    if snapshot_gid != gid:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="host_returned_snapshot_for_different_group",
         )
 
     # Apply locally (idempotent upsert). The host we asked to pull from
