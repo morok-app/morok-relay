@@ -425,6 +425,13 @@ class DMSCheckInResponse(BaseModel):
     fires_at: int
 
 
+class SignedDMSCheckInResponse(BaseModel):
+    """Відповідь /dms/checkin-signed — бампає ВСІ ARMED DMS одразу,
+    тож немає єдиного dms_id/fires_at, як у DMSCheckInResponse."""
+    checked_in_count: int
+    checked_in_at: int
+
+
 class DMSCancelResponse(BaseModel):
     dms_id: str
     cancelled: bool

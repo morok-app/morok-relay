@@ -12,13 +12,14 @@ import time
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select, update
+from pydantic import BaseModel, Field
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import selectinload
 
 from ..config import get_settings
+from ..crypto import canonical_json, ed25519_verify
 from ..deps import CurrentSession, DBSession
 from ..models import DeadManSwitch, DMSRecipient, DMSStatus, User, UserTier
-from sqlalchemy import func
 from ..rate_limit import rate_limit_by_pubkey
 from ..schemas import (
     DMS_FREE_TIER_MAX_ACTIVE,
@@ -32,6 +33,7 @@ from ..schemas import (
     DMSCreate,
     DMSInfo,
     DMSRecipientInfo,
+    SignedDMSCheckInResponse,
 )
 
 router = APIRouter(tags=["dms"])
@@ -233,6 +235,87 @@ async def get_dms(
     pubkey = bytes.fromhex(current.pubkey_hex)
     dms = await _load_dms_for_owner(db, did, pubkey)
     return _to_info(dms)
+
+
+class SignedCheckInRequest(BaseModel):
+    """
+    Підписаний proof-of-life (аудит зовн. №3, HIGH).
+
+    ЧОМУ ЦЕ ІСНУЄ. `get_current_session` (deps.py) досі bump'ить
+    last_check_in_at усіх ARMED DMS на БУДЬ-ЯКИЙ автентифікований
+    запит — це залишається fallback'ом для клієнтів, які ще не вміють
+    підписувати heartbeat. Але семантично це неправильно: bearer-
+    токен доводить лише "хтось колись пройшов auth і отримав сесію",
+    не "власник ключа живий ЗАРАЗ". Викрадений bearer (навіть у межах
+    нашої 30-денної абсолютної стелі) міг придушувати DMS до місяця.
+
+    Цей ендпоінт — правильний шлях: підпис Ed25519 із domain
+    separation ("morok_dms_checkin:v1") і вузьким вікном свіжості,
+    так само як access-контроль скрізь у федерації. Клієнт підписує
+    сам, автономно, без запиту challenge — periodic background job,
+    що раз на день ставить підпис на поточний timestamp.
+
+    Коли клієнт (RN/web) навчиться викликати цей ендпоінт, generic
+    bearer-bump можна буде прибрати або ще сильніше обмежити.
+    """
+    timestamp: int = Field(..., ge=0)
+    signature_hex: str = Field(..., pattern=r"^[0-9a-f]{128}$")
+
+
+@router.post(
+    "/checkin-signed",
+    response_model=SignedDMSCheckInResponse,
+    summary="Cryptographic DMS proof-of-life (Ed25519-signed, not bearer-based)",
+    dependencies=[Depends(rate_limit_by_pubkey(
+        "dms_checkin_signed",
+        get_settings().rate_limit_dms_create_per_minute,
+    ))],
+)
+async def check_in_signed(
+    body: SignedCheckInRequest,
+    current: CurrentSession,
+    db: DBSession,
+) -> SignedDMSCheckInResponse:
+    """
+    current.pubkey_hex тут — вже верифікований bearer, тобто ЦЕЙ шлях
+    ще не сильніший за bearer сам по собі (аутентифікація однакова).
+    Реальна перевага прийде, коли клієнт зможе слати підпис БЕЗ живої
+    сесії (наприклад, фоновий процес з локально збереженим ключем) —
+    інфраструктура готова заздалегідь, підпис перевіряється незалежно
+    від bearer-стану.
+    """
+    now = int(time.time())
+    if abs(now - body.timestamp) > 300:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="stale_timestamp",
+        )
+
+    message = canonical_json({
+        "morok_dms_checkin": "v1",
+        "pubkey": current.pubkey_hex,
+        "timestamp": body.timestamp,
+    })
+    pubkey_bytes = bytes.fromhex(current.pubkey_hex)
+    try:
+        sig_bytes = bytes.fromhex(body.signature_hex)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="invalid_signature",
+        )
+    if not ed25519_verify(message, sig_bytes, pubkey_bytes):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="invalid_signature",
+        )
+
+    bumped = await bump_check_in_for_pubkey(db, current.pubkey_hex)
+    await db.commit()
+    return SignedDMSCheckInResponse(
+        checked_in_count=bumped,
+        checked_in_at=now,
+    )
 
 
 @router.post("/{dms_id}/check-in", response_model=DMSCheckInResponse)
