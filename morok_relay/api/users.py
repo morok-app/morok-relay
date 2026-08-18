@@ -28,7 +28,7 @@ from sqlalchemy.exc import IntegrityError
 
 from ..config import get_settings
 from ..deps import CurrentSession, DBSession, RedisClient
-from ..rate_limit import rate_limit_tor_aware_by_path_param
+from ..rate_limit import rate_limit_by_pubkey, rate_limit_tor_aware_by_path_param
 from ..federation_client import LookupOutcome, remote_lookup
 from ..models import FederationPeer, User, UsernameHistory, UserTier
 from ..schemas import (
@@ -266,7 +266,16 @@ async def get_me(current: CurrentSession, db: DBSession) -> MeInfo:
     )
 
 
-@router.post("/me/username", response_model=MeInfo, summary="Claim a @username")
+@router.post(
+    "/me/username",
+    response_model=MeInfo,
+    summary="Claim a @username",
+    # Частота запитів (аудит зовн. №3, HIGH). Не єдиний захист — м'який
+    # шар анти-спаму на HTTP-рівні; реальна стеля проти namespace
+    # squatting нижче, у вигляді мінімального інтервалу між ФАКТИЧНИМИ
+    # змінами.
+    dependencies=[Depends(rate_limit_by_pubkey("username_claim", 10))],
+)
 async def claim_username(
     body: UsernameClaim, current: CurrentSession, db: DBSession,
 ) -> MeInfo:
@@ -296,6 +305,26 @@ async def claim_username(
     if other is not None and other.pubkey != pubkey_bytes:
         raise HTTPException(status.HTTP_409_CONFLICT, detail="username_taken")
 
+    # Мінімальний інтервал МІЖ ВЛАСНИМИ змінами (аудит зовн. №3, HIGH).
+    # user.username_changed_at (не UsernameHistory!) — history записує
+    # лише ЗВІЛЬНЕННЯ попереднього імені, тож перший claim там сліду не
+    # лишає; ця колонка фіксує КОЖНУ явну зміну, включно з першою. NULL
+    # (ще жодної явної зміни через цей ендпоінт) — обмежень немає.
+    if (
+        user.username_changed_at is not None
+        and now - user.username_changed_at
+            < settings.username_change_min_interval_seconds
+    ):
+        retry_after = (
+            user.username_changed_at
+            + settings.username_change_min_interval_seconds - now
+        )
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="username_changed_too_recently",
+            headers={"Retry-After": str(max(retry_after, 1))},
+        )
+
     cooldown_seconds = settings.username_cooldown_days * 86400
     cooldown_cutoff = now - cooldown_seconds
     stmt = (
@@ -320,6 +349,7 @@ async def claim_username(
         ))
 
     user.username = username
+    user.username_changed_at = now
     try:
         await db.flush()
     except IntegrityError:

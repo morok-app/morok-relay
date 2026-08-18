@@ -74,6 +74,15 @@ class User(Base):
     )
     last_seen_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     deleted_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # Момент ОСТАННЬОЇ зміни username (аудит зовн. №3, HIGH — namespace
+    # squatting). НЕ те саме, що UsernameHistory.released_at: історія
+    # записує тільки ЗВІЛЬНЕННЯ попереднього імені, тобто для першого
+    # claim (немає що звільняти) запису не з'являється — і без окремого
+    # поля перевірка "чи давно я останній раз змінював username" не
+    # бачила б першу зміну взагалі. NULL = ще жодної явної зміни.
+    username_changed_at: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True,
+    )
 
 
 # ============================================================================

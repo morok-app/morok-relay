@@ -36,6 +36,17 @@ class Settings(BaseSettings):
     message_ttl_hard_seconds: int = Field(default=86400)
     max_blob_bytes: int = Field(default=262144)
     username_cooldown_days: int = Field(default=30)
+    # Мінімальний інтервал МІЖ ВЛАСНИМИ змінами username (аудит зовн.
+    # №3, HIGH — namespace squatting). username_cooldown_days захищає
+    # ІНШИХ (звільнене ім'я недоступне їм якийсь час) — але нічого не
+    # обмежувало, як ЧАСТО САМ акаунт може змінювати ім'я. Без цього
+    # бот міг пройти словник хороших username'ів за секунди: claim
+    # "alice" → одразу claim "bob" (звільняючи "alice" в 30-денний
+    # cooldown для всіх) → claim "charlie" → ... Одна доба — реальний
+    # захист від масового захоплення, не заважає легітимній людині
+    # виправити помилку одразу після реєстрації (перша зміна винятку
+    # не потребує, бо UsernameHistory для нового pubkey ще порожня).
+    username_change_min_interval_seconds: int = Field(default=86400)
 
     # ----- DB / Redis -----
     db_dsn: str = Field(default="postgresql+asyncpg://morok@localhost/morok_relay")
