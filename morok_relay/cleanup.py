@@ -22,7 +22,7 @@ import asyncio
 import logging
 import time
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from . import db as _db
@@ -150,6 +150,36 @@ FED_SUCCEEDED_RETENTION_SECONDS = 86400
 FED_DEAD_LETTER_RETENTION_SECONDS = 72 * 3600
 
 
+# Метадані завершеного DMS (dms_id, часові метки, порожні recipients-
+# рядки) — не привід тримати вічно, попри те, що payload уже занулено
+# при cancel/trigger (аудит зовн. №3, HIGH). 30 днів — щоб власник міг
+# ще довго бачити в UI "цей DMS спрацював/було відмінено".
+DMS_TERMINAL_RETENTION_SECONDS = 30 * 86400
+
+
+async def reap_terminal_dms(session) -> int:
+    """
+    Прибрати CANCELLED/TRIGGERED рядки DeadManSwitch, старші за
+    ретенцію. ARMED не чіпаємо ніколи — це діюча гарантія, її термін
+    визначає сам користувач через trigger_seconds, не cleanup.
+
+    payload_encrypted до цього моменту вже занулений (cancel_dms /
+    dms_reaper при тригері) — це прибирання РЯДКА, не ciphertext'у;
+    ciphertext іде першим і в іншому місці.
+    """
+    from .models import DeadManSwitch, DMSStatus
+
+    now = int(time.time())
+    result = await session.execute(
+        delete(DeadManSwitch).where(
+            DeadManSwitch.status.in_([DMSStatus.CANCELLED, DMSStatus.TRIGGERED]),
+            func.coalesce(DeadManSwitch.cancelled_at, DeadManSwitch.triggered_at)
+            < now - DMS_TERMINAL_RETENTION_SECONDS,
+        )
+    )
+    return result.rowcount or 0
+
+
 async def reap_federation_queue(session) -> int:
     """
     Прибрати завершені рядки federation outbound queue.
@@ -209,6 +239,7 @@ async def cleanup_task_loop():
                         count = await reap_anonymous_users(session)
                         mail_count = await reap_delivered_outbound(session)
                         fed_count = await reap_federation_queue(session)
+                        dms_count = await reap_terminal_dms(session)
                         await session.commit()
                         if count > 0:
                             logger.info(
@@ -224,7 +255,12 @@ async def cleanup_task_loop():
                                 "Cleanup: reaped %d finished federation rows",
                                 fed_count,
                             )
-                        if count == 0 and mail_count == 0 and fed_count == 0:
+                        if dms_count > 0:
+                            logger.info(
+                                "Cleanup: reaped %d terminal DMS rows", dms_count,
+                            )
+                        if (count == 0 and mail_count == 0
+                                and fed_count == 0 and dms_count == 0):
                             logger.debug("Cleanup: nothing to reap")
                     except Exception:
                         await session.rollback()

@@ -334,6 +334,15 @@ DMS_TRIGGER_MAX_SECONDS = 365 * 86400   # 1 year
 DMS_PAYLOAD_MAX_BYTES = 262144          # 256 KB, same as message blob
 DMS_FREE_TIER_MAX_RECIPIENTS = 5
 DMS_PREMIUM_TIER_MAX_RECIPIENTS = 20
+
+# Квота на АКТИВНІ (ARMED) DMS одночасно, і на сумарний обсяг їхніх
+# payload'ів (аудит зовн. №3, HIGH). Без цього створення обмежувала
+# лише частота (5/хв), а не накопичений стан: за добу — до ~1.76 GiB
+# з одного pubkey при максимальному розмірі запису.
+DMS_FREE_TIER_MAX_ACTIVE = 5
+DMS_PREMIUM_TIER_MAX_ACTIVE = 20
+DMS_FREE_TIER_MAX_TOTAL_BYTES = 2 * 1024 * 1024        # 2 MiB
+DMS_PREMIUM_TIER_MAX_TOTAL_BYTES = 20 * 1024 * 1024    # 20 MiB
 DMS_LABEL_MAX_LEN = 100
 
 

@@ -246,8 +246,15 @@ async def fire_dms_switches() -> dict:
                 if all_delivered:
                     dms.status = DMSStatus.TRIGGERED
                     dms.triggered_at = now
+                    # Scrub (аудит зовн. №3, HIGH): payload вже доставлений
+                    # усім одержувачам як звичайний конверт (з власним TTL
+                    # у черзі) — тримати ще один повний ciphertext-копію в
+                    # DeadManSwitch назавжди сенсу не має.
+                    dms.payload_encrypted = b""
                     stats["dms_fired"] += 1
                 # else: stays armed; next run retries un-delivered recipients
+                #       (payload MUST stay intact until all_delivered — do
+                #       not scrub early, un-delivered recipients still need it)
 
             await db.commit()
     finally:

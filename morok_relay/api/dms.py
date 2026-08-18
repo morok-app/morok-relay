@@ -18,10 +18,15 @@ from sqlalchemy.orm import selectinload
 from ..config import get_settings
 from ..deps import CurrentSession, DBSession
 from ..models import DeadManSwitch, DMSRecipient, DMSStatus, User, UserTier
+from sqlalchemy import func
 from ..rate_limit import rate_limit_by_pubkey
 from ..schemas import (
+    DMS_FREE_TIER_MAX_ACTIVE,
     DMS_FREE_TIER_MAX_RECIPIENTS,
+    DMS_FREE_TIER_MAX_TOTAL_BYTES,
+    DMS_PREMIUM_TIER_MAX_ACTIVE,
     DMS_PREMIUM_TIER_MAX_RECIPIENTS,
+    DMS_PREMIUM_TIER_MAX_TOTAL_BYTES,
     DMSCancelResponse,
     DMSCheckInResponse,
     DMSCreate,
@@ -137,8 +142,12 @@ async def create_dms(
     user = await _get_current_user(db, current.pubkey_hex)
     if user.tier == UserTier.PREMIUM or user.tier == UserTier.ADMIN:
         max_recipients = DMS_PREMIUM_TIER_MAX_RECIPIENTS
+        max_active = DMS_PREMIUM_TIER_MAX_ACTIVE
+        max_bytes = DMS_PREMIUM_TIER_MAX_TOTAL_BYTES
     else:
         max_recipients = DMS_FREE_TIER_MAX_RECIPIENTS
+        max_active = DMS_FREE_TIER_MAX_ACTIVE
+        max_bytes = DMS_FREE_TIER_MAX_TOTAL_BYTES
 
     if len(body.recipient_pubkeys_hex) > max_recipients:
         raise HTTPException(
@@ -149,6 +158,36 @@ async def create_dms(
     creator_pubkey = bytes.fromhex(current.pubkey_hex)
     now = int(time.time())
     payload_bytes = base64.b64decode(body.payload_encrypted, validate=True)
+
+    # Квота count+bytes на АКТИВНІ DMS (аудит зовн. №3, HIGH — DMS як
+    # дешева машина забивання Postgres). rate_limit_dms_create обмежує
+    # лише ЧАСТОТУ створення (5/хв) — при 256 KB на запис це ~1.76 GiB/
+    # добу з ОДНОГО pubkey, а Ed25519-ідентичності дешеві, тож per-pubkey
+    # rate-limit не є Sybil-перешкодою. FOR UPDATE-подібного захисту тут
+    # не потрібно: перевищення квоти під гонкою в найгіршому разі дає
+    # ОДИН зайвий рядок, не необмежене зростання — ARMED-рахунок і сума
+    # рахуються атомарним запитом ДО insert, а сам insert синхронний у
+    # межах запиту.
+    active_stmt = (
+        select(func.count(), func.coalesce(func.sum(
+            func.length(DeadManSwitch.payload_encrypted)
+        ), 0))
+        .where(
+            DeadManSwitch.creator_pubkey == creator_pubkey,
+            DeadManSwitch.status == DMSStatus.ARMED,
+        )
+    )
+    active_count, active_bytes = (await db.execute(active_stmt)).one()
+    if active_count >= max_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"too_many_active_dms_max_{max_active}",
+        )
+    if active_bytes + len(payload_bytes) > max_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"dms_storage_quota_exceeded_max_{max_bytes}_bytes",
+        )
 
     dms = DeadManSwitch(
         creator_pubkey=creator_pubkey,
@@ -231,6 +270,11 @@ async def cancel_dms(
         return DMSCancelResponse(dms_id=str(dms.id), cancelled=True)
     dms.status = DMSStatus.CANCELLED
     dms.cancelled_at = int(time.time())
+    # Scrub (аудит зовн. №3, HIGH): cancel лише ставив статус, ciphertext
+    # лишався в БД назавжди — а це той самий payload, який людина щойно
+    # explicitly відкликала. Порожні байти замість NULL: колонка
+    # nullable=False лишається валідною безміграції.
+    dms.payload_encrypted = b""
     await db.flush()
     return DMSCancelResponse(dms_id=str(dms.id), cancelled=True)
 
