@@ -14,9 +14,12 @@ morok.email — вихідний відправник (Фаза 3). Крутит
 """
 from __future__ import annotations
 
+import contextlib
+import ipaddress
 import logging
 import os
 import smtplib
+import socket
 import ssl
 from email.message import EmailMessage
 from email.utils import formatdate, make_msgid
@@ -25,6 +28,85 @@ import dkim
 import dns.resolver
 
 logger = logging.getLogger("morok.mailout")
+
+
+# ============================================================================
+# MX SSRF guard (аудит зовн. №3, MEDIUM)
+# ============================================================================
+#
+# ПРОБЛЕМА. Домен отримувача контролює його власник — це нормально для
+# пошти (ми ЗОБОВ'ЯЗАНІ довіряти MX-запису, інакше лист нікуди не
+# піде). Але без перевірки MX-hostname міг резолвитись у приватну/
+# link-local адресу (10.x, 127.x, 169.254.169.254 — cloud metadata),
+# і mail-out вузол зробив би вихідне TCP:25-з'єднання у ВНУТРІШНЮ
+# мережу цього сервера. Другий шар — DNS rebinding: smtplib сам
+# резолвить MX-hostname під час connect(), тобто НЕЗАЛЕЖНО від
+# будь-якої попередньої перевірки — класичний check-then-use TOCTOU,
+# той самий клас, що вже закритий у federation_client.py.
+#
+# ФІКС. Резолвимо MX ОДИН раз, перевіряємо ВСІ повернуті адреси як
+# публічні, і тимчасово підміняємо socket.getaddrinfo так, щоб
+# наступний connect() smtplib пішов рівно на перевірену IP — без
+# другого resolve. host, переданий у smtplib.SMTP(), лишається ІМ'ЯМ
+# MX (не IP) — SNI/сертифікат при STARTTLS перевіряються правильно.
+#
+# Безпечно монки-патчити ГЛОБАЛЬНИЙ socket.getaddrinfo: mailout_worker
+# — однопотоковий послідовний цикл (claim → send_external → claim →
+# ...), паралельних send_external немає, тож підміна в межах одного
+# виклику нікому іншому не заважає.
+
+
+def _is_public_ip(ip_str: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return False
+    return not (
+        ip.is_private or ip.is_loopback or ip.is_link_local
+        or ip.is_multicast or ip.is_reserved or ip.is_unspecified
+    )
+
+
+def _resolve_pinned_mx(hostname: str) -> str | None:
+    """Резолвить MX-hostname, повертає ОДНУ публічну адресу, або None
+    якщо резолв не вдався чи хоч одна повернута адреса приватна."""
+    try:
+        infos = socket.getaddrinfo(hostname, 25, proto=socket.IPPROTO_TCP)
+    except (socket.gaierror, UnicodeError, OSError):
+        return None
+    if not infos:
+        return None
+    ips = []
+    for info in infos:
+        ip_str = info[4][0]
+        if not _is_public_ip(ip_str):
+            return None  # хоч одна приватна — відмова повністю
+        ips.append(ip_str)
+    return ips[0]
+
+
+@contextlib.contextmanager
+def _pinned_dns(hostname: str, pinned_ip: str):
+    """
+    Тимчасово підміняє socket.getaddrinfo так, щоб САМЕ ЦЕЙ hostname
+    резолвився лише в заздалегідь перевірену адресу — жодного другого
+    (потенційно іншого) DNS resolve під час smtplib.connect().
+    Інші hostname (яких тут бути не повинно, але про всяк випадок)
+    ідуть через звичайний резолвер.
+    """
+    real_getaddrinfo = socket.getaddrinfo
+    family = socket.AF_INET6 if ":" in pinned_ip else socket.AF_INET
+
+    def _patched(host, port, *args, **kwargs):
+        if host == hostname:
+            return [(family, socket.SOCK_STREAM, 6, "", (pinned_ip, port))]
+        return real_getaddrinfo(host, port, *args, **kwargs)
+
+    socket.getaddrinfo = _patched
+    try:
+        yield
+    finally:
+        socket.getaddrinfo = real_getaddrinfo
 
 # Конфіг вузла — з оточення, бо це деталі конкретної інсталяції, а не коду.
 # SOURCE_IP порожній => egress не прибивається, ОС вибирає інтерфейс сама
@@ -121,27 +203,38 @@ def send_external(from_addr: str, to_addr: str, subject: str,
     ctx = ssl.create_default_context()
     last_err = "unknown"
     for mx in mxs:
+        pinned_ip = _resolve_pinned_mx(mx)
+        if pinned_ip is None:
+            last_err = f"{mx}: resolves to non-public address or DNS failure"
+            logger.warning(
+                "mailout: MX %s rejected — private/unresolvable target", mx,
+            )
+            continue
         try:
             # source_address=(SOURCE_IP, 0) → egress прибитий до нашого IPv4.
             # Якщо MOROK_MAIL_SOURCE_IP не заданий — не прибиваємо взагалі
             # (передати ("", 0) у source_address = помилка bind).
             src = (SOURCE_IP, 0) if SOURCE_IP else None
-            smtp = smtplib.SMTP(host=mx, port=25, local_hostname=HELO_NAME,
-                                timeout=30, source_address=src)
-            try:
-                smtp.ehlo(HELO_NAME)
-                if smtp.has_extn("starttls"):
-                    smtp.starttls(context=ctx)
-                    smtp.ehlo(HELO_NAME)
-                smtp.sendmail(from_addr, [to_addr], raw)
-                smtp.quit()
-                logger.info("mailout: delivered to %s via %s", domain, mx)
-                return True, f"delivered via {mx}"
-            finally:
+            # host лишається ІМ'ЯМ mx (не pinned_ip) — SNI/сертифікат при
+            # STARTTLS перевіряються за іменем; сам DNS-resolve усередині
+            # connect() підмінений на перевірену адресу (_pinned_dns).
+            with _pinned_dns(mx, pinned_ip):
+                smtp = smtplib.SMTP(host=mx, port=25, local_hostname=HELO_NAME,
+                                    timeout=30, source_address=src)
                 try:
-                    smtp.close()
-                except Exception:
-                    pass
+                    smtp.ehlo(HELO_NAME)
+                    if smtp.has_extn("starttls"):
+                        smtp.starttls(context=ctx)
+                        smtp.ehlo(HELO_NAME)
+                    smtp.sendmail(from_addr, [to_addr], raw)
+                    smtp.quit()
+                    logger.info("mailout: delivered to %s via %s", domain, mx)
+                    return True, f"delivered via {mx}"
+                finally:
+                    try:
+                        smtp.close()
+                    except Exception:
+                        pass
         except Exception as e:
             last_err = f"{mx}: {e}"
             logger.warning("mailout: MX %s failed: %s", mx, e)
