@@ -143,3 +143,41 @@ async def test_rate_limit_dependency_registered():
     ]
     assert any("rate_limit" in name for name in dep_names), \
         "claim_username без rate-limit dependency"
+
+
+# ── delete + reactivate не має блокувати перший claim (жорсткий прохід) ──
+async def test_delete_account_resets_username_changed_at(db, redis):
+    """
+    ЗНАЙДЕНО ПІД ЧАС ЖОРСТКОГО ПРОХОДУ (не аудитом ззовні). Сценарій:
+    людина claim'ить ім'я → видаляє акаунт (username=None, але
+    username_changed_at РАНІШЕ лишався незмінним) → відновлюється тим
+    самим seed'ом (auth._reactivate_if_deleted) → щойно "порожній"
+    акаунт (username IS NULL) безпідставно впирався в 24-годинний
+    інтервал, розрахований проти claim'у з ПОПЕРЕДНЬОГО життя цього ж
+    pubkey. Не дірка безпеки — легітимний UX-глухий кут, який сам собі
+    ж і вніс попередній фікс username churn.
+    """
+    from morok_relay.api.account import delete_me
+
+    await _ensure_user(db)
+    await claim_username(UsernameClaim(username="firstlife"), _session(), db)
+
+    row = await db.get(User, (await db.execute(
+        __import__("sqlalchemy").select(User).where(User.pubkey == bytes.fromhex(OWNER))
+    )).scalar_one().id)
+    assert row.username_changed_at is not None
+
+    await delete_me(_session(), db, redis)
+
+    await db.refresh(row)
+    assert row.username is None
+    assert row.username_changed_at is None, \
+        "username_changed_at пережив видалення — реактивований акаунт " \
+        "безпідставно блокується від першого claim"
+
+    # реактивація (звичайний шлях — новий логін тим самим pubkey)
+    row.deleted_at = None
+    await db.commit()
+
+    result = await claim_username(UsernameClaim(username="secondlife"), _session(), db)
+    assert result.username == "secondlife"

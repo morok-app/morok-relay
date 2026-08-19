@@ -90,6 +90,17 @@ async def delete_me(
                 released_at=now,
             ))
             user.username = None
+            # ВИПРАВЛЕНО (жорсткий прохід — знайдено самим собою, не
+            # аудитом): username_changed_at МУСИТЬ скинутись разом із
+            # username. Інакше сценарій «видалив → одразу відновив
+            # тим самим seed» (_reactivate_if_deleted в auth.py) лишав
+            # порожній акаунт (username=None) із чужим "минулим життям"
+            # у username_changed_at — і людина, що хоче встановити
+            # ПЕРШЕ ім'я в щойно відновленому акаунті, безпідставно
+            # впиралась у 24-годинний інтервал, розрахований проти
+            # зовсім іншого claim'у з попереднього життя цього pubkey.
+            # Не дірка безпеки — легітимний UX-глухий кут.
+            user.username_changed_at = None
 
         if user.deleted_at is None:
             user.deleted_at = now
