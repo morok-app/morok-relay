@@ -220,6 +220,7 @@ async def post_subscribe_native(
     body: NativePushSubscribeRequest,
     current: CurrentSession,
     db: DBSession,
+    redis: RedisClient,
 ) -> dict:
     """
     Native Android push. `token` — FCM device token; зберігаємо його в
@@ -227,7 +228,23 @@ async def post_subscribe_native(
     на боці релея (service account) не перевіряємо тут навмисно:
     підписка може бути зареєстрована до того, як адмін донастроїв
     relay, і запрацює без повторної реєстрації.
+
+    Rate-limit + квота (аудит зовн. №4, MEDIUM): web push мав обидва
+    захисти від самого початку, native/FCM — ні. Один спільний ліміт
+    MAX_PUSH_SUBSCRIPTIONS_PER_ACCOUNT рахує ОБИДВІ платформи разом
+    (запит нижче навмисно без фільтра platform) — це один ресурс
+    (рядки, які потім тягне push fan-out), не два окремих.
     """
+    allowed, _, retry_after = await check_rate_limit(
+        redis, "push_subscribe_native", current.pubkey_hex, limit_per_minute=10,
+    )
+    if not allowed:
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="rate_limited",
+            headers={"Retry-After": str(retry_after)},
+        )
+
     pubkey = bytes.fromhex(current.pubkey_hex)
     now = int(time.time())
 
@@ -242,15 +259,26 @@ async def post_subscribe_native(
         existing.platform = "fcm"
         existing.user_agent = body.user_agent
         existing.updated_at = now
-    else:
-        db.add(PushSubscription(
-            pubkey=pubkey,
-            endpoint=body.token,
-            p256dh="",
-            auth="",
-            platform="fcm",
-            user_agent=body.user_agent,
-        ))
+        return {"subscribed": True}
+
+    count = (await db.execute(
+        select(func.count()).select_from(PushSubscription)
+        .where(PushSubscription.pubkey == pubkey)
+    )).scalar_one()
+    if count >= MAX_PUSH_SUBSCRIPTIONS_PER_ACCOUNT:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail="too_many_push_subscriptions",
+        )
+
+    db.add(PushSubscription(
+        pubkey=pubkey,
+        endpoint=body.token,
+        p256dh="",
+        auth="",
+        platform="fcm",
+        user_agent=body.user_agent,
+    ))
     return {"subscribed": True}
 
 

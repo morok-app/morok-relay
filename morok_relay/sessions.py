@@ -138,6 +138,7 @@ async def verify_session_token(
     if not token:
         return None
 
+    now = int(time.time())
     digest = _token_digest(token)
     key = _session_key(digest)
     value = await redis.get(key)
@@ -150,12 +151,26 @@ async def verify_session_token(
         if value is None:
             return None
         pubkey_legacy = value.decode("utf-8").partition("|")[0]
+        # ВИПРАВЛЕНО (аудит зовн. №4, HIGH): раніше сюди копіювався
+        # СТАРИЙ raw value (голий pubkey, без "|created_at") — тобто
+        # 30-денна абсолютна стеля НІКОЛИ не спрацьовувала для жодної
+        # мігрованої legacy-сесії: created_str завжди виходив порожнім,
+        # перевірка нижче (`if created_str:`) мовчки пропускалась
+        # НАЗАВЖДИ, а sliding TTL продовжував сесію вічно, поки вона
+        # активна. Той самий стелінг, який ми зробили спеціально проти
+        # "вкрадений bearer глушить DMS роками", просто не діяв на
+        # будь-яку сесію, видану до патчу зі стелею. Тепер міграція
+        # записує created_at=МОМЕНТ МІГРАЦІЇ (найкраще наближення до
+        # "коли ми вперше побачили цю сесію після деплою стелі" — точний
+        # момент видачі невідомий за визначенням старого формату).
+        migrated_value = f"{pubkey_legacy}|{now}".encode("utf-8")
         async with redis.pipeline(transaction=True) as pipe:
-            pipe.setex(key, SESSION_TTL_SECONDS, value)
+            pipe.setex(key, SESSION_TTL_SECONDS, migrated_value)
             pipe.delete(legacy_key)
             pipe.srem(_user_sessions_key(pubkey_legacy), token.encode("utf-8"))
             pipe.sadd(_user_sessions_key(pubkey_legacy), digest.encode("utf-8"))
             await pipe.execute()
+        value = migrated_value
 
     # Формат value: "pubkey|created_at" (новий) або голий pubkey
     # (сесії, видані до цього патчу — стелю для них рахуємо від «зараз
@@ -167,8 +182,8 @@ async def verify_session_token(
         try:
             created_at = int(created_str)
         except ValueError:
-            created_at = int(time.time())
-        if time.time() - created_at > SESSION_ABSOLUTE_MAX_SECONDS:
+            created_at = now
+        if now - created_at > SESSION_ABSOLUTE_MAX_SECONDS:
             # Стеля вичерпана: прибираємо сесію так само, як revoke.
             await redis.delete(key)
             await redis.srem(

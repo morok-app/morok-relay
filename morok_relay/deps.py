@@ -23,6 +23,21 @@ logger = logging.getLogger(__name__)
 # on inactivity measured in days.
 DMS_CHECKIN_THROTTLE_SECONDS = 300
 
+# Аудит зовн. №4, P0 — активний анонімний користувач помилково "вмирав".
+# reap_anonymous_users (cleanup.py) косить username IS NULL з last_seen_at
+# старшим за 7 днів. Але last_seen_at оновлювався ЛИШЕ в _get_or_create_user
+# (users.py) — а той викликається тільки з /me, /me/username. Шлях
+# send_dm/send_group робить голий SELECT sender'а БЕЗ bump. Наслідок:
+# анонім, що щодня активно листується (саме той @anon_xxx сценарій із
+# хотфіксу 15.08 з федерацією), але жодного разу не відкриває /me — через
+# тиждень втрачав GroupMember, backup, DMS, попри активне спілкування.
+#
+# Годинний throttle — той самий coarse-heartbeat підхід, що для DMS вище:
+# reap дивиться на 7-денний поріг, тож затримка до години на запис у
+# Postgres не впливає на коректність, а UPDATE на КОЖЕН запит бив би по
+# базі даремно.
+LAST_SEEN_THROTTLE_SECONDS = 3600
+
 
 async def _bump_dms_check_in_for_pubkey(pubkey_hex: str) -> None:
     """
@@ -56,6 +71,37 @@ async def _bump_dms_check_in_for_pubkey(pubkey_hex: str) -> None:
             await db.commit()
     except Exception as e:
         logger.warning("DMS check-in bump failed for %s: %s", pubkey_hex[:16], e)
+
+
+async def _bump_last_seen(pubkey_hex: str) -> None:
+    """
+    Fire-and-forget: оновлює users.last_seen_at для АКТИВНОГО (наявного)
+    рядка. Свідомо НЕ створює/чіпає remote-кеш і не викликає
+    _get_or_create_user — цей bump лише для локальних користувачів, що
+    вже мають рядок (свіжий рядок і так отримує last_seen_at=now() при
+    створенні). Мовчки no-op, якщо рядка ще немає: перший запит на
+    /me/*, dms/groups create тощо його створить сам зі свіжим timestamp.
+    """
+    try:
+        from sqlalchemy import update
+        from .db import _session_factory
+        from .models import User
+
+        if _session_factory is None:
+            return
+
+        pubkey = bytes.fromhex(pubkey_hex)
+        now = int(time.time())
+
+        async with _session_factory() as db:
+            await db.execute(
+                update(User)
+                .where(User.pubkey == pubkey)
+                .values(last_seen_at=now)
+            )
+            await db.commit()
+    except Exception as e:
+        logger.warning("last_seen_at bump failed for %s: %s", pubkey_hex[:16], e)
 
 
 async def get_current_session(
@@ -115,6 +161,21 @@ async def get_current_session(
         should_bump = False
     if should_bump:
         asyncio.create_task(_bump_dms_check_in_for_pubkey(session.pubkey_hex))
+
+    # Той самий throttled fire-and-forget патерн, окремий Redis-ключ і
+    # окреме вікно (година, не 5 хв — last_seen_at потрібна лише грубо,
+    # проти 7-денного порогу reap_anonymous_users).
+    try:
+        should_bump_seen = await redis.set(
+            f"morok:last_seen_throttle:{session.pubkey_hex}",
+            b"1",
+            nx=True,
+            ex=LAST_SEEN_THROTTLE_SECONDS,
+        )
+    except Exception:
+        should_bump_seen = False
+    if should_bump_seen:
+        asyncio.create_task(_bump_last_seen(session.pubkey_hex))
 
     return session
 
