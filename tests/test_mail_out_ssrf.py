@@ -132,3 +132,41 @@ def test_pinned_dns_ipv6_family():
         result = socket.getaddrinfo("mx6.example.com", 25)
     assert result[0][0] == socket.AF_INET6
     assert result[0][4][0] == "2001:db8::1"
+
+
+# ── регресія, зловлена в проді 19.08 ─────────────────────────────────────
+def test_resolve_pinned_mx_never_returns_ipv6(monkeypatch):
+    """
+    ГОЛОВНИЙ ТЕСТ РЕГРЕСІЇ. Egress цього вузла жорстко прибитий до
+    IPv4 (source_address=(SOURCE_IP, 0) у send_external). Якщо MX має
+    і A, і AAAA записи (Gmail — саме такий випадок) і pinned IP
+    випадково опиниться IPv6 — smtplib падає з "Address family for
+    hostname not supported" на КОЖНОМУ MX, бо сокет AF_INET6
+    несумісний з IPv4-бінду. Явний family=AF_INET у запиті
+    гарантує, що це фізично неможливо.
+    """
+    def fake_gai(host, port, family=0, proto=0, **kw):
+        # Імітуємо getaddrinfo(family=AF_INET): реальна ОС фільтрує
+        # сама, тут перевіряємо, що ми ЗАПИТУЄМО саме AF_INET.
+        assert family == socket.AF_INET, \
+            "запит без family=AF_INET — IPv6 могла пройти першою"
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "",
+                ("142.250.0.27", port))]
+    monkeypatch.setattr(socket, "getaddrinfo", fake_gai)
+
+    result = _resolve_pinned_mx("gmail-smtp-in.l.google.com")
+    assert result == "142.250.0.27"
+    assert ":" not in result, "pinned IP виявився IPv6"
+
+
+def test_pinned_ip_family_matches_ipv4_source_address_expectation():
+    """
+    Наскрізна перевірка узгодженості: family, який _pinned_dns
+    підставить у getaddrinfo-результат для pinned IPv4-адреси, — це
+    AF_INET, сумісний з IPv4 source_address у send_external.
+    """
+    with _pinned_dns("mx.example.com", "93.184.216.34") as _:
+        pass
+    with _pinned_dns("mx.example.com", "93.184.216.34"):
+        result = socket.getaddrinfo("mx.example.com", 25)
+    assert result[0][0] == socket.AF_INET

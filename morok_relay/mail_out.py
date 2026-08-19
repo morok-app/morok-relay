@@ -68,10 +68,28 @@ def _is_public_ip(ip_str: str) -> bool:
 
 
 def _resolve_pinned_mx(hostname: str) -> str | None:
-    """Резолвить MX-hostname, повертає ОДНУ публічну адресу, або None
-    якщо резолв не вдався чи хоч одна повернута адреса приватна."""
+    """
+    Резолвить MX-hostname, повертає ОДНУ публічну IPv4-адресу, або
+    None якщо резолв не вдався чи хоч одна повернута адреса приватна.
+
+    РЕГРЕСІЯ, ЗНАЙДЕНА В ПРОДІ (19.08): раніше тут не було family=,
+    тобто getaddrinfo повертав і IPv4, і IPv6 разом. Weesь механізм
+    egress на цьому вузлі жорстко прибитий до IPv4 (source_address=
+    (SOURCE_IP, 0) нижче в send_external — навмисно, бо чистий PTR/
+    репутація тут лише на IPv4). Якщо ips[0] випадково виявлявся IPv6
+    (Gmail MX має AAAA-записи, і на хостах з IPv6-конективністю
+    getaddrinfo часто повертає IPv6 першим) — pinned IP був IPv6, а
+    source_address лишався IPv4: сокет AF_INET6 несумісний з IPv4-
+    бінду, і smtplib падав з "Address family for hostname not
+    supported" на КОЖНОМУ MX. Вхідна пошта це не зачіпало (інший
+    код-шлях) — звідси симптом "приходить, не йде". Явний family=
+    AF_INET прибирає цей клас неузгодженості раз і назавжди: pinned
+    IP і source_address тепер гарантовано з однієї сім'ї.
+    """
     try:
-        infos = socket.getaddrinfo(hostname, 25, proto=socket.IPPROTO_TCP)
+        infos = socket.getaddrinfo(
+            hostname, 25, family=socket.AF_INET, proto=socket.IPPROTO_TCP,
+        )
     except (socket.gaierror, UnicodeError, OSError):
         return None
     if not infos:
