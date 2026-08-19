@@ -331,9 +331,56 @@ class ReadReceiptItem(BaseModel):
     )
     group_id: str | None = Field(default=None, max_length=64)
 
+    # Опціональний підпис reader'а (аудит зовн. №4, MEDIUM). Обидва поля
+    # ОБОВ'ЯЗКОВО разом або відсутні разом — часткова пара безглузда.
+    # Legacy-клієнти, що не вміють підписувати, лишають обидва None —
+    # стара unsigned поведінка (задокументований у _handle_read_receipt
+    # ризик: недобросовісний peer relay міг би вигадати receipt) не
+    # зникає, поки клієнти цього не підтримають; тут лише готова
+    # інфраструктура для сильнішого шляху, коли клієнт дозріє.
+    reader_signature_hex: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{128}$",
+    )
+    signed_at: int | None = Field(default=None, ge=0)
+
 
 class ReadReceiptsRequest(BaseModel):
     reads: list[ReadReceiptItem] = Field(..., min_length=1, max_length=100)
+
+
+# Domain separation для підпису read receipt — той самий підхід, що
+# auth verify ("morok_auth") і DMS check-in ("morok_dms_checkin").
+_READ_RECEIPT_SIG_DOMAIN = "morok_read_receipt:v1"
+_READ_RECEIPT_SIG_WINDOW_SECONDS = 300
+
+
+def _verify_read_receipt_signature(
+    *, envelope_id: str, sender_pubkey_hex: str, reader_pubkey_hex: str,
+    group_id: str | None, signed_at: int, signature_hex: str,
+) -> bool:
+    """
+    Ed25519-перевірка підпису READER'а над конкретним read receipt
+    (аудит зовн. №4, MEDIUM). reader_pubkey_hex тут — ЗАВЖДИ
+    current.pubkey_hex з верифікованої сесії, ніколи з тіла запиту:
+    підмінити "хто підписав" через тіло неможливо.
+    """
+    now = int(time.time())
+    if abs(now - signed_at) > _READ_RECEIPT_SIG_WINDOW_SECONDS:
+        return False
+    message = crypto.canonical_json({
+        "morok_read_receipt": _READ_RECEIPT_SIG_DOMAIN,
+        "envelope_id": envelope_id,
+        "sender_pubkey_hex": sender_pubkey_hex,
+        "reader_pubkey_hex": reader_pubkey_hex,
+        "group_id": group_id,
+        "signed_at": signed_at,
+    })
+    try:
+        sig_bytes = bytes.fromhex(signature_hex)
+        pubkey_bytes = bytes.fromhex(reader_pubkey_hex)
+    except ValueError:
+        return False
+    return crypto.ed25519_verify(message, sig_bytes, pubkey_bytes)
 
 
 @router.post(
@@ -359,9 +406,17 @@ async def post_read_receipts(
 
     Privacy notes:
     - Receipts contain ONLY: which envelope, by which reader (this user).
-    - Receipts are NOT signed and NOT verified — a misbehaving client
-      could send fake receipts. That only fools the supposed sender,
-      not the relay. Acceptable in v1.
+    - Local receipts are implicitly authenticated by the bearer session
+      (reader_pubkey_hex = current.pubkey_hex) — no extra signature
+      needed for the LOCAL sender push.
+    - Cross-relay: an unsigned receipt asks the sender's home relay to
+      trust OUR relay's word for "user X read this". A misbehaving peer
+      could fabricate one; impact is limited to a misleading checkmark,
+      not plaintext exposure. Clients MAY now attach reader_signature_hex
+      + signed_at (Ed25519 over the receipt) — when present, we verify
+      it and forward the signature so the receiving relay can check it
+      independently instead of trusting us. Legacy clients that don't
+      sign keep working exactly as before.
     """
     settings = get_settings()
     reader_pubkey_hex = current.pubkey_hex
@@ -374,6 +429,22 @@ async def post_read_receipts(
         if r.sender_pubkey_hex == reader_pubkey_hex:
             skipped += 1
             continue
+
+        # Якщо клієнт НАМАГАВСЯ підписати (поле присутнє), але підпис
+        # не проходить — краще явно відмовити цей конкретний елемент,
+        # ніж тихо занизити гарантію до unsigned. Мовчазний даунгрейд
+        # ховав би від клієнта, що щось зламалось.
+        if r.reader_signature_hex is not None and r.signed_at is not None:
+            if not _verify_read_receipt_signature(
+                envelope_id=r.envelope_id,
+                sender_pubkey_hex=r.sender_pubkey_hex,
+                reader_pubkey_hex=reader_pubkey_hex,
+                group_id=r.group_id,
+                signed_at=r.signed_at,
+                signature_hex=r.reader_signature_hex,
+            ):
+                skipped += 1
+                continue
 
         try:
             sender_pubkey = bytes.fromhex(r.sender_pubkey_hex)
@@ -413,6 +484,12 @@ async def post_read_receipts(
                 "reader_pubkey_hex": reader_pubkey_hex,
                 "group_id": r.group_id,
             }
+            # Якщо підпис пройшов верифікацію вище — передаємо його
+            # далі. Приймаючий relay зможе перевірити НЕЗАЛЕЖНО, а не
+            # довіряти нашому слову "user X read this".
+            if r.reader_signature_hex is not None and r.signed_at is not None:
+                payload["reader_signature_hex"] = r.reader_signature_hex
+                payload["signed_at"] = r.signed_at
             synthetic_id = _synthetic_queue_id(
                 "read", r.envelope_id, reader_pubkey_hex, target_relay,
             )

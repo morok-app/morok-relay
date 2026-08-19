@@ -1047,6 +1047,41 @@ async def _handle_dm_delete_forward(envelope: dict, redis) -> "ForwardResponse":
     )
 
 
+# Той самий домен/вікно, що клієнт використовує для підпису — див.
+# _verify_read_receipt_signature у api/messages.py.
+_READ_RECEIPT_SIG_WINDOW_SECONDS = 300
+
+
+def _verify_read_receipt_signature_independently(
+    *, envelope_id: str, sender_pubkey_hex: str, reader_pubkey_hex: str,
+    group_id: str | None, signed_at: int, signature_hex: str,
+) -> bool:
+    """
+    Приймаючий relay перевіряє підпис READER'а САМ, а не довіряє
+    forwarding-релею на слово (аудит зовн. №4, MEDIUM). Той самий
+    canonical_json/domain, що клієнт підписував і local relay вже
+    звірив — але тут це робиться НЕЗАЛЕЖНО, публічним ключем reader'а
+    з envelope, без довіри до forwarding relay.
+    """
+    now = int(time.time())
+    if abs(now - signed_at) > _READ_RECEIPT_SIG_WINDOW_SECONDS:
+        return False
+    message = crypto.canonical_json({
+        "morok_read_receipt": "morok_read_receipt:v1",
+        "envelope_id": envelope_id,
+        "sender_pubkey_hex": sender_pubkey_hex,
+        "reader_pubkey_hex": reader_pubkey_hex,
+        "group_id": group_id,
+        "signed_at": signed_at,
+    })
+    try:
+        sig_bytes = bytes.fromhex(signature_hex)
+        pubkey_bytes = bytes.fromhex(reader_pubkey_hex)
+    except ValueError:
+        return False
+    return crypto.ed25519_verify(message, sig_bytes, pubkey_bytes)
+
+
 async def _handle_read_receipt(
     envelope: dict, db, redis, settings,
 ) -> "ForwardResponse":
@@ -1054,9 +1089,14 @@ async def _handle_read_receipt(
     A peer relay tells us "your user X had a message read by Y".
     Verify the sender lives on our relay, then push a WS event.
 
-    Read receipts are unsigned (cheap metadata). Acceptable risk: a
-    misbehaving peer relay could fabricate receipts; the only effect
-    is a misleading checkmark on the sender's screen.
+    Read receipts are unsigned BY DEFAULT (cheap metadata). Acceptable
+    risk: a misbehaving peer relay could fabricate receipts; the only
+    effect is a misleading checkmark on the sender's screen — never
+    plaintext exposure. Since the reader-signed path (see api/
+    messages.py) was added: if reader_signature_hex + signed_at are
+    present, we verify them OURSELVES against the reader's own pubkey
+    — the forwarding relay's word is no longer the only guarantee.
+    Legacy/unsigned receipts still work exactly as before.
     """
     from ..queue import publish_read_receipt as _publish_read
 
@@ -1064,12 +1104,32 @@ async def _handle_read_receipt(
     sender_pubkey_hex = envelope.get("sender_pubkey_hex")
     reader_pubkey_hex = envelope.get("reader_pubkey_hex")
     group_id = envelope.get("group_id")
+    reader_signature_hex = envelope.get("reader_signature_hex")
+    signed_at = envelope.get("signed_at")
 
     if not (envelope_id and sender_pubkey_hex and reader_pubkey_hex):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="read_receipt_missing_fields",
         )
+
+    # Якщо forwarding relay каже "цей receipt підписаний" — перевіряємо
+    # САМІ. Невалідний підпис при заявленій присутності — явна відмова
+    # (400), а не мовчазний даунгрейд до unsigned-довіри: forwarding
+    # relay або зламаний, або бреше про підпис.
+    if reader_signature_hex is not None and signed_at is not None:
+        if not _verify_read_receipt_signature_independently(
+            envelope_id=envelope_id,
+            sender_pubkey_hex=sender_pubkey_hex,
+            reader_pubkey_hex=reader_pubkey_hex,
+            group_id=group_id,
+            signed_at=int(signed_at),
+            signature_hex=reader_signature_hex,
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="read_receipt_invalid_signature",
+            )
 
     # Sanity: the named sender must be local. Otherwise this receipt
     # doesn't belong on our relay.
