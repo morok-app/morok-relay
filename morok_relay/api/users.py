@@ -516,7 +516,11 @@ async def lookup_username(
         # 2a. Redis cache
         cached = await _get_lookup_cache(redis, relay_host, normalized)
         if cached is not None:
-            logger.info("Federation lookup cache hit: %s on %s", normalized, relay_host)
+            # Username пошуку НЕ логуємо (аудит зовн. №4, MEDIUM): це
+            # публічний ендпоінт без авторизації, і логувати ХТО кого
+            # шукав через journald означало б другу базу метаданих поза
+            # TTL релея. relay_host досить для diagnostики маршрутизації.
+            logger.info("Federation lookup cache hit on %s", relay_host)
             return UserInfo(
                 pubkey_hex=cached["pubkey_hex"],
                 username=cached["username"],
@@ -525,7 +529,7 @@ async def lookup_username(
 
         # 2b. Federation lookup with retry
         logger.info(
-            "Federation lookup: %s on %s (with retry)", normalized, relay_host,
+            "Federation lookup on %s (with retry)", relay_host,
         )
         result = await _remote_lookup_with_retry(relay_host, normalized)
 

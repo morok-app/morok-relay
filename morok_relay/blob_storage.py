@@ -120,7 +120,19 @@ async def secure_delete_blob(envelope_id: str) -> bool:
             path.unlink()
             return True
         except OSError as e:
-            logger.error("Failed to secure-delete blob %s: %s", envelope_id, e)
+            # Обрізаний ідентифікатор — той самий принцип, що скрізь
+            # у relay (аудит зовн. №4, MEDIUM): повний envelope_id у
+            # логах не потрібен для diagnостики, а стабільний повний
+            # ID полегшує кореляцію журналу з іншими системами.
+            # ТИП помилки, не сам виняток: str(OSError) містить ПОВНИЙ
+            # шлях файлу, а шлях закінчується на envelope_id БЕЗ
+            # обрізки — обрізати лише перший аргумент замало, якщо
+            # виняток сам просочує ідентифікатор через власне
+            # повідомлення (зловлено власним тестом на цей фікс).
+            logger.error(
+                "Failed to secure-delete blob %s...: %s",
+                envelope_id[:8], type(e).__name__,
+            )
             return False
 
     return await asyncio.to_thread(_delete_sync)

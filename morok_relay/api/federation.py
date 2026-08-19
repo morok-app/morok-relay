@@ -360,13 +360,23 @@ async def forward(
     try:
         return await _forward_impl(body, db, redis)
     except HTTPException as e:
+        # Обрізані ідентифікатори (аудит зовн. №4, MEDIUM): цей лог
+        # спрацьовує на КОЖЕН відхилений forward, тобто регулярно, не
+        # як рідкісний edge case — повний recipient pubkey і group_id
+        # тут означали б стабільний метадата-слід у journald на щоденній
+        # основі, поза TTL самого релея. [:8] досить для diagnостики
+        # (розрізнити записи, зіставити з іншими [:8]-логами поруч),
+        # не досить для ідентифікації конкретної людини/групи.
         env_keys = list(body.envelope.keys()) if body.envelope else []
+        _gid = body.envelope.get("group_id") if body.envelope else None
+        _to = body.envelope.get("to") if body.envelope else None
         logger.warning(
-            "FORWARD_REJECTED status=%s detail=%s | envelope.kind=%s group_id=%s to=%s ts=%s keys=%s",
+            "FORWARD_REJECTED status=%s detail=%s | envelope.kind=%s "
+            "group_id=%s... to=%s... ts=%s keys=%s",
             e.status_code, e.detail,
             body.envelope.get("kind") if body.envelope else None,
-            body.envelope.get("group_id") if body.envelope else None,
-            body.envelope.get("to") if body.envelope else None,
+            (_gid[:8] if isinstance(_gid, str) else _gid),
+            (_to[:8] if isinstance(_to, str) else _to),
             body.envelope.get("ts") if body.envelope else None,
             env_keys,
         )
