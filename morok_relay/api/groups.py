@@ -35,6 +35,7 @@ from ..queue import (
 from ..push_sender import schedule_push
 from ..rate_limit import check_rate_limit, rate_limit_by_pubkey
 from ..schemas import (
+    GROUP_NAME_MAX_BYTES,
     GroupAddMemberRequest,
     GroupCreate,
     GroupEnvelopeAck,
@@ -1564,10 +1565,58 @@ async def apply_group_snapshot(
             detail="snapshot_missing_expected_home_relay",
         )
 
+    # ── Жорсткі межі протоколу на snapshot (аудит зовн. №4, MEDIUM) ──
+    #
+    # ЧОМУ. "Trusted peer" (сигнатура/TLS валідні) ≠ "peer не зламаний
+    # і не має багів". apply_group_snapshot довіряв структурі payload'а
+    # майже без перевірки: max_members = будь-яке int (0, від'ємне,
+    # мільйон), members = список БУДЬ-ЯКОЇ довжини, pubkey_hex — будь-
+    # яка парна кількість hex-символів (bytes.fromhex не перевіряє
+    # довжину; GroupMember.pubkey у Postgres — bytea без constraint на
+    # розмір, LargeBinary(32) у SQLAlchemy це лише hint, не CHECK).
+    # Скомпрометований або просто зламаний peer міг би засунути 32-байт
+    # інваріант, на який покладається решта коду (crypto.py verify,
+    # federation.py), або роздути один запит до сотень тисяч рядків.
+    # Це не auth-обхід — це containment: обмежуємо шкоду від
+    # довіреного, але потенційно скомпрометованого джерела.
+    PROTOCOL_MAX_MEMBERS = PREMIUM_TIER_MAX_MEMBERS
+
     try:
         gid = uuid.UUID(snapshot["group_id"])
-        creator_bytes = bytes.fromhex(snapshot["creator_pubkey_hex"])
-        name_bytes = base64.b64decode(snapshot["name_encrypted_b64"], validate=True)
+
+        creator_hex = snapshot["creator_pubkey_hex"]
+        if not isinstance(creator_hex, str) or len(creator_hex) != 64:
+            raise ValueError("creator_pubkey_hex must be exactly 64 hex chars")
+        creator_bytes = bytes.fromhex(creator_hex)
+
+        name_b64 = snapshot["name_encrypted_b64"]
+        if not isinstance(name_b64, str):
+            raise ValueError("name_encrypted_b64 must be a string")
+        name_bytes = base64.b64decode(name_b64, validate=True)
+        if len(name_bytes) > GROUP_NAME_MAX_BYTES:
+            raise ValueError(
+                f"name_encrypted too large (max {GROUP_NAME_MAX_BYTES} bytes)"
+            )
+
+        snap_max_members = int(snapshot.get("max_members", 50))
+        if not (1 <= snap_max_members <= PROTOCOL_MAX_MEMBERS):
+            raise ValueError(
+                f"max_members out of protocol range "
+                f"[1, {PROTOCOL_MAX_MEMBERS}]: {snap_max_members}"
+            )
+
+        raw_members = snapshot.get("members", [])
+        if not isinstance(raw_members, list):
+            raise ValueError("members must be a list")
+        if len(raw_members) > PROTOCOL_MAX_MEMBERS:
+            raise ValueError(
+                f"members list exceeds protocol max "
+                f"({len(raw_members)} > {PROTOCOL_MAX_MEMBERS})"
+            )
+
+        snap_ttl = int(snapshot.get("default_ttl_seconds", 86400))
+        if not (0 < snap_ttl <= 30 * 86400):
+            raise ValueError(f"default_ttl_seconds out of range: {snap_ttl}")
     except (KeyError, ValueError, TypeError) as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -1630,11 +1679,21 @@ async def apply_group_snapshot(
         group = existing
 
     # Reconcile members. Members listed in snapshot are authoritative.
+    # raw_members — уже перевірений вище список (тип + довжина ≤ протоколу).
+    # Кожен pubkey_hex тут додатково звіряється РІВНО на 32 байти (64 hex-
+    # символи): bytes.fromhex сам по собі приймає БУДЬ-ЯКУ парну кількість
+    # символів, тож без цієї перевірки кривий peer міг би засунути
+    # pubkey іншої довжини в GroupMember (bytea без CHECK-обмеження).
     snap_pubkeys: dict[bytes, dict] = {}
-    for m in snapshot.get("members", []):
+    for m in raw_members:
+        if not isinstance(m, dict):
+            continue
+        pk_hex = m.get("pubkey_hex")
+        if not isinstance(pk_hex, str) or len(pk_hex) != 64:
+            continue
         try:
-            pk = bytes.fromhex(m["pubkey_hex"])
-        except (KeyError, ValueError, TypeError):
+            pk = bytes.fromhex(pk_hex)
+        except ValueError:
             continue
         snap_pubkeys[pk] = m
 
