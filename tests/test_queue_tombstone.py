@@ -53,11 +53,18 @@ async def test_expired_envelope_raises_not_none(redis):
 
 
 async def test_redis_failure_raises_not_none(redis, monkeypatch):
-    """Збій Redis під час enqueue → EnqueueRejected, НЕ тихий None."""
+    """
+    Збій Redis під час enqueue → EnqueueRejected, НЕ тихий None.
+
+    depth-check+insert тепер атомарний EVAL (аудит зовн. №4) — мокаємо
+    саме eval, а не окрему клієнтську команду: старий prune+count
+    відбувався клієнтськими викликами, тепер усередині Lua-скрипта на
+    сервері Redis.
+    """
     async def boom(*a, **kw):
         raise ConnectionError("redis down")
 
-    monkeypatch.setattr(redis, "zremrangebyscore", boom)
+    monkeypatch.setattr(redis, "eval", boom)
     with pytest.raises(q.EnqueueRejected):
         await q.enqueue_envelope(redis, **_mk("bc" * 32))
 

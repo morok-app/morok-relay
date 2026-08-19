@@ -18,7 +18,7 @@ import uuid
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import selectinload
 
 from .. import blob_storage, crypto, invite_tokens
@@ -413,7 +413,25 @@ async def add_member(
             action="added",
             member_count=len(group.members),
         )
-    if len(group.members) >= group.max_members:
+
+    # Row-lock проти capacity-гонки (аудит зовн. №4, MEDIUM): без нього
+    # capacity перевірявся проти вже завантаженого group.members, а
+    # INSERT відбувався окремо — два одночасні add_member на ОСТАННЄ
+    # вільне місце могли обидва прочитати "є місце" і обидва вставити,
+    # перевищивши max_members на 1. FOR UPDATE серіалізує конкурентні
+    # add_member ЛИШЕ для цієї групи (інші групи не блокуються); лок
+    # тримається до кінця транзакції запиту.
+    await db.execute(
+        select(Group.id).where(Group.id == gid).with_for_update()
+    )
+    # Перечитуємо member_count ПІД локом — те, що завантажив _load_group
+    # раніше, могло вже застаріти, поки цей запит чекав на лок іншого
+    # паралельного add_member.
+    current_count = (await db.execute(
+        select(func.count()).select_from(GroupMember)
+        .where(GroupMember.group_id == gid)
+    )).scalar_one()
+    if current_count >= group.max_members:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"group_full_max_{group.max_members}_members",

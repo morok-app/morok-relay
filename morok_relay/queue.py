@@ -53,6 +53,36 @@ MAX_INBOX_QUEUE_DEPTH = 5000
 # клієнта), але не жити вічно — інакше volatile-ttl не має що витісняти.
 INBOX_KEY_TTL_SLACK_SECONDS = 3600
 
+# ── Атомарна prune+count+conditional-insert (аудит зовн. №4, MEDIUM) ──
+#
+# ЧОМУ. Раніше ZREMRANGEBYSCORE+ZCARD (перевірка) і ZADD (вставка)
+# були ОКРЕМИМИ round-trip. Документація називала MAX_INBOX_QUEUE_DEPTH
+# "hard physical limit", але між перевіркою і вставкою є вікно: кілька
+# паралельних відправників на ОДНОГО одержувача могли всі побачити
+# depth=4999<5000 і всі пройти — overshoot на кількість паралельних
+# запитів. Не catastrophic (обмежений concurrency, не необмежений), але
+# "hard cap" має бути дійсно hard, якщо ми так пишемо в коментарях.
+#
+# EVAL атомарний за визначенням (Redis виконує скрипт однопотоково) —
+# єдиний надійний спосіб зробити check-and-insert одним кроком без
+# WATCH/MULTI retry-loop (який тут негарно масштабується під високий
+# concurrency на популярного одержувача).
+_INBOX_ENQUEUE_LUA = """
+local key = KEYS[1]
+local now = tonumber(ARGV[1])
+local envelope_id = ARGV[2]
+local expires_at = tonumber(ARGV[3])
+local max_depth = tonumber(ARGV[4])
+
+redis.call('ZREMRANGEBYSCORE', key, 0, now)
+local depth = redis.call('ZCARD', key)
+if depth >= max_depth then
+    return 0
+end
+redis.call('ZADD', key, expires_at, envelope_id)
+return 1
+"""
+
 
 class EnqueueRejected(HTTPException):
     """
@@ -265,32 +295,6 @@ async def enqueue_envelope(
             status.HTTP_400_BAD_REQUEST, "envelope_already_expired",
         )
 
-    # ── Per-recipient queue cap (anti-flood storage guard) ──
-    # Hard physical limit on how many envelopes may wait for one recipient
-    # at once. Independent of the Redis rate-limiter (which is a separate,
-    # fail-open layer) — this protects storage even if that limiter is
-    # bypassed or Redis-side counters are unavailable. We first drop
-    # expired rows so a backlog of stale envelopes can't wedge delivery
-    # for a recipient who simply hasn't been online.
-    try:
-        await redis.zremrangebyscore(_inbox_key(recipient_pubkey_hex), 0, now)
-        depth = await redis.zcard(_inbox_key(recipient_pubkey_hex))
-    except Exception as e:
-        # Redis hiccup on the cap check — do NOT fail-open into unbounded
-        # growth. Treat as "cannot guarantee headroom" and refuse.
-        logger.warning("inbox queue-depth check failed, refusing enqueue: %s", e)
-        raise EnqueueRejected(
-            status.HTTP_503_SERVICE_UNAVAILABLE, "queue_backend_unavailable",
-        ) from e
-
-    if depth >= MAX_INBOX_QUEUE_DEPTH:
-        # Recipient's queue is full. Reject — sender (or their relay)
-        # will see this as a delivery failure and can retry later once
-        # the recipient drains their inbox.
-        raise EnqueueRejected(
-            status.HTTP_429_TOO_MANY_REQUESTS, "recipient_queue_full",
-        )
-
     meta = {
         "envelope_id": envelope_id,
         "from": sender_pubkey_hex,
@@ -328,8 +332,46 @@ async def enqueue_envelope(
         # caller — do nothing.
         return None
 
+    # ── Атомарний prune+count+conditional-insert (замість окремих
+    # zremrangebyscore/zcard/zadd — див. коментар біля _INBOX_ENQUEUE_LUA
+    # вгорі файлу: розділені кроки лишали вікно, де кілька паралельних
+    # відправників на ОДНОГО одержувача могли всі побачити місце під
+    # лімітом і всі пройти, прострілюючи "hard limit" на N. ──
+    try:
+        inserted = await redis.eval(
+            _INBOX_ENQUEUE_LUA,
+            1,
+            _inbox_key(recipient_pubkey_hex),
+            now,
+            envelope_id,
+            expires_at,
+            MAX_INBOX_QUEUE_DEPTH,
+        )
+    except Exception as e:
+        # Redis hiccup — не fail-open в необмежене зростання. meta вже
+        # записана (SET NX вище) — прибираємо її, щоб не лишити сироту.
+        logger.warning("inbox atomic enqueue failed, refusing: %s", e)
+        try:
+            await redis.delete(_envelope_meta_key(envelope_id))
+        except Exception:
+            pass
+        raise EnqueueRejected(
+            status.HTTP_503_SERVICE_UNAVAILABLE, "queue_backend_unavailable",
+        ) from e
+
+    if not inserted:
+        # Черга одержувача справді повна (перевірено атомарно, не
+        # "виглядала вільною секунду тому"). Прибираємо щойно записану
+        # meta — інакше вона висіла б сиротою до власного TTL.
+        try:
+            await redis.delete(_envelope_meta_key(envelope_id))
+        except Exception:
+            pass
+        raise EnqueueRejected(
+            status.HTTP_429_TOO_MANY_REQUESTS, "recipient_queue_full",
+        )
+
     async with redis.pipeline(transaction=True) as pipe:
-        pipe.zadd(_inbox_key(recipient_pubkey_hex), {envelope_id: expires_at})
         # TTL на САМ inbox-ключ. Без нього ZSET жив вічно: елементи
         # всередині мали score=expires_at і прибирались лише при явному
         # zremrangebyscore (тобто коли одержувач наступного разу
