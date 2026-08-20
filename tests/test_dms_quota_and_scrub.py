@@ -74,7 +74,7 @@ async def test_active_dms_count_capped(db):
     assert "too_many_active_dms" in e.value.detail
 
 
-async def test_cancelled_dms_do_not_count_toward_active_quota(db):
+async def test_cancelled_dms_do_not_count_toward_active_quota(db, redis):
     """CANCELLED звільняє місце в квоті — це не "5 DMS назавжди"."""
     await _ensure_user(db, OWNER)
     created_ids = []
@@ -82,7 +82,7 @@ async def test_cancelled_dms_do_not_count_toward_active_quota(db):
         info = await create_dms(_create_body(), _session(), db)
         created_ids.append(info.dms_id)
 
-    await cancel_dms(created_ids[0], _session(), db)
+    await cancel_dms(created_ids[0], _session(), db, redis, proof=None)
 
     # тепер має пройти — один слот звільнився
     info = await create_dms(_create_body(), _session(), db)
@@ -116,7 +116,7 @@ async def test_small_payloads_within_quota_allowed(db):
 
 
 # ── scrub на cancel ──────────────────────────────────────────────────────
-async def test_cancel_scrubs_payload(db):
+async def test_cancel_scrubs_payload(db, redis):
     """
     ГОЛОВНИЙ ТЕСТ. Власник явно відкликав DMS — ciphertext не має
     лишатись у БД, попри те що рядок (метадані) ще живий якийсь час.
@@ -124,7 +124,7 @@ async def test_cancel_scrubs_payload(db):
     await _ensure_user(db, OWNER)
     info = await create_dms(_create_body(1000), _session(), db)
 
-    await cancel_dms(info.dms_id, _session(), db)
+    await cancel_dms(info.dms_id, _session(), db, redis, proof=None)
 
     row = await db.get(DeadManSwitch, uuid.UUID(info.dms_id))
     assert row.status == DMSStatus.CANCELLED
@@ -132,11 +132,11 @@ async def test_cancel_scrubs_payload(db):
         "payload лишився в БД після явного cancel"
 
 
-async def test_double_cancel_is_idempotent_and_stays_scrubbed(db):
+async def test_double_cancel_is_idempotent_and_stays_scrubbed(db, redis):
     await _ensure_user(db, OWNER)
     info = await create_dms(_create_body(100), _session(), db)
-    await cancel_dms(info.dms_id, _session(), db)
-    result = await cancel_dms(info.dms_id, _session(), db)
+    await cancel_dms(info.dms_id, _session(), db, redis, proof=None)
+    result = await cancel_dms(info.dms_id, _session(), db, redis, proof=None)
     assert result.cancelled is True
 
     row = await db.get(DeadManSwitch, uuid.UUID(info.dms_id))

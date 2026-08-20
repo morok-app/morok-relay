@@ -23,14 +23,16 @@ import base64
 import logging
 import time
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Body, Depends, HTTPException, status
 from sqlalchemy import select
 
 from ..config import get_settings
-from ..deps import CurrentSession, DBSession
+from ..deps import CurrentSession, DBSession, RedisClient
 from ..models import EncryptedBackup, User, UserTier
-from ..rate_limit import rate_limit_tor_aware_by_path_param, rate_limit_by_pubkey
+from ..rate_limit import rate_limit_by_pubkey, rate_limit_tor_aware_by_path_param
+from ..sensitive_action import verify_sensitive_action
 from ..schemas import (
+    SensitiveActionProof,
     BackupCreateRequest,
     BackupDeleted,
     BackupInfo,
@@ -68,6 +70,7 @@ async def create_or_replace_backup(
     body: BackupCreateRequest,
     current: CurrentSession,
     db: DBSession,
+    redis: RedisClient,
 ) -> BackupInfo:
     pubkey_bytes = bytes.fromhex(current.pubkey_hex)
 
@@ -93,6 +96,31 @@ async def create_or_replace_backup(
     # Upsert: one backup per pubkey
     stmt = select(EncryptedBackup).where(EncryptedBackup.pubkey == pubkey_bytes)
     backup = (await db.execute(stmt)).scalar_one_or_none()
+
+    # Крипто-підтвердження (аудит зовн. №5, P1). Якщо клієнт ПЕРЕДАВ
+    # підпис — перевіряємо fail-closed, незалежно від того, це заміна
+    # чи перше створення (раз уже надіслав, недійсний підпис
+    # підозріліший за його повну відсутність). Якщо підпису немає
+    # взагалі — legacy bearer-only шлях, без змін (поки клієнти не
+    # підтримають підписування) — заміна БЕЗ підпису й далі можлива,
+    # це свідомий компроміс сумісності, не діра, що з'явилась щойно.
+    if body.action_signature_hex is not None:
+        settings = get_settings()
+        valid = await verify_sensitive_action(
+            redis,
+            action="backup_replace",
+            pubkey_hex=current.pubkey_hex,
+            target=current.pubkey_hex,
+            nonce=body.action_nonce or "",
+            timestamp=body.action_timestamp or 0,
+            signature_hex=body.action_signature_hex,
+            relay_name=settings.relay_name,
+        )
+        if not valid:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="invalid_action_proof",
+            )
 
     if backup is not None:
         backup.encrypted_seed = encrypted_seed
@@ -154,6 +182,8 @@ async def get_my_backup(
 async def delete_my_backup(
     current: CurrentSession,
     db: DBSession,
+    redis: RedisClient,
+    proof: SensitiveActionProof | None = Body(default=None),
 ) -> BackupDeleted:
     pubkey_bytes = bytes.fromhex(current.pubkey_hex)
     stmt = select(EncryptedBackup).where(EncryptedBackup.pubkey == pubkey_bytes)
@@ -161,6 +191,25 @@ async def delete_my_backup(
 
     if backup is None:
         return BackupDeleted(deleted=False)
+
+    # Крипто-підтвердження (аудит зовн. №5, P1) — див. sensitive_action.py.
+    if proof is not None and proof.action_signature_hex is not None:
+        settings = get_settings()
+        valid = await verify_sensitive_action(
+            redis,
+            action="backup_delete",
+            pubkey_hex=current.pubkey_hex,
+            target=current.pubkey_hex,
+            nonce=proof.action_nonce or "",
+            timestamp=proof.action_timestamp or 0,
+            signature_hex=proof.action_signature_hex,
+            relay_name=settings.relay_name,
+        )
+        if not valid:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="invalid_action_proof",
+            )
 
     await db.delete(backup)
     await db.flush()
@@ -228,5 +277,4 @@ async def restore_by_username(
         kdf_salt_b64=base64.b64encode(backup.kdf_salt).decode(),
         kdf_params=backup.kdf_params,
         schema_version=backup.schema_version,
-        username_at_backup=backup.username_at_backup,
     )

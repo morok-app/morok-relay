@@ -168,12 +168,12 @@ async def test_no_armed_dms_returns_zero_not_error(db):
     assert result.checked_in_count == 0
 
 
-async def test_cancelled_dms_not_bumped(db):
+async def test_cancelled_dms_not_bumped(db, redis):
     """Тільки ARMED реагує на check-in — CANCELLED лишається як є."""
     await _ensure_user(db)
     from morok_relay.api.dms import cancel_dms
     info = await _armed_dms(db)
-    await cancel_dms(info.dms_id, _session(), db)
+    await cancel_dms(info.dms_id, _session(), db, redis, proof=None)
 
     import uuid
     row = await db.get(DeadManSwitch, uuid.UUID(info.dms_id))

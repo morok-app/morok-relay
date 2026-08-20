@@ -167,7 +167,7 @@ async def test_delete_account_resets_username_changed_at(db, redis):
     )).scalar_one().id)
     assert row.username_changed_at is not None
 
-    await delete_me(_session(), db, redis)
+    await delete_me(_session(), db, redis, proof=None)
 
     await db.refresh(row)
     assert row.username is None

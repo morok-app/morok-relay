@@ -15,10 +15,13 @@ from __future__ import annotations
 import logging
 import time
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Body, HTTPException, status
 from sqlalchemy import delete, select
 
+from ..config import get_settings
 from ..deps import CurrentSession, DBSession, RedisClient
+from ..schemas import SensitiveActionProof
+from ..sensitive_action import verify_sensitive_action
 from ..sessions import revoke_all_sessions
 from ..models import (
     DeadManSwitch,
@@ -42,6 +45,7 @@ async def delete_me(
     current: CurrentSession,
     db: DBSession,
     redis: RedisClient,
+    proof: SensitiveActionProof | None = Body(default=None),
 ) -> dict:
     """
     Soft-delete the calling user and wipe their server-side data.
@@ -70,6 +74,30 @@ async def delete_me(
 
     Idempotent: a second call is a no-op (everything is already gone).
     """
+    # Крипто-підтвердження (аудит зовн. №5, P1) — найважливіше
+    # застосування sensitive_action.py: раніше вкрадений bearer сам
+    # по собі був достатнім, щоб стерти акаунт, backup, DMS і історію
+    # входів. Якщо клієнт передав підпис — перевіряємо fail-closed
+    # ПЕРЕД будь-якою мутацією. Якщо ні — legacy bearer-only шлях,
+    # без змін, поки клієнти не підтримають підписування.
+    if proof is not None and proof.action_signature_hex is not None:
+        settings = get_settings()
+        valid = await verify_sensitive_action(
+            redis,
+            action="account_delete",
+            pubkey_hex=current.pubkey_hex,
+            target=current.pubkey_hex,
+            nonce=proof.action_nonce or "",
+            timestamp=proof.action_timestamp or 0,
+            signature_hex=proof.action_signature_hex,
+            relay_name=settings.relay_name,
+        )
+        if not valid:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="invalid_action_proof",
+            )
+
     pubkey_bytes = bytes.fromhex(current.pubkey_hex)
     now = int(time.time())
 

@@ -457,7 +457,19 @@ BACKUP_MAX_BYTES = 1024
 BACKUP_KDF_SALT_BYTES = 16
 
 
-class BackupCreateRequest(BaseModel):
+# Спільні опціональні поля крипто-підтвердження незворотної дії
+# (аудит зовн. №5, P1 — sensitive_action.py). Усі три разом або
+# відсутні разом — часткова пара безглузда й трактується як
+# "підпису немає" (bearer-only legacy шлях).
+class SensitiveActionProof(BaseModel):
+    action_signature_hex: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{128}$",
+    )
+    action_nonce: str | None = Field(default=None, min_length=8, max_length=64)
+    action_timestamp: int | None = Field(default=None, ge=0)
+
+
+class BackupCreateRequest(SensitiveActionProof):
     encrypted_seed_b64: str = Field(...)
     kdf_salt_b64: str = Field(...)
     kdf_params: dict = Field(default_factory=dict)
@@ -538,11 +550,20 @@ class BackupInfo(BaseModel):
 
 
 class BackupRestoreResponse(BaseModel):
+    """
+    Публічна, НЕавтентифікована відповідь /backup/by-username/{username}
+    (аудит зовн. №5, MEDIUM — privacy leak). username_at_backup раніше
+    видавав нік, який був АКТУАЛЬНИМ на момент СТВОРЕННЯ бекапу — не
+    поточний. Сценарій: @alice робить backup → змінює нік на @bob →
+    бекап не переписується → сторонній шукає @bob через цей ендпоінт →
+    отримує "username_at_backup": "alice", зв'язуючи старий і новий
+    псевдонім того самого акаунта. Клієнту поле й не потрібне: він уже
+    знає ПОТОЧНИЙ username, саме за ним і робив цей запит.
+    """
     encrypted_seed_b64: str
     kdf_salt_b64: str
     kdf_params: dict
     schema_version: int
-    username_at_backup: str | None
 
 
 class BackupDeleted(BaseModel):

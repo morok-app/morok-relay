@@ -11,17 +11,19 @@ import base64
 import time
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Body, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import selectinload
 
 from ..config import get_settings
 from ..crypto import canonical_json, ed25519_verify
-from ..deps import CurrentSession, DBSession
+from ..deps import CurrentSession, DBSession, RedisClient
 from ..models import DeadManSwitch, DMSRecipient, DMSStatus, User, UserTier
 from ..rate_limit import rate_limit_by_pubkey
+from ..sensitive_action import verify_sensitive_action
 from ..schemas import (
+    SensitiveActionProof,
     DMS_FREE_TIER_MAX_ACTIVE,
     DMS_FREE_TIER_MAX_RECIPIENTS,
     DMS_FREE_TIER_MAX_TOTAL_BYTES,
@@ -342,7 +344,8 @@ async def check_in(
 
 @router.delete("/{dms_id}", response_model=DMSCancelResponse)
 async def cancel_dms(
-    dms_id: str, current: CurrentSession, db: DBSession,
+    dms_id: str, current: CurrentSession, db: DBSession, redis: RedisClient,
+    proof: SensitiveActionProof | None = Body(default=None),
 ) -> DMSCancelResponse:
     did = _parse_dms_id(dms_id)
     pubkey = bytes.fromhex(current.pubkey_hex)
@@ -351,6 +354,29 @@ async def cancel_dms(
         return DMSCancelResponse(dms_id=str(dms.id), cancelled=False)
     if dms.status == DMSStatus.CANCELLED:
         return DMSCancelResponse(dms_id=str(dms.id), cancelled=True)
+
+    # Крипто-підтвердження (аудит зовн. №5, P1). target=dms_id (не self
+    # pubkey!) — прив'язує підпис до КОНКРЕТНОГО DMS, інакше один
+    # валідний підпис на "скасування" міг би переграно закрити ІНШИЙ
+    # DMS того самого власника.
+    if proof is not None and proof.action_signature_hex is not None:
+        settings = get_settings()
+        valid = await verify_sensitive_action(
+            redis,
+            action="dms_cancel",
+            pubkey_hex=current.pubkey_hex,
+            target=str(did),
+            nonce=proof.action_nonce or "",
+            timestamp=proof.action_timestamp or 0,
+            signature_hex=proof.action_signature_hex,
+            relay_name=settings.relay_name,
+        )
+        if not valid:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="invalid_action_proof",
+            )
+
     dms.status = DMSStatus.CANCELLED
     dms.cancelled_at = int(time.time())
     # Scrub (аудит зовн. №3, HIGH): cancel лише ставив статус, ciphertext
