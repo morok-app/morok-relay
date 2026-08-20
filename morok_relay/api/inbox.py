@@ -42,7 +42,7 @@ from ..config import get_settings
 from ..deps import get_redis
 from ..queue import acknowledge_envelope, get_envelope_meta, list_inbox
 from ..rate_limit import release_ws_slot, reserve_ws_slot, refresh_ws_slot
-from ..sessions import verify_session_token
+from ..sessions import is_session_alive, verify_session_token
 
 logger = logging.getLogger(__name__)
 
@@ -297,10 +297,38 @@ async def inbox_socket(
             raise
 
     async def pinger_task() -> None:
-        """Periodic ping to detect stale connections."""
+        """
+        Periodic ping to detect stale connections.
+
+        ВИПРАВЛЕНО (аудит зовн. №5, P1): раніше сокет не мав ЖОДНОЇ
+        перевірки природної смерті сесії — лише explicit revoke (pub/
+        sub) закривав з'єднання. Викрадений token, для якого ще ДО
+        протухання встигли відкрити WS, жив би необмежено довго: sliding
+        TTL і 30-денна стеля стосуються HTTP-запитів, не вже відкритого
+        сокета. Атакуючий продовжував би бачити нові envelope events і
+        міг ACK-ати їх з черги жертви — без жодного HTTP-запиту, який
+        міг би зловити rate-limit чи щось інше.
+
+        is_session_alive() — non-refreshing (не verify_session_token!):
+        просто ЧИТАЄ стан, не продовжує TTL. Якщо викликати тут звичайний
+        verify_session_token(), сам факт пінгу нескінченно продовжував би
+        сесію — TTL ніколи не спрацював би, поки WS відкритий.
+        """
         try:
             while True:
                 await asyncio.sleep(PING_INTERVAL_SECONDS)
+
+                if not await is_session_alive(redis, token):
+                    logger.info(
+                        "inbox WS: session expired naturally for %s..., closing",
+                        pubkey_hex[:8],
+                    )
+                    with contextlib.suppress(Exception):
+                        await websocket.close(
+                            code=WS_CLOSE_AUTH_FAILED, reason="session_expired",
+                        )
+                    return
+
                 await websocket.send_json({"type": "ping"})
                 # Живе з'єднання => тримаємо лічильник онлайну живим...
                 try:

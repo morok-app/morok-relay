@@ -25,6 +25,71 @@ logger = logging.getLogger(__name__)
 settings = get_settings()
 
 
+# ============================================================================
+# Uvicorn WebSocket query-string redaction (аудит зовн. №5, CRITICAL —
+# зловлено ЖИВИМ доказом у продакшн journald на relay1: повний
+# 64-символьний session bearer у відкритому тексті).
+# ============================================================================
+#
+# ЩО СТАЛОСЯ. /ws/v1/inbox?token=<bearer> — bearer у query string, бо
+# WebSocket-протокол не має заголовків після handshake для передачі
+# custom auth. Це прийнятний компроміс САМ ПО СОБІ (той самий підхід,
+# що й у більшості WS-based API) — за умови, що query string ніде не
+# логується. nginx уже правильно робить `access_log off` для /ws/.
+#
+# Але uvicorn (клас WSProtocol / WebSocketProtocol, залежно від --ws
+# backend) логує WS accept/reject через get_path_with_query_string(),
+# і робить це через logger "uvicorn.error" — НЕ "uvicorn.access".
+# --no-access-log і navmisна відсутність access-log конфігурації тут
+# НІЧОГО не рятує: цей шлях логування взагалі не access-log. Результат
+# ми бачили НАЖИВО в journald:
+#
+#   INFO: ('IP', 0) - "WebSocket /ws/v1/inbox?token=0782d856...fbb5c4" [accepted]
+#
+# Повний bearer — прямо в системному журналі, куди його читає кожен,
+# хто має доступ до journalctl (адмін, log shipper, moninoring agent,
+# бекап /var/log).
+#
+# ФІКС. logging.Filter на "uvicorn.error", застосований на рівні
+# МОДУЛЯ (виконується одразу при імпорті morok_relay.main — задовго до
+# прийому першого WS-запиту, тож жоден запис не встигає проскочити
+# нередагованим). Редагуємо і record.args, і record.msg — так фікс не
+# залежить від точного форматного рядка, який може відрізнятись між
+# мінорними версіями uvicorn чи between WS-бекендами (websockets/
+# wsproto/websockets-sansio).
+_TOKEN_QUERY_RE = re.compile(r"([?&](?:token|ticket)=)[0-9a-fA-F]{16,}")
+
+
+class _UvicornCredentialRedactor(logging.Filter):
+    """
+    Редагує ГОТОВИЙ, повністю відформатований рядок (getMessage()), а
+    не msg і args окремо. ЗНАЙДЕНО ТЕСТОМ: якщо форматний рядок і
+    аргумент розбиті (наприклад msg="...token=%s...", args=(token,)),
+    редагування msg і args ПООДИНЦІ пропускало витік — префікс
+    "token=" сидить у msg (без самого значення), значення сидить у
+    args (без префіксу), і жодна з двох half-перевірок не спрацьовує.
+    getMessage() збирає їх в один рядок ЗАВЖДИ коректно, незалежно від
+    того, як саме побудований запис.
+    """
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            full_message = record.getMessage()
+        except Exception:
+            return True  # дивний формат запису — не блокуємо логування
+        redacted = _TOKEN_QUERY_RE.sub(r"\1[redacted]", full_message)
+        if redacted != full_message:
+            record.msg = redacted
+            record.args = ()  # msg уже готовий текст — форматувати вдруге не треба
+        return True
+
+
+logging.getLogger("uvicorn.error").addFilter(_UvicornCredentialRedactor())
+# uvicorn.access теж — про всяк випадок, якщо хтось увімкне access-log
+# (за замовчуванням він і так вимкнений в install.sh, але redaction
+# не повинен залежати від цього налаштування).
+logging.getLogger("uvicorn.access").addFilter(_UvicornCredentialRedactor())
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """

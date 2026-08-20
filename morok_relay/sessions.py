@@ -203,6 +203,48 @@ async def verify_session_token(
     return Session(token=token, pubkey_hex=pubkey_hex, expires_at=expires_at)
 
 
+async def is_session_alive(redis: redis_async.Redis, token: str) -> bool:
+    """
+    Non-refreshing перевірка: чи сесія ще жива ПРЯМО ЗАРАЗ, без побічних
+    ефектів (аудит зовн. №5, P1 — WS переживав природну смерть сесії).
+
+    ЧОМУ ОКРЕМА ФУНКЦІЯ, А НЕ verify_session_token(). WS-хендшейк
+    викликає verify_session_token() ОДИН РАЗ — далі сокет живе сам по
+    собі. Explicit revoke (logout/delete) публікує подію в pub/sub, WS
+    її ловить і закривається — це вже правильно. Але ПРИРОДНЕ
+    закінчення (sliding TTL без активності, чи 30-денна абсолютна
+    стеля) нічого не публікує: Redis-ключ просто зникає мовчки. Якби
+    pinger викликав verify_session_token() для періодичної перевірки,
+    він би сам ПРОДОВЖУВАВ sliding TTL на кожному пінгу — відкритий
+    сокет тоді ніколи не помирав би природно, що зводить нанівець сенс
+    самого TTL. is_session_alive() лише ЧИТАЄ (GET), нічого не пише:
+    не рефрешить TTL, не мігрує legacy-формат, не чіпає reverse-індекс.
+
+    Returns True, якщо сесія існує і (для нового формату) не
+    перевищила абсолютну стелю. Legacy bare-формат (без "|created_at")
+    вважається живим, доки природно не вичерпає TTL, — так само, як і
+    основний verify-шлях трактує його до першої міграції.
+    """
+    if not token:
+        return False
+    digest = _token_digest(token)
+    value = await redis.get(_session_key(digest))
+    if value is None:
+        value = await redis.get(_session_key(token))  # legacy bare key
+        if value is None:
+            return False
+    raw = value.decode("utf-8")
+    _, _, created_str = raw.partition("|")
+    if created_str:
+        try:
+            created_at = int(created_str)
+        except ValueError:
+            return True  # непарсибельний created_at — не наша турбота тут
+        if int(time.time()) - created_at > SESSION_ABSOLUTE_MAX_SECONDS:
+            return False
+    return True
+
+
 async def revoke_session(redis: redis_async.Redis, token: str) -> bool:
     """
     Delete a single session token (logout from this device).
