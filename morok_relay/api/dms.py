@@ -14,6 +14,7 @@ import uuid
 from fastapi import APIRouter, Body, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select, update
+from sqlalchemy import text as sa_text
 from sqlalchemy.orm import selectinload
 
 from ..config import get_settings
@@ -167,11 +168,22 @@ async def create_dms(
     # дешева машина забивання Postgres). rate_limit_dms_create обмежує
     # лише ЧАСТОТУ створення (5/хв) — при 256 KB на запис це ~1.76 GiB/
     # добу з ОДНОГО pubkey, а Ed25519-ідентичності дешеві, тож per-pubkey
-    # rate-limit не є Sybil-перешкодою. FOR UPDATE-подібного захисту тут
-    # не потрібно: перевищення квоти під гонкою в найгіршому разі дає
-    # ОДИН зайвий рядок, не необмежене зростання — ARMED-рахунок і сума
-    # рахуються атомарним запитом ДО insert, а сам insert синхронний у
-    # межах запиту.
+    # rate-limit не є Sybil-перешкодою.
+    #
+    # ВИПРАВЛЕНО (аудит зовн. №5, MEDIUM): попередній коментар тут
+    # стверджував, що гонка "в найгіршому разі дає ОДИН зайвий рядок"
+    # — це неправда, той самий клас check-then-insert race, що ми вже
+    # закривали для inbox depth і group capacity. N одночасних
+    # create_dms можуть УСІ виконати SELECT до того, як хоч один
+    # закомітить INSERT — усі бачать однаковий active_count, усі
+    # проходять. pg_advisory_xact_lock (той самий підхід, що вже working
+    # для mail-квоти в api/mail.py) серіалізує конкурентні create_dms
+    # ЛИШЕ для ЦЬОГО pubkey — інші користувачі не блокуються. Лок
+    # тримається до кінця транзакції запиту.
+    await db.execute(
+        sa_text("SELECT pg_advisory_xact_lock(hashtext(:pk))"),
+        {"pk": current.pubkey_hex},
+    )
     active_stmt = (
         select(func.count(), func.coalesce(func.sum(
             func.length(DeadManSwitch.payload_encrypted)
