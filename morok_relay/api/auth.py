@@ -19,7 +19,7 @@ from ..config import get_settings
 from ..crypto import canonical_json, ed25519_verify
 from ..deps import CurrentSession, DBSession, RedisClient
 from ..models import LoginLog, User
-from ..rate_limit import rate_limit_tor_aware_by_body_pubkey
+from ..rate_limit import rate_limit_by_pubkey, rate_limit_tor_aware_by_body_pubkey
 from ..schemas import (
     AuthRequest,
     AuthResponse,
@@ -28,8 +28,10 @@ from ..schemas import (
     LogoutResponse,
 )
 from ..sessions import (
+    WS_TICKET_TTL_SECONDS,
     consume_challenge,
     create_session,
+    issue_ws_ticket,
     revoke_all_sessions,
     revoke_session,
     store_challenge,
@@ -38,6 +40,36 @@ from ..sessions import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["auth"])
+
+
+@router.post(
+    "/ws-ticket",
+    summary="Issue a short-lived one-time ticket for WebSocket handshake",
+    dependencies=[Depends(rate_limit_by_pubkey("ws_ticket", 30))],
+)
+async def get_ws_ticket(
+    current: CurrentSession, redis: RedisClient,
+) -> dict:
+    """
+    Паралельна, кращого якості інфраструктура для WS-автентифікації
+    (аудит зовн. №5 — доповнення до critical WS-token-leak фіксу).
+
+    ЧОМУ ЦЕ ІСНУЄ. /ws/v1/inbox?token=<bearer> досі працює НЕЗМІННО —
+    старі клієнти нічого не втрачають. Але сам bearer у query string
+    — довгоживучий credential у місці, звідки він теоретично може
+    просочитись різними шляхами (логи проксі, browser history, той
+    самий uvicorn-leak, який ми вже закрили redaction-фільтром — це
+    другий, незалежний шар, не заміна першого).
+
+    Клієнт, що підтримує цей крок, викликає цей ендпоінт через
+    ЗВИЧАЙНИЙ HTTP bearer (Authorization header — тут це доступно, на
+    відміну від WS), отримує ticket, і негайно підключається з
+    ?ticket=<ticket> замість ?token=<bearer>. Ticket живе секунди й
+    споживається атомарно при першому використанні — навіть повний
+    leak такого значення практично марний.
+    """
+    ticket = await issue_ws_ticket(redis, current.pubkey_hex)
+    return {"ticket": ticket, "expires_in": WS_TICKET_TTL_SECONDS}
 
 
 async def _daily_ip_hash(redis, ip: str) -> str:

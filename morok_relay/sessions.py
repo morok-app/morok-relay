@@ -245,6 +245,59 @@ async def is_session_alive(redis: redis_async.Redis, token: str) -> bool:
     return True
 
 
+# Скільки живе одноразовий WS-ticket. Секунди, не хвилини: ticket
+# споживається негайно при handshake, вікно потрібне лише щоб
+# покрити мережеву затримку між видачею і підключенням.
+WS_TICKET_TTL_SECONDS = 25
+
+
+async def issue_ws_ticket(redis: redis_async.Redis, pubkey_hex: str) -> str:
+    """
+    Короткоживучий одноразовий ticket для WS-handshake (аудит зовн.
+    №5 — доповнення до critical WS-token-leak фіксу). Клієнт отримує
+    його через звичайний HTTP bearer auth (Authorization header — НЕ
+    query string, для HTTP-запитів це доступно на відміну від WS), і
+    одразу підключається з ?ticket=<ticket> замість ?token=<bearer>.
+
+    Навіть якщо ticket десь потрапить у лог (той самий шлях, який ми
+    вже закрили redaction-фільтром для WS query string), він живе
+    рахунок секунд і споживається атомарно при першому використанні —
+    другий, незалежний шар захисту, а не заміна першого.
+    """
+    ticket = secrets.token_urlsafe(32)
+    await redis.set(
+        f"morok:ws_ticket:{ticket}", pubkey_hex.encode("utf-8"),
+        ex=WS_TICKET_TTL_SECONDS, nx=True,
+    )
+    return ticket
+
+
+async def consume_ws_ticket(redis: redis_async.Redis, ticket: str) -> str | None:
+    """
+    Атомарно споживає ticket (GETDEL — одна команда, get+delete без
+    вікна між ними). Повертає pubkey_hex або None, якщо ticket
+    невідомий, протух чи вже використаний раніше.
+    """
+    raw = await redis.getdel(f"morok:ws_ticket:{ticket}")
+    return raw.decode("utf-8") if raw is not None else None
+
+
+async def has_any_live_session(redis: redis_async.Redis, pubkey_hex: str) -> bool:
+    """
+    Чи є ХОЧ ОДНА жива сесія для цього pubkey — на відміну від
+    is_session_alive(token), яка перевіряє КОНКРЕТНИЙ токен.
+
+    Потрібна для WS-з'єднань, автентифікованих через одноразовий
+    ticket (ws_ticket.py): такий сокет НЕ прив'язаний до конкретного
+    bearer-токена (ticket сам одноразовий і вже спожитий на handshake,
+    повторно перевіряти нема чого), тож pinger для нього перевіряє
+    "чи власник взагалі ще має якусь живу сесію", а не долю одного
+    токена.
+    """
+    count = await redis.scard(_user_sessions_key(pubkey_hex))
+    return bool(count)
+
+
 async def revoke_session(redis: redis_async.Redis, token: str) -> bool:
     """
     Delete a single session token (logout from this device).

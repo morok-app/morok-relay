@@ -2,6 +2,9 @@
 WebSocket inbox — real-time delivery of envelope notifications.
 
 URL: wss://relay1.morok.app/ws/v1/inbox?token=<session_token>
+  або: wss://relay1.morok.app/ws/v1/inbox?ticket=<one-time ticket>
+       (отриманий через POST /auth/ws-ticket — аудит зовн. №5,
+       рекомендований шлях для нових клієнтів)
 
 Why query token instead of Authorization header
 -----------------------------------------------
@@ -9,6 +12,13 @@ Browsers do not allow setting custom headers on WebSocket connections
 (unlike HTTP). Native clients can, but to keep parity we accept the token
 as a query parameter. Token is only used for the handshake — once the
 connection is established, no further auth is needed for THIS connection.
+
+?ticket= — інший шлях, той самий обмежувач (WS не має заголовків), але
+з коротшим і одноразовим значенням замість довгоживучого bearer'а:
+клієнт викликає POST /auth/ws-ticket через ЗВИЧАЙНИЙ HTTP bearer
+(Authorization header тут доступний), отримує ticket на секунди, і
+підключається з ним. Старий ?token= шлях лишається без змін — обидва
+підтримуються паралельно.
 
 What the server pushes
 ----------------------
@@ -42,7 +52,12 @@ from ..config import get_settings
 from ..deps import get_redis
 from ..queue import acknowledge_envelope, get_envelope_meta, list_inbox
 from ..rate_limit import release_ws_slot, reserve_ws_slot, refresh_ws_slot
-from ..sessions import is_session_alive, verify_session_token
+from ..sessions import (
+    consume_ws_ticket,
+    has_any_live_session,
+    is_session_alive,
+    verify_session_token,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -63,18 +78,23 @@ PING_INTERVAL_SECONDS = 30
 @router.websocket("/inbox")
 async def inbox_socket(
     websocket: WebSocket,
-    token: str = Query(..., min_length=64, max_length=64),
+    token: str | None = Query(default=None, min_length=64, max_length=64),
+    ticket: str | None = Query(default=None, min_length=16, max_length=64),
 ) -> None:
     """
     Real-time delivery channel for authenticated users.
 
-    Handshake: client connects with ?token=<session_token>. Server verifies,
-    accepts the connection, sends a catch-up frame with current inbox,
-    then forwards new envelopes as they arrive.
+    Handshake: client connects with ?token=<session_token> (bearer у
+    query string, є з дня одного — доведеться підтримувати ще довго)
+    АБО ?ticket=<one-time ticket> (аудит зовн. №5 — новий, кращий
+    шлях: ticket видається через POST /auth/ws-ticket за звичайним
+    HTTP bearer, живе секунди й спалюється атомарно при handshake).
+    Обидва шляхи рівноправні для клієнта, ticket пріоритетний, якщо
+    передані обидва (малоймовірний випадок, але детермінований).
     """
     redis = get_redis()
 
-    # 1. Authenticate via session token
+    # 1. Authenticate — ticket-first, token як fallback.
     #
     # ВАЖЛИВО: спершу accept(), і лише потім close(code=...).
     # У Starlette close() ДО accept() не надсилає WebSocket-кадр закриття —
@@ -87,17 +107,34 @@ async def inbox_socket(
     # Приймаємо з'єднання на мілісекунди, щоб мати змогу передати причину,
     # і одразу закриваємо. Коди в діапазоні 4000-4999 зарезервовані для
     # застосунку саме для таких випадків.
-    session = await verify_session_token(redis, token)
-    if session is None:
+    pubkey_hex: str | None = None
+    auth_via_ticket = False
+
+    if ticket:
+        pubkey_hex = await consume_ws_ticket(redis, ticket)
+        auth_via_ticket = pubkey_hex is not None
+
+    if pubkey_hex is None and token:
+        session = await verify_session_token(redis, token)
+        if session is not None:
+            pubkey_hex = session.pubkey_hex
+
+    if pubkey_hex is None:
         await websocket.accept()
         await websocket.close(code=WS_CLOSE_AUTH_FAILED, reason="auth_failed")
         return
 
-    pubkey_hex = session.pubkey_hex
     # Хеш власного токена: за ним відрізняємо адресовану саме нам подію
     # session_revoked від такої ж події для іншого пристрою користувача
-    # (канал pub/sub спільний на весь акаунт).
-    _my_token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    # (канал pub/sub спільний на весь акаунт). Для ticket-based з'єднання
+    # немає конкретного bearer — None означає "не прив'язаний до одного
+    # токена": explicit revoke_all (token_hash=None у події) закриє й
+    # такий сокет, а revoke ОДНОГО bearer'а — ні (ticket-based сокет не
+    # належить жодному з них персонально).
+    _my_token_hash = (
+        hashlib.sha256(token.encode("utf-8")).hexdigest()
+        if (token and not auth_via_ticket) else None
+    )
 
     # Enforce the per-pubkey concurrent-connection cap. The helper and
     # the setting existed since day one but were never wired in — without
@@ -313,12 +350,24 @@ async def inbox_socket(
         просто ЧИТАЄ стан, не продовжує TTL. Якщо викликати тут звичайний
         verify_session_token(), сам факт пінгу нескінченно продовжував би
         сесію — TTL ніколи не спрацював би, поки WS відкритий.
+
+        Для ticket-based з'єднань (аудит зовн. №5, доповнення) немає
+        КОНКРЕТНОГО bearer-токена для перевірки — ticket одноразовий і
+        вже спожитий на handshake. Перевіряємо ЗАГАЛЬНИЙ стан: чи
+        власник ВЗАГАЛІ ще має бодай одну живу сесію десь. Якщо всі
+        його сесії відкликані чи протухли — ticket-based сокет теж
+        має природно померти.
         """
         try:
             while True:
                 await asyncio.sleep(PING_INTERVAL_SECONDS)
 
-                if not await is_session_alive(redis, token):
+                still_alive = (
+                    await has_any_live_session(redis, pubkey_hex)
+                    if auth_via_ticket
+                    else await is_session_alive(redis, token)
+                )
+                if not still_alive:
                     logger.info(
                         "inbox WS: session expired naturally for %s..., closing",
                         pubkey_hex[:8],
