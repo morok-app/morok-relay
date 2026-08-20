@@ -557,6 +557,29 @@ async def list_inbox(
     return out
 
 
+async def is_envelope_in_inbox(
+    redis: redis_async.Redis,
+    recipient_pubkey_hex: str,
+    envelope_id: str,
+) -> bool:
+    """
+    Пряма перевірка належності: чи цей envelope_id є ЧЛЕНОМ inbox-ZSET
+    цього одержувача — незалежно від того, скільки всього елементів у
+    черзі (жорсткий свіжий прохід: список — тут ZSCORE — не сканування
+    обмеженого вікна).
+
+    ЧОМУ ЦЕ ОКРЕМА ФУНКЦІЯ. list_inbox(limit=200) повертає лише
+    найстаріші 200 записів; get_envelope_blob() раніше перевіряв
+    авторизацію через "чи цей id входить у ці перші 200" — при черзі
+    понад 200 (максимум за дизайном 5000, MAX_INBOX_QUEUE_DEPTH)
+    легітимний власник конверта №201+ отримував хибний 404, попри те
+    що конверт реально в його черзі. ZSCORE — O(1), коректний для
+    будь-якого розміру черги.
+    """
+    score = await redis.zscore(_inbox_key(recipient_pubkey_hex), envelope_id)
+    return score is not None
+
+
 async def get_envelope_meta(
     redis: redis_async.Redis,
     envelope_id: str,

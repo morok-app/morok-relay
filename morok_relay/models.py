@@ -267,7 +267,12 @@ class EncryptedBackup(Base):
     kdf_salt: Mapped[bytes] = mapped_column(LargeBinary(16), nullable=False)
     kdf_params: Mapped[dict] = mapped_column(
         JSONB, nullable=False, server_default="{}",
-        comment="Client-defined KDF parameters: algorithm, iterations, etc.",
+        comment="KDF parameters (algorithm, iterations, etc). Клієнт "
+                "задає значення, але сервер валідує мінімуми при "
+                "збереженні (argon2id, memory>=64MiB, iterations>=2 — "
+                "див. BackupCreateRequest._kdf_floor у schemas.py, "
+                "аудит зовн. №2): не повністю client-defined, як тут "
+                "раніше писалось.",
     )
     schema_version: Mapped[int] = mapped_column(
         Integer, nullable=False, default=1, server_default="1",
@@ -342,8 +347,13 @@ class InboxToken(Base):
     The recipient generates a random secret token client-side, registers
     sha256(token) here, and shares the token itself with contacts over
     E2EE. A sealed envelope is accepted iff sha256(presented_token)
-    matches a registered hash for the recipient. Up to 2 rows per user
-    (current + previous) so rotation doesn't break in-flight senders.
+    matches a registered hash for the recipient.
+
+    Оновлено: не "2 роти (current+previous)", як тут раніше писалось —
+    модель перейшла на per-contact токени (окремий hash на кожного
+    контакта, revocable по одному через /inbox-token/revoke), стеля —
+    MAX_TOKENS_PER_PUBKEY = 64 (api/sealed.py), найстарші витісняються
+    понад цю межу.
     """
     __tablename__ = "inbox_tokens"
 
@@ -435,10 +445,18 @@ class LoginLog(Base):
         operator with DB access can confirm that two logins came from
         the same network within a 24h window, but linkability evaporates
         after the salt rolls over.
-      - daily_salt = sha256(relay_privkey || UTC date string). If the
-        relay's private key were ever exfiltrated, hashes from that day
-        could in theory be brute-forced against a precomputed dictionary
-        of all IPv4 — but after the salt rotates, the window closes.
+      - daily_salt — ЕФЕМЕРНА (аудит зовн. №2, оновлено): випадкові 32
+        байти, згенеровані на перший вхід доби (SET NX) і збережені в
+        Redis з TTL 48 годин, НЕ детерміновані від relay_privkey. Це
+        свідома зміна: детермінована сіль (стара схема, sha256(relay_
+        privkey || дата)) відкривала ретроспективну атаку — маючи
+        privkey, можна було б через рік відтворити сіль за будь-яку
+        дату й перебрати весь IPv4-простір. Ефемерна сіль фізично
+        зникає з TTL — навіть повна компрометація сервера відкриває
+        щонайбільше сьогодні-вчора. Fallback на стару детерміновану
+        схему лишається ТІЛЬКИ при недоступності Redis (див.
+        _daily_ip_hash в api/auth.py) — гірший за нову, кращий за
+        відсутність журналу.
       - user_agent is truncated to 255 chars.
       - We keep at most 30 rows per pubkey; older entries are pruned on
         insert.

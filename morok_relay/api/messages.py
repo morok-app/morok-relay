@@ -29,6 +29,7 @@ from ..queue import (
     delete_envelope_by_sender,
     enqueue_envelope,
     envelope_exists,
+    is_envelope_in_inbox,
     list_inbox,
     publish_read_receipt,
 )
@@ -268,8 +269,13 @@ async def get_envelope_blob(
             detail="malformed_envelope_id",
         )
 
-    inbox = await list_inbox(redis, current.pubkey_hex, limit=200)
-    if not any(e["envelope_id"] == envelope_id for e in inbox):
+    # ВИПРАВЛЕНО (жорсткий свіжий прохід): раніше перевіряли належність
+    # через list_inbox(limit=200) — "чи id входить у перші 200
+    # найстаріших записів". При черзі понад 200 (максимум за дизайном
+    # 5000) власник конверта №201+ отримував хибний 404, попри те що
+    # конверт реально в його черзі. is_envelope_in_inbox — пряма
+    # ZSCORE-перевірка, коректна для будь-якого розміру черги.
+    if not await is_envelope_in_inbox(redis, current.pubkey_hex, envelope_id):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="envelope_not_in_your_inbox",
