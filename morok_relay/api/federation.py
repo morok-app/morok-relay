@@ -768,16 +768,20 @@ async def _handle_group_forward(
             "sig": sig_hex,
             "from_username": envelope.get("from_username"),
         }
-        local_count, remote_relay_count = await do_group_fanout(
-            group=group,
-            envelope=envelope_for_fanout,
-            envelope_id=envelope_id,
-            db=db,
-            redis=redis,
+        local_delivered, remote_relay_count, remote_recipients, skipped = (
+            await do_group_fanout(
+                group=group,
+                envelope=envelope_for_fanout,
+                envelope_id=envelope_id,
+                db=db,
+                redis=redis,
+            )
         )
         logger.info(
-            "Group forward to_host %s: local=%d remote_relays=%d",
-            envelope_id[:8], local_count, remote_relay_count,
+            "Group forward to_host %s: local_delivered=%d remote_relays=%d "
+            "remote_recipients=%d some_skipped=%s",
+            envelope_id[:8], local_delivered, remote_relay_count,
+            remote_recipients, skipped,
         )
         return ForwardResponse(accepted=True, envelope_id=envelope_id)
 

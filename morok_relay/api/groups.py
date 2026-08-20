@@ -702,7 +702,9 @@ async def do_group_fanout(
       - persisted the blob via blob_storage.write_blob
       - verified that this relay IS the group's home
 
-    Returns (local_count, remote_relay_count) for the ack.
+    Returns (local_delivered_count, remote_relay_count,
+    remote_recipient_count, some_local_skipped) for the ack — див.
+    коментар у GroupEnvelopeAck.some_recipients_skipped.
     """
     settings = get_settings()
 
@@ -736,8 +738,15 @@ async def do_group_fanout(
         else:
             remote_by_relay.setdefault(home, []).append(pk_hex)
 
+    # Аудит зовн. №5, MEDIUM: раніше повернене значення тут просто
+    # відкидалось (виклик без присвоєння) — сервер потім підтверджував
+    # відправнику доставку N одержувачам, хоча частину N могло бути
+    # мовчки пропущено через переповнений inbox. enqueue_envelope_for_
+    # recipients уже РАХУЄ реальний eligible-список, ми лише перестали
+    # його ігнорувати.
+    local_delivered_count = 0
     if local_recipients:
-        await enqueue_envelope_for_recipients(
+        _, local_delivered_count = await enqueue_envelope_for_recipients(
             redis=redis,
             envelope_id=envelope_id,
             sender_pubkey_hex=envelope["from"],
@@ -758,6 +767,7 @@ async def do_group_fanout(
             sender_username=envelope.get("from_username"),
             group_id=str(group.id),
         )
+    some_local_skipped = local_delivered_count < len(local_recipients)
 
     now = int(time.time())
     for target_relay, members_on_relay in remote_by_relay.items():
@@ -793,7 +803,13 @@ async def do_group_fanout(
     if remote_by_relay:
         await db.flush()
 
-    return len(local_recipients), len(remote_by_relay)
+    remote_recipient_count = sum(len(v) for v in remote_by_relay.values())
+    return (
+        local_delivered_count,
+        len(remote_by_relay),
+        remote_recipient_count,
+        some_local_skipped,
+    )
 
 
 @router.post(
@@ -974,7 +990,10 @@ async def send_group_message(
         "sig": body.sig,
         "from_username": sender_username,
     }
-    local_count, remote_relay_count = await do_group_fanout(
+    (
+        local_delivered_count, _remote_relay_count,
+        remote_recipient_count, some_local_skipped,
+    ) = await do_group_fanout(
         group=group,
         envelope=envelope_for_fanout,
         envelope_id=envelope_id,
@@ -985,9 +1004,15 @@ async def send_group_message(
     return GroupEnvelopeAck(
         envelope_id=envelope_id,
         queued=True,
-        # Approximation: members minus sender. (Some remote relays may
-        # have multiple members behind one outbound row.)
-        recipient_count=max(0, len(group.members) - 1),
+        # Аудит зовн. №5, MEDIUM: раніше тут стояло len(group.members)-1
+        # — запитана кількість, незалежно від того, чи справді вставили
+        # конверт у чергу. Тепер: local_delivered_count — РЕАЛЬНО
+        # підтверджена локальна доставка; remote_recipient_count — «на
+        # federation forward відправлено», не «доставлено» (це ми
+        # дізнаємось лише асинхронно, тож для remote чесна семантика —
+        # саме «спробували», а не гарантія).
+        recipient_count=local_delivered_count + remote_recipient_count,
+        some_recipients_skipped=some_local_skipped,
         expires_at=expires_at,
     )
 
