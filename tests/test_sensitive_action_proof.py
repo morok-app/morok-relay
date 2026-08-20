@@ -211,7 +211,7 @@ async def test_delete_me_accepts_valid_proof(db, redis):
         action_timestamp=now,
     )
     result = await delete_me(session, db, redis, proof=proof)
-    assert result == {"deleted": True}
+    assert result == {"deleted": True, "sessions_revoked": True}
 
 
 async def test_delete_me_still_works_without_proof_legacy(db, redis):
@@ -231,7 +231,7 @@ async def test_delete_me_still_works_without_proof_legacy(db, redis):
 
     session = Session(token="t" * 64, pubkey_hex=OWNER, expires_at=2**31)
     result = await delete_me(session, db, redis, proof=None)
-    assert result == {"deleted": True}
+    assert result == {"deleted": True, "sessions_revoked": True}
 
 
 # ── DMS cancel: target=dms_id, не self pubkey ────────────────────────────

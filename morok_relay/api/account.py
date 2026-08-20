@@ -12,6 +12,7 @@ intentionally client-side — the relay never sees the mnemonic.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 
@@ -174,17 +175,45 @@ async def delete_me(
     # акаунт» будь-який раніше виданий токен (у тому числі вкрадений)
     # продовжував працювати до кінця свого 7-денного вікна, а відкритий
     # сокет — приймати ack.
-    try:
-        revoked = await revoke_all_sessions(redis, current.pubkey_hex)
+    #
+    # ВИПРАВЛЕНО (аудит зовн. №5, MEDIUM): раніше збій тут ловився
+    # мовчки — сервер логував WARNING і однаково відповідав
+    # {"deleted": true}, попри те, що старі bearer могли лишитись
+    # живими. Правдива атомарність тут неможлива (Postgres і Redis —
+    # окремі системи, справжнього двофазного коміту немає, а Redis-
+    # cleanup вище теж поза SQL-транзакцією), тож чесний компроміс:
+    # кілька спроб проти тимчасового блимка + ЯВНИЙ прапорець
+    # sessions_revoked у відповіді замість мовчазної брехні. Клієнт
+    # (чи сама людина) тоді знає, що варто повторити спробу.
+    revoked_count = 0
+    sessions_revoked = False
+    last_err: Exception | None = None
+    for attempt in range(3):
+        try:
+            revoked_count = await revoke_all_sessions(redis, current.pubkey_hex)
+            sessions_revoked = True
+            break
+        except Exception as e:
+            last_err = e
+            if attempt < 2:
+                await asyncio.sleep(0.2 * (attempt + 1))
+
+    if sessions_revoked:
         logger.info(
             "Account delete %s: revoked %d session(s)",
-            current.pubkey_hex[:8], revoked,
+            current.pubkey_hex[:8], revoked_count,
         )
-    except Exception as e:
-        logger.warning("Session revoke on account delete failed: %s", e)
+    else:
+        # ERROR, не WARNING: акаунт стерто, а старі сесії — ні. Це має
+        # бути видно в моніторингу, не загублено серед звичайних логів.
+        logger.error(
+            "Account delete %s: session revoke FAILED after retries, "
+            "old bearer tokens may still be valid: %s",
+            current.pubkey_hex[:8], last_err,
+        )
 
     logger.info("Account deleted: pubkey=%s...", current.pubkey_hex[:8])
-    return {"deleted": True}
+    return {"deleted": True, "sessions_revoked": sessions_revoked}
 
 
 # ============================================================================
