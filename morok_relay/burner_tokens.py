@@ -71,14 +71,60 @@ def generate_token() -> str:
     return secrets.token_urlsafe(18)
 
 
+# Атомарний check-then-insert для per-owner ліміту активних токенів
+# (жорсткий свіжий прохід — той самий клас race, що ми вже закривали
+# для inbox depth/group capacity/DMS quota: count_active_tokens() і
+# create_token() були ОКРЕМИМИ операціями, N паралельних POST /burner
+# могли всі побачити active=9<10 і всі створити токен).
+#
+# Складніше за звичайний EVAL-guard: наявна (стара, неатомарна) логіка
+# ТЕЖ чистить stale-членів SET перед підрахунком (list_tokens_for_owner
+# робить lazy cleanup) — просте SCARD без цього кроку дало б false
+# positives (власник із протухлими, але ще не вичищеними токенами
+# отримав би несправедливу відмову). Тому Lua-скрипт сам ітерує SET,
+# видаляє мертві записи (EXISTS перевірка кожного) і рахує РЕАЛЬНО
+# живих — в одному атомарному проході.
+_CREATE_LUA = """
+local owner_key = KEYS[1]
+local token_key = KEYS[2]
+local max_active = tonumber(ARGV[1])
+local token = ARGV[2]
+local payload = ARGV[3]
+local ttl = tonumber(ARGV[4])
+local token_prefix = ARGV[5]
+
+local members = redis.call('SMEMBERS', owner_key)
+local alive = 0
+for i, member in ipairs(members) do
+    if redis.call('EXISTS', token_prefix .. member) == 1 then
+        alive = alive + 1
+    else
+        redis.call('SREM', owner_key, member)
+    end
+end
+
+if alive >= max_active then
+    return {0, alive}
+end
+
+redis.call('SET', token_key, payload, 'EX', ttl)
+redis.call('SADD', owner_key, token)
+return {1, alive + 1}
+"""
+
+
 async def create_token(
     redis: redis_async.Redis,
     owner_pubkey_hex: str,
     ttl_seconds: int = DEFAULT_TTL_SECONDS,
     label: str | None = None,
-) -> dict:
+) -> dict | None:
     """
-    Create a new burner token. Returns the same shape as get_token.
+    Create a new burner token. Returns the same shape as get_token, or
+    None if the owner is already at MAX_ACTIVE_TOKENS_PER_OWNER (caller
+    must check for None — the old "count first, then create" pattern
+    let this be checked separately and non-atomically; now the limit is
+    enforced INSIDE the same atomic operation as the insert).
 
     Caps ttl_seconds to MIN_TTL_SECONDS / MAX_TTL_SECONDS.
     """
@@ -95,10 +141,20 @@ async def create_token(
         "message_count": 0,
     })
 
-    async with redis.pipeline(transaction=True) as pipe:
-        pipe.set(_token_key(token), payload, ex=ttl)
-        pipe.sadd(_owner_key(owner_pubkey_hex), token)
-        await pipe.execute()
+    result = await redis.eval(
+        _CREATE_LUA,
+        2,
+        _owner_key(owner_pubkey_hex),
+        _token_key(token),
+        str(MAX_ACTIVE_TOKENS_PER_OWNER),
+        token,
+        payload,
+        str(ttl),
+        _token_key(""),  # префікс: _token_key("") -> "morok:burner_token:"
+    )
+    allowed = bool(result[0])
+    if not allowed:
+        return None
 
     return {
         "token": token,

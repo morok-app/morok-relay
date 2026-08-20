@@ -105,13 +105,10 @@ async def create_burner_token(
     current: CurrentSession,
     redis: RedisClient,
 ) -> BurnerInfo:
-    active = await burner_tokens.count_active_tokens(redis, current.pubkey_hex)
-    if active >= burner_tokens.MAX_ACTIVE_TOKENS_PER_OWNER:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=f"too_many_active_burner_links_max_{burner_tokens.MAX_ACTIVE_TOKENS_PER_OWNER}",
-        )
-
+    # Ліміт перевіряється АТОМАРНО всередині create_token (жорсткий
+    # свіжий прохід — той самий клас check-then-insert race, що вже
+    # закривали для inbox/group/DMS): раніше count_active_tokens() і
+    # create_token() були окремими викликами.
     ttl = body.ttl_seconds or burner_tokens.DEFAULT_TTL_SECONDS
     info = await burner_tokens.create_token(
         redis,
@@ -119,6 +116,11 @@ async def create_burner_token(
         ttl_seconds=ttl,
         label=body.label,
     )
+    if info is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"too_many_active_burner_links_max_{burner_tokens.MAX_ACTIVE_TOKENS_PER_OWNER}",
+        )
     return BurnerInfo(**info)
 
 
