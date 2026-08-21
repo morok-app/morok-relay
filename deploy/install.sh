@@ -689,8 +689,13 @@ ${C_GREEN}${C_BOLD}════════════════════�
   ${C_BOLD}1. DNS${C_RESET}
      Point an A-record at this server:
          ${DOMAIN}  →  ${SERVER_IP}
-     ${C_DIM}(then, if TLS was skipped above:)${C_RESET}
-         certbot --nginx -d ${DOMAIN} --agree-tos -m ${EMAIL} --redirect
+     ${C_DIM}(then, if TLS was skipped above — same command this script${C_RESET}
+     ${C_DIM} runs itself, NOT certbot --nginx: that mode rewrites nginx${C_RESET}
+     ${C_DIM} config on its own, conflicting with the config this installer${C_RESET}
+     ${C_DIM} already wrote deterministically. Re-run this installer instead${C_RESET}
+     ${C_DIM} of running certbot manually — it repeats the same certonly step${C_RESET}
+     ${C_DIM} and leaves the nginx config untouched by certbot.)${C_RESET}
+         certbot certonly --webroot -w /var/www/certbot -d ${DOMAIN} -m ${EMAIL} --agree-tos
 
   ${C_BOLD}2. Federate${C_RESET} (optional — to talk to other relays)
      Both operators run this on their own relay:

@@ -28,6 +28,7 @@ Keys
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -36,6 +37,8 @@ import time
 
 import redis.asyncio as redis_async
 from fastapi import HTTPException, status
+
+from .blob_storage import secure_delete_blob
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +87,43 @@ return 1
 """
 
 
+# Атомарний decrement+conditional-delete для pending-recipient tracking
+# (жорсткий свіжий прохід — README-обіцянка негайного видалення після
+# доставки). Паралельні ACK від РІЗНИХ учасників групи на той самий
+# envelope_id інакше могли б обидва прочитати SCARD>0 і жоден не
+# зробити фінальне видалення (той самий клас check-then-act race, що
+# ми вже закривали в кількох інших місцях) — EVAL прибирає це вікно.
+#
+# Повертає:
+#   -1 — pending-ключ не існував (legacy-конверт, поставлений у чергу
+#        ДО деплою цього фіксу, без pending-tracking) — Python-бік НЕ
+#        видаляє нічого негайно, залишає на волю reaper (стара,
+#        безпечна поведінка), а не хибно трактує "немає SET" як "усі
+#        забрали" — це і зламало б групові конверти, де інші учасники
+#        реально ще чекають.
+#    0 — ще лишились інші pending-одержувачі, blob чіпати не можна.
+#    1 — цей ACK був останнім; pending SET і meta вже видалені атомарно
+#        всередині скрипта; Python-бік викликає secure_delete_blob().
+_ACK_PENDING_LUA = """
+local pending_key = KEYS[1]
+local meta_key = KEYS[2]
+local recipient = ARGV[1]
+
+if redis.call('EXISTS', pending_key) == 0 then
+    return -1
+end
+
+redis.call('SREM', pending_key, recipient)
+local remaining = redis.call('SCARD', pending_key)
+if remaining == 0 then
+    redis.call('DEL', pending_key)
+    redis.call('DEL', meta_key)
+    return 1
+end
+return 0
+"""
+
+
 class EnqueueRejected(HTTPException):
     """
     Постановку в чергу НЕ виконано, і це не дедуп.
@@ -117,6 +157,26 @@ def _inbox_key(recipient_pubkey_hex: str) -> str:
 
 def _envelope_meta_key(envelope_id: str) -> str:
     return f"morok:envelope:{envelope_id}"
+
+
+def _pending_recipients_key(envelope_id: str) -> str:
+    """
+    SET одержувачів, які ще не забрали (ACK-нули) цей конверт.
+
+    Жорсткий свіжий прохід: README обіцяє "після отримання видаляються
+    і запис у черзі, і файл із шифротекстом" — але раніше ACK видаляв
+    ЛИШЕ запис із inbox (zrem), а meta й blob жили до кінця свого
+    повного TTL (годинами), незалежно від того, чи одержувач уже забрав
+    повідомлення. Для DM (один одержувач) це означало: файл фізично
+    лежить на диску ще довго ПІСЛЯ того, як його реально доставлено.
+
+    Для DM SET міститиме рівно одного одержувача — ACK одразу спорожнює
+    його. Для групи (fan-out) SET містить усіх eligible одержувачів на
+    момент відправки — видалення відбувається лише після ОСТАННЬОГО
+    ACK, не раніше (той самий blob на диску використовується для всіх
+    копій у групі).
+    """
+    return f"morok:envelope_pending:{envelope_id}"
 
 
 # ── Tombstone відправника ───────────────────────────────────────────────
@@ -386,6 +446,13 @@ async def enqueue_envelope(
             max(ttl_until_expiry, 60) + INBOX_KEY_TTL_SLACK_SECONDS,
         )
         pipe.publish(_inbox_channel(recipient_pubkey_hex), _new_event(envelope_id))
+        # Pending-recipient tracking (жорсткий свіжий прохід) — див.
+        # _pending_recipients_key і _ACK_PENDING_LUA. Для DM SET містить
+        # рівно ОДНОГО одержувача: ACK одразу спорожнить його, і
+        # acknowledge_envelope видалить meta+blob негайно, замість
+        # чекати на природний TTL.
+        pipe.sadd(_pending_recipients_key(envelope_id), recipient_pubkey_hex)
+        pipe.expire(_pending_recipients_key(envelope_id), ttl_until_expiry)
         # Tombstone для майбутнього sender-delete: переживає meta на
         # TOMBSTONE_EXTRA_TTL_SECONDS, щоб «видалити після ack/протухання»
         # досі можна було авторизувати. Sealed не потребує — там preimage.
@@ -513,6 +580,14 @@ async def enqueue_envelope_for_recipients(
                 max(expires_at - now, 60) + INBOX_KEY_TTL_SLACK_SECONDS,
             )
             pipe.publish(_inbox_channel(recipient), new_event)
+        # Pending-recipient tracking (жорсткий свіжий прохід) — SET
+        # містить УСІХ eligible одержувачів разом: спільний blob на
+        # диску використовується для всіх копій у групі, тож видалення
+        # відбувається лише після ОСТАННЬОГО ACK, не раніше. Один
+        # SADD з усім списком одразу — не по одному в циклі.
+        if eligible:
+            pipe.sadd(_pending_recipients_key(envelope_id), *eligible)
+            pipe.expire(_pending_recipients_key(envelope_id), expires_at - now)
         await pipe.execute()
 
     return expires_at, len(eligible)
@@ -608,13 +683,61 @@ async def acknowledge_envelope(
     """
     Mark envelope as delivered for THIS recipient: remove from inbox.
 
-    For group messages, this only removes from the current recipient's
-    inbox — other group members still see the message until they ack
-    individually. The blob is not deleted until the reaper sees that NO
-    recipient still has it queued (or it ages out).
+    ВИПРАВЛЕНО (жорсткий свіжий прохід — README-обіцянка "після
+    отримання видаляються і запис у черзі, і файл із шифротекстом").
+    Раніше ACK видаляв ЛИШЕ inbox-запис; meta й blob жили до кінця
+    свого повного TTL (годинами) незалежно від того, чи одержувач уже
+    забрав повідомлення — reaper бачив "meta ще існує" і не чіпав файл.
+    Для DM (один одержувач) файл фізично лежав на диску ще довго ПІСЛЯ
+    реальної доставки.
+
+    Тепер: атомарний EVAL (_ACK_PENDING_LUA) прибирає цього одержувача
+    з pending-set і, якщо він був ОСТАННІМ (для групи — усі учасники
+    забрали; для DM — єдиний одержувач), видаляє meta й повертає
+    сигнал видалити blob. Legacy-конверти без pending-set (поставлені
+    в чергу до деплою цього фіксу) безпечно падають на стару поведінку
+    — reaper як safety net, а не хибне негайне видалення.
+
+    Видалення самого файлу — fire-and-forget: навіть якщо процес
+    впаде між EVAL (уже видалила pending+meta) і фактичним unlink,
+    reaper підхопить осиротілий файл (meta відсутня → "доставлений
+    сирота") тим самим механізмом, що вже існував.
     """
     removed = await redis.zrem(_inbox_key(recipient_pubkey_hex), envelope_id)
-    return removed > 0
+    if removed <= 0:
+        return False
+
+    try:
+        result = await redis.eval(
+            _ACK_PENDING_LUA,
+            2,
+            _pending_recipients_key(envelope_id),
+            _envelope_meta_key(envelope_id),
+            recipient_pubkey_hex,
+        )
+    except Exception as e:
+        # Redis-збій на цьому кроці не повинен ламати сам ACK (inbox
+        # уже прибрано вище) — просто лишаємо meta/blob на волю reaper.
+        logger.warning(
+            "pending-recipient decrement failed for %s: %s",
+            envelope_id[:8], e,
+        )
+        return True
+
+    if result == 1:
+        asyncio.create_task(_delete_blob_after_last_ack(envelope_id))
+
+    return True
+
+
+async def _delete_blob_after_last_ack(envelope_id: str) -> None:
+    try:
+        await secure_delete_blob(envelope_id)
+    except Exception as e:
+        logger.warning(
+            "post-ACK blob delete failed for %s (reaper will retry): %s",
+            envelope_id[:8], e,
+        )
 
 
 async def envelope_exists(redis: redis_async.Redis, envelope_id: str) -> bool:
