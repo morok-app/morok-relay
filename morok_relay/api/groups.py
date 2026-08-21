@@ -1297,13 +1297,10 @@ async def create_invite_token(
             detail="only_admin_can_create_invites",
         )
 
-    active = await invite_tokens.count_active_tokens(redis, str(group.id))
-    if active >= invite_tokens.MAX_ACTIVE_TOKENS_PER_GROUP:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=f"too_many_active_invites_max_{invite_tokens.MAX_ACTIVE_TOKENS_PER_GROUP}",
-        )
-
+    # Ліміт перевіряється АТОМАРНО всередині create_token (жорсткий
+    # свіжий прохід — той самий клас check-then-insert race, знайдений
+    # і закритий тим самим часом у burner_tokens.py): раніше
+    # count_active_tokens() і create_token() були окремими викликами.
     ttl = body.ttl_seconds or invite_tokens.DEFAULT_TTL_SECONDS
     info = await invite_tokens.create_token(
         redis=redis,
@@ -1311,6 +1308,11 @@ async def create_invite_token(
         created_by_pubkey_hex=current.pubkey_hex,
         ttl_seconds=ttl,
     )
+    if info is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"too_many_active_invites_max_{invite_tokens.MAX_ACTIVE_TOKENS_PER_GROUP}",
+        )
     return InviteTokenInfo(
         token=info["token"],
         group_id=str(group.id),

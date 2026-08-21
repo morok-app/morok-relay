@@ -44,6 +44,7 @@ import time
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, select
+from sqlalchemy import text as sa_text
 
 from .. import blob_storage
 from ..config import get_settings
@@ -75,6 +76,21 @@ class InboxTokenRegisterRequest(BaseModel):
     token_hash: str = Field(..., pattern=HEX64)
 
 
+async def _fetch_inbox_tokens_for_pubkey(db, pubkey: bytes) -> list:
+    """
+    Винесено в окрему функцію (той самий підхід, що
+    _count_push_subscriptions у api/push.py) — і для чистоти, і для
+    testability: точка, потрібна тестам для синхронізації concurrency-
+    race без ризикованого перехоплення AsyncSession.execute (яке
+    конфліктує з SQLAlchemy async internals і дає deadlock).
+    """
+    return list((await db.execute(
+        select(InboxToken)
+        .where(InboxToken.pubkey == pubkey)
+        .order_by(InboxToken.created_at.desc())
+    )).scalars().all())
+
+
 @router.post(
     "/inbox-token",
     summary="Register sha256 hash of my sealed-sender delivery token",
@@ -98,11 +114,18 @@ async def register_inbox_token(
     pubkey = bytes.fromhex(current.pubkey_hex)
     now = int(time.time())
 
-    rows = (await db.execute(
-        select(InboxToken)
-        .where(InboxToken.pubkey == pubkey)
-        .order_by(InboxToken.created_at.desc())
-    )).scalars().all()
+    # Атомарний check-then-evict-then-insert (жорсткий свіжий прохід —
+    # той самий клас race, знайдений тим самим заходом у burner_tokens/
+    # invite_tokens/push subscriptions). Тут наслідок м'якший (eviction,
+    # не rejection — черговий register сам довів би кількість до норми),
+    # але pg_advisory_xact_lock прибирає навіть це тимчасове перевищення
+    # дешево, тим самим перевіреним підходом, що вже working для DMS/
+    # mail/push квот.
+    await db.execute(
+        sa_text("SELECT pg_advisory_xact_lock(hashtext(:pk))"),
+        {"pk": current.pubkey_hex},
+    )
+    rows = await _fetch_inbox_tokens_for_pubkey(db, pubkey)
 
     if any(r.token_hash == body.token_hash for r in rows):
         return {"registered": True, "rotated": False}

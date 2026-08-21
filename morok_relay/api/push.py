@@ -18,6 +18,7 @@ from urllib.parse import urlsplit
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import delete, func, select
+from sqlalchemy import text as sa_text
 
 from ..config import get_settings
 from ..deps import CurrentSession, DBSession, RedisClient
@@ -106,6 +107,21 @@ class PushSubscribeRequest(BaseModel):
 MAX_PUSH_SUBSCRIPTIONS_PER_ACCOUNT = 10
 
 
+async def _count_push_subscriptions(db, pubkey: bytes) -> int:
+    """
+    Винесено в окрему функцію (жорсткий свіжий прохід): і для чистоти
+    коду (спільний хелпер для web push + native FCM, які рахують ОДНУ
+    спільну квоту), і для testability — саме ця точка потрібна тестам
+    для точної синхронізації concurrency-race без ризикованого
+    перехоплення AsyncSession.execute (яке конфліктує з SQLAlchemy
+    async internals / greenlet-based механізмом і дає deadlock).
+    """
+    return (await db.execute(
+        select(func.count()).select_from(PushSubscription)
+        .where(PushSubscription.pubkey == pubkey)
+    )).scalar_one()
+
+
 @router.post(
     "/subscribe",
     summary="Register or update a web push subscription for this device",
@@ -154,10 +170,17 @@ async def post_subscribe(
         await db.flush()
         return {"ok": True, "created": False}
 
-    count = (await db.execute(
-        select(func.count()).select_from(PushSubscription)
-        .where(PushSubscription.pubkey == pubkey)
-    )).scalar_one()
+    # Атомарний check-then-insert (жорсткий свіжий прохід — той самий
+    # клас race, явно вказаний у зовн. аудиті №5: "Web Push quota
+    # зроблена через COUNT → INSERT, тому під сильною concurrency сама
+    # межа 10 теж не строго атомарна"). pg_advisory_xact_lock — той
+    # самий перевірений підхід, що вже working для DMS quota і mail
+    # quota: серіалізує конкурентні subscribe ЛИШЕ для цього pubkey.
+    await db.execute(
+        sa_text("SELECT pg_advisory_xact_lock(hashtext(:pk))"),
+        {"pk": current.pubkey_hex},
+    )
+    count = await _count_push_subscriptions(db, pubkey)
     if count >= MAX_PUSH_SUBSCRIPTIONS_PER_ACCOUNT:
         raise HTTPException(
             status.HTTP_409_CONFLICT,
@@ -261,10 +284,14 @@ async def post_subscribe_native(
         existing.updated_at = now
         return {"subscribed": True}
 
-    count = (await db.execute(
-        select(func.count()).select_from(PushSubscription)
-        .where(PushSubscription.pubkey == pubkey)
-    )).scalar_one()
+    # Той самий advisory lock, що web push subscribe вище — обидва
+    # шляхи рахують СПІЛЬНУ квоту (platform-агностично), тому обидва
+    # мають бути серіалізовані тим самим механізмом.
+    await db.execute(
+        sa_text("SELECT pg_advisory_xact_lock(hashtext(:pk))"),
+        {"pk": current.pubkey_hex},
+    )
+    count = await _count_push_subscriptions(db, pubkey)
     if count >= MAX_PUSH_SUBSCRIPTIONS_PER_ACCOUNT:
         raise HTTPException(
             status.HTTP_409_CONFLICT,

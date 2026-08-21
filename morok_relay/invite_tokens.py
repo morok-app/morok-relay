@@ -52,14 +52,57 @@ def generate_token() -> str:
     return secrets.token_urlsafe(18)
 
 
+# Атомарний check-then-insert (жорсткий свіжий прохід — той самий клас
+# race, тим самим часом виявлений і закритий у burner_tokens.py:
+# count_active_tokens() і create_token() були окремими операціями, N
+# паралельних POST /invites могли всі побачити active<MAX і всі пройти).
+# Складніше за звичайний EVAL-guard: наявна логіка (list_tokens) ТЕЖ
+# чистить stale-членів SET перед підрахунком — простий SCARD без цього
+# кроку дав би false positives (адмін із протухлими, ще не вичищеними
+# токенами отримав би несправедливу відмову). Лічимо реально живих
+# в одному атомарному проході.
+_CREATE_LUA = """
+local group_key = KEYS[1]
+local token_key = KEYS[2]
+local max_active = tonumber(ARGV[1])
+local token = ARGV[2]
+local payload = ARGV[3]
+local ttl = tonumber(ARGV[4])
+local set_ttl = tonumber(ARGV[5])
+local token_prefix = ARGV[6]
+
+local members = redis.call('SMEMBERS', group_key)
+local alive = 0
+for i, member in ipairs(members) do
+    if redis.call('EXISTS', token_prefix .. member) == 1 then
+        alive = alive + 1
+    else
+        redis.call('SREM', group_key, member)
+    end
+end
+
+if alive >= max_active then
+    return {0, alive}
+end
+
+redis.call('SET', token_key, payload, 'EX', ttl)
+redis.call('SADD', group_key, token)
+redis.call('EXPIRE', group_key, set_ttl)
+return {1, alive + 1}
+"""
+
+
 async def create_token(
     redis: redis_async.Redis,
     group_id: str,
     created_by_pubkey_hex: str,
     ttl_seconds: int = DEFAULT_TTL_SECONDS,
-) -> dict:
+) -> dict | None:
     """
-    Create a new invite token. Returns {token, expires_at, created_at}.
+    Create a new invite token. Returns {token, expires_at, created_at},
+    or None if the group is already at MAX_ACTIVE_TOKENS_PER_GROUP
+    (limit enforced ATOMICALLY inside the same operation as the insert
+    — caller must check for None).
 
     Caps ttl_seconds to MIN_TTL_SECONDS / MAX_TTL_SECONDS.
     """
@@ -75,16 +118,21 @@ async def create_token(
         "expires_at": expires_at,
     })
 
-    async with redis.pipeline(transaction=True) as pipe:
-        pipe.set(_token_key(token), payload, ex=ttl)
-        pipe.sadd(_group_invites_key(group_id), token)
-        # TTL на САМ сет: без нього він жив вічно (чистився лише ліниво
-        # в list_tokens, яку для покинутої групи ніхто не викличе) — те
-        # саме сімейство, що inbox-ключі без TTL: volatile-ttl не має що
-        # витісняти. Кожне нове запрошення зсуває TTL уперед, тож живий
-        # сет не помре; MAX_TTL + доба покриває найдовший токен.
-        pipe.expire(_group_invites_key(group_id), MAX_TTL_SECONDS + 86400)
-        await pipe.execute()
+    result = await redis.eval(
+        _CREATE_LUA,
+        2,
+        _group_invites_key(group_id),
+        _token_key(token),
+        str(MAX_ACTIVE_TOKENS_PER_GROUP),
+        token,
+        payload,
+        str(ttl),
+        str(MAX_TTL_SECONDS + 86400),
+        _token_key(""),  # префікс: _token_key("") -> "morok:invite_token:"
+    )
+    allowed = bool(result[0])
+    if not allowed:
+        return None
 
     return {
         "token": token,
@@ -163,7 +211,7 @@ async def list_tokens(redis: redis_async.Redis, group_id: str) -> list[dict]:
             pipe.get(_token_key(t))
         raw_list = await pipe.execute()
 
-    for t, raw in zip(decoded, raw_list):
+    for t, raw in zip(decoded, raw_list, strict=False):
         if raw is None:
             stale.append(t)
             continue
