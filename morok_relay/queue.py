@@ -179,6 +179,23 @@ def _pending_recipients_key(envelope_id: str) -> str:
     return f"morok:envelope_pending:{envelope_id}"
 
 
+# Redis ZSET: envelope_id → expires_at, для reaper.py (MEDIUM з фрешевого
+# аудиту — "reaper масштабується як повний filesystem scan"). Замість
+# rglob() над усім blob_dir (O(N) traversal + N stat() + N Redis EXISTS,
+# незалежно від того, скільки blob'ів реально прострочено), reaper читає
+# candidates ОДНИМ ZRANGEBYSCORE — Redis сам тримає структуру sorted by
+# score в пам'яті. Записується в ТОМУ САМОМУ pipeline, де вже пишеться
+# meta (enqueue_envelope / enqueue_envelope_for_recipients) — жодного
+# додаткового call site, на відміну від альтернативи "додати параметр
+# у write_blob" (та зачепила б 9 різних місць виклику).
+#
+# Full filesystem-scan (rglob) лишається — але як РІДКІСНИЙ safety-net
+# прохід (orphan recovery: файли, що якимось чином лишились НЕ
+# заіндексованими — crash між write_blob і enqueue, чи blob'и, записані
+# ДО деплою цього фіксу), не основний щогодинний механізм.
+_BLOB_EXPIRY_INDEX_KEY = "morok:blob_expiry_index"
+
+
 # ── Tombstone відправника ───────────────────────────────────────────────
 # Живе ДОВШЕ за metadata конверта. Потрібен для sender-delete: коли meta
 # вже протухла/ack-нута, релей раніше не мав проти чого авторизувати
@@ -490,6 +507,10 @@ async def enqueue_envelope(
         # чекати на природний TTL.
         pipe.sadd(_pending_recipients_key(envelope_id), recipient_pubkey_hex)
         pipe.expire(_pending_recipients_key(envelope_id), ttl_until_expiry)
+        # Reaper-індекс (MEDIUM, фрешевий аудит) — score=expires_at,
+        # той самий момент, коли meta й так природно протухне в Redis.
+        # reaper читає прострочені candidates звідси, не з диска.
+        pipe.zadd(_BLOB_EXPIRY_INDEX_KEY, {envelope_id: expires_at})
         # Tombstone для майбутнього sender-delete: переживає meta на
         # TOMBSTONE_EXTRA_TTL_SECONDS, щоб «видалити після ack/протухання»
         # досі можна було авторизувати. Sealed не потребує — там preimage.
@@ -625,6 +646,8 @@ async def enqueue_envelope_for_recipients(
         if eligible:
             pipe.sadd(_pending_recipients_key(envelope_id), *eligible)
             pipe.expire(_pending_recipients_key(envelope_id), expires_at - now)
+        # Reaper-індекс (MEDIUM, фрешевий аудит) — той самий, що DM-шлях.
+        pipe.zadd(_BLOB_EXPIRY_INDEX_KEY, {envelope_id: expires_at})
         await pipe.execute()
 
     return expires_at, len(eligible)

@@ -1,0 +1,21 @@
+[Unit]
+Description=Run Morok blob reaper full filesystem safety-net scan daily
+Requires=morok-reaper-fullscan.service
+
+[Timer]
+# Рідкісний safety-net (MEDIUM, фрешевий аудит) — ловить те, що
+# indexed-прохід (morok-reaper.timer, кожні 5 хв) не бачить: orphan-
+# файли, які фізично лежать на диску, але ніколи не потрапили в Redis-
+# індекс (crash між write_blob і enqueue; blob'и, записані ДО деплою
+# indexed reaper'а). Раз на добу достатньо — це не основний механізм
+# видалення, лише страховка. installer генерує той самий графік через
+# OnCalendar (див. deploy/install.sh) — ЦЕЙ файл лише документує
+# результат.
+OnCalendar=*-*-* 04:15:00
+Persistent=true
+RandomizedDelaySec=1h
+
+Unit=morok-reaper-fullscan.service
+
+[Install]
+WantedBy=timers.target

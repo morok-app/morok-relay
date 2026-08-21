@@ -1,18 +1,18 @@
 [Unit]
-Description=Run Morok blob reaper hourly
+Description=Run Morok blob reaper (indexed, fast) every 5 minutes
 Requires=morok-reaper.service
 
 [Timer]
-# First run 5 minutes after boot, then every hour
-OnBootSec=5min
-OnUnitActiveSec=1h
+# Indexed прохід (MEDIUM, фрешевий аудит) — Redis ZRANGEBYSCORE, не
+# filesystem scan. Дешевий: installer тримає той самий 5-хвилинний
+# інтервал, що й раніше (див. emit_timer у deploy/install.sh — ЦЕЙ
+# файл лише документує, як виглядає реально згенерований юніт).
+OnBootSec=30s
+OnUnitActiveSec=5min
+AccuracySec=2s
 
 # If the system was off when the timer should have fired, run it on boot
 Persistent=true
-
-# Spread out timer execution by up to 5 min to avoid all morok instances
-# (when we have many relays) reaping at the exact same time
-RandomizedDelaySec=5min
 
 Unit=morok-reaper.service
 

@@ -2,15 +2,25 @@
 Blob and group reaper — secure-delete expired data.
 
 Run manually:
-    python -m morok_relay.scripts.reaper
+    python -m morok_relay.scripts.reaper                # indexed only
+    python -m morok_relay.scripts.reaper --full-scan     # + filesystem scan
 
-Or via systemd timer (preferred — see deploy/morok-reaper.{service,timer}).
+Or via systemd timer (preferred — see deploy/morok-reaper.{service,timer}
+for the frequent indexed run, morok-reaper-fullscan.{service,timer} for
+the rare filesystem safety-net run).
 
-What it does
-------------
-1. Walk /var/lib/morok/blobs/ for every blob file. Delete if Redis no longer
-   has the envelope (acked or queue-expired), or if older than hard ceiling.
-2. Soft-delete groups whose expires_at has passed. The actual DB row is
+Що робить (MEDIUM з фрешевого аудиту — "reaper масштабується як повний
+filesystem scan" — виправлено)
+------------------------------------------------------------------------
+1. ОСНОВНИЙ, ЧАСТИЙ прохід (reap_blobs_indexed): читає прострочені
+   candidates з Redis ZSET (morok:blob_expiry_index, заповнюється
+   в queue.py на кожному enqueue), а не сканує диск. O(K), не O(усі
+   файли).
+2. РІДКІСНИЙ safety-net прохід (reap_blobs_full_scan, --full-scan):
+   стара логіка — rglob() над УСІМ blob_dir, для orphan-файлів, яких
+   індекс не бачив (crash між write_blob і enqueue; blob'и, записані
+   ДО деплою indexed-версії).
+3. Soft-delete groups whose expires_at has passed. The actual DB row is
    kept for 24h before hard deletion, so federated peers can stop trying
    to deliver. Member rows are cascade-deleted when the group is.
 
@@ -33,6 +43,7 @@ from ..blob_storage import secure_delete_blob
 from ..config import get_settings
 from ..db import close_db, init_db
 from ..models import Group
+from ..queue import _BLOB_EXPIRY_INDEX_KEY
 
 
 logger = logging.getLogger(__name__)
@@ -101,8 +112,74 @@ def reap_stale_temp_files(blob_dir: Path, now: int) -> dict:
     return stats
 
 
-async def reap_blobs(redis: redis_async.Redis) -> dict:
-    """One pass over the blob directory."""
+async def reap_blobs_indexed(redis: redis_async.Redis) -> dict:
+    """
+    Основний, ЧАСТИЙ прохід (MEDIUM з фрешевого аудиту — "reaper
+    масштабується як повний filesystem scan"). Читає прострочені
+    candidates з Redis ZSET (заповнюється в queue.py на кожному
+    enqueue, score=expires_at) замість rglob() над УСІМ blob_dir.
+
+    Вартість: O(K log N), де K — кількість реально прострочених
+    candidates, N — розмір індексу. НЕ залежить від загальної
+    кількості файлів на диску, на відміну від filesystem-scan (де
+    вартість завжди O(усі файли), навіть якщо прострочений лише один).
+
+    Що НЕ ловить: файли, які фізично лежать на диску, але ніколи не
+    потрапили в індекс (crash між write_blob і enqueue; blob'и,
+    записані ДО деплою цього фіксу). Для них лишається
+    reap_blobs_full_scan() — рідкісний (не щогодинний) safety-net.
+    """
+    stats = {
+        "indexed_candidates": 0,
+        "indexed_deleted": 0,
+        "indexed_still_queued": 0,
+        "indexed_errors": 0,
+    }
+    now = int(time.time())
+
+    raw_candidates = await redis.zrangebyscore(_BLOB_EXPIRY_INDEX_KEY, 0, now)
+    stats["indexed_candidates"] = len(raw_candidates)
+
+    for raw_eid in raw_candidates:
+        envelope_id = (
+            raw_eid.decode("utf-8") if isinstance(raw_eid, bytes) else raw_eid
+        )
+        try:
+            # Той самий сигнал, що й у full-scan шляху: meta existence
+            # означає "ще в черзі, не чіпати". Може статись рідко —
+            # округлення score трохи відстає від реального Redis TTL
+            # meta-ключа; не страшно, просто пропускаємо цей прохід.
+            if await redis.exists(f"morok:envelope:{envelope_id}"):
+                stats["indexed_still_queued"] += 1
+                continue
+            deleted = await secure_delete_blob(envelope_id)
+            if deleted:
+                stats["indexed_deleted"] += 1
+        except Exception as e:
+            stats["indexed_errors"] += 1
+            logger.exception(
+                "Indexed reaper error on %s: %s", envelope_id[:16], e,
+            )
+        finally:
+            # Прибираємо з індексу НЕЗАЛЕЖНО від результату — інакше
+            # той самий candidate повертався б щоразу: ZRANGEBYSCORE
+            # 0..now завжди включає старі score.
+            try:
+                await redis.zrem(_BLOB_EXPIRY_INDEX_KEY, raw_eid)
+            except Exception:
+                pass
+
+    return stats
+
+
+async def reap_blobs_full_scan(redis: redis_async.Redis) -> dict:
+    """
+    Рідкісний (не щогодинний) safety-net прохід — повний filesystem
+    scan, стара логіка без змін. Ловить те, що індекс пропустив:
+    orphan-файли, які фізично лежать на диску, але ніколи не
+    потрапили в morok:blob_expiry_index (crash між write_blob і
+    enqueue; blob'и, записані ДО деплою reap_blobs_indexed).
+    """
     settings = get_settings()
     now = int(time.time())
 
@@ -233,8 +310,17 @@ async def reap_expired_groups() -> dict:
     return stats
 
 
-async def reap_once() -> dict:
-    """Run blob and group reaping in one pass."""
+async def reap_once(full_scan: bool = False) -> dict:
+    """
+    Run blob and group reaping in one pass.
+
+    full_scan=False (типовий, частий прохід — щогодинний timer):
+    лише reap_blobs_indexed(), швидкий, Redis-based.
+
+    full_scan=True (рідкісний прохід — окремий, нечастий timer):
+    ОБИДВА — indexed (як завжди) ПЛЮС filesystem safety-net для
+    orphan-файлів, яких індекс не бачив.
+    """
     settings = get_settings()
     start = time.monotonic()
 
@@ -247,7 +333,10 @@ async def reap_once() -> dict:
         return {"elapsed_seconds": time.monotonic() - start, "errors": 1}
 
     try:
-        blob_stats = await reap_blobs(redis)
+        blob_stats = await reap_blobs_indexed(redis)
+        if full_scan:
+            full_scan_stats = await reap_blobs_full_scan(redis)
+            blob_stats.update(full_scan_stats)
     finally:
         await redis.aclose()
 
@@ -274,20 +363,31 @@ def _setup_logging() -> None:
 
 async def _main() -> int:
     _setup_logging()
-    logger.info("morok-reaper starting")
-    stats = await reap_once()
+    full_scan = "--full-scan" in sys.argv[1:]
     logger.info(
-        "morok-reaper done: blobs scanned=%d queued=%d delivered=%d aged=%d "
+        "morok-reaper starting (mode=%s)",
+        "full-scan" if full_scan else "indexed",
+    )
+    stats = await reap_once(full_scan=full_scan)
+    logger.info(
+        "morok-reaper done: indexed_candidates=%d indexed_deleted=%d "
+        "fullscan_scanned=%d fullscan_delivered=%d fullscan_aged=%d "
         "groups_expired=%d errors=%d elapsed=%.2fs",
+        stats.get("indexed_candidates", 0),
+        stats.get("indexed_deleted", 0),
         stats.get("blobs_scanned", 0),
-        stats.get("blobs_still_queued", 0),
         stats.get("blobs_deleted_delivered", 0),
         stats.get("blobs_deleted_aged_out", 0),
         stats.get("groups_expired", 0),
-        stats.get("blob_errors", 0) + stats.get("group_errors", 0),
+        stats.get("indexed_errors", 0) + stats.get("blob_errors", 0)
+        + stats.get("group_errors", 0),
         stats.get("elapsed_seconds", 0.0),
     )
-    total_errors = stats.get("blob_errors", 0) + stats.get("group_errors", 0)
+    total_errors = (
+        stats.get("indexed_errors", 0)
+        + stats.get("blob_errors", 0)
+        + stats.get("group_errors", 0)
+    )
     return 0 if total_errors == 0 else 1
 
 

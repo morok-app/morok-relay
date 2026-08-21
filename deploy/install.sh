@@ -437,6 +437,56 @@ emit_timer "federation-worker" "Morok federation outbound worker" "federation_wo
 emit_timer "reaper"            "Morok expired-message reaper"      "reaper"            "5min" "true"
 emit_timer "dms-reaper"        "Morok dead-man-switch reaper"      "dms_reaper"        "1min" "true"
 
+# Full-scan safety-net (MEDIUM, фрешевий аудит — "reaper масштабується як
+# повний filesystem scan"): звичайний morok-reaper.timer вище тепер читає
+# прострочені candidates з Redis-індексу (queue.py), не сканує диск —
+# швидко, можна запускати кожні 5 хв. Але індекс не бачить orphan-файлів,
+# які фізично лежать на диску, але туди ніколи не потрапили (crash між
+# write_blob і enqueue; blob'и, записані ДО деплою indexed reaper'а) —
+# для них цей окремий, рідкісний (раз на добу) прохід із --full-scan,
+# та сама стара rglob()-логіка як безпечна страховка. emit_timer() не
+# підтримує передачу CLI-прапорця, тож явний heredoc, як fstrim нижче.
+cat > /etc/systemd/system/morok-reaper-fullscan.service <<EOF
+[Unit]
+Description=Morok blob reaper — full filesystem safety-net scan (orphan recovery)
+After=morok-relay.service
+
+[Service]
+Type=oneshot
+User=${MOROK_USER}
+Group=${MOROK_USER}
+WorkingDirectory=${INSTALL_DIR}
+EnvironmentFile=${INSTALL_DIR}/.env
+ExecStart=${INSTALL_DIR}/.venv/bin/python -m morok_relay.scripts.reaper --full-scan
+SyslogIdentifier=morok-reaper-fullscan
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/morok
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+EOF
+cat > /etc/systemd/system/morok-reaper-fullscan.timer <<EOF
+[Unit]
+Description=Schedule: Morok blob reaper full filesystem safety-net scan
+
+[Timer]
+OnCalendar=*-*-* 04:15:00
+Persistent=true
+RandomizedDelaySec=1h
+
+[Install]
+WantedBy=timers.target
+EOF
+
 # fstrim: юніти лежали в deploy/, але installer їх НЕ ставив — тобто
 # коментар у blob_storage.py про "fstrim-таймер" був порожньою обіцянкою
 # навіть на власних релеях. TRIM скорочує вікно життя стертих блобів на
@@ -472,6 +522,7 @@ systemctl daemon-reload
 systemctl enable --now morok-relay.service >/dev/null 2>&1
 systemctl enable --now morok-federation-worker.timer >/dev/null 2>&1
 systemctl enable --now morok-reaper.timer >/dev/null 2>&1
+systemctl enable --now morok-reaper-fullscan.timer >/dev/null 2>&1
 systemctl enable --now morok-dms-reaper.timer >/dev/null 2>&1
 systemctl enable --now morok-fstrim.timer >/dev/null 2>&1
 ok "Services enabled and started (incl. fstrim.timer)"
