@@ -33,6 +33,7 @@ from ..queue import (
     list_inbox,
     publish_read_receipt,
     was_delivered_to,
+    write_blob_then_enqueue,
 )
 from ..rate_limit import rate_limit_by_pubkey
 from ..schemas import EnvelopeAck, EnvelopeIn
@@ -153,10 +154,9 @@ async def send_envelope(
         if await envelope_exists(redis, envelope_id):
             return EnvelopeAck(envelope_id=envelope_id, queued=False, expires_at=0)
 
-        await blob_storage.write_blob(envelope_id, blob_bytes)
-        expires_at = await enqueue_envelope(
+        expires_at = await write_blob_then_enqueue(
+            envelope_id, blob_bytes,
             redis=redis,
-            envelope_id=envelope_id,
             sender_pubkey_hex=body.from_,
             recipient_pubkey_hex=body.to,
             timestamp=body.ts,

@@ -45,7 +45,11 @@ from .. import blob_storage, crypto
 from ..config import get_settings
 from ..deps import DBSession, RedisClient
 from ..models import FederationPeer, Group, GroupMember, User
-from ..queue import enqueue_envelope, enqueue_envelope_for_recipients, envelope_exists
+from ..queue import (
+    enqueue_envelope_for_recipients,
+    envelope_exists,
+    write_blob_then_enqueue,
+)
 from ..rate_limit import rate_limit_by_ip
 from ..push_sender import schedule_push
 
@@ -587,10 +591,9 @@ async def _forward_impl(
         )
 
     # 7. Persist
-    await blob_storage.write_blob(envelope_id, blob_bytes)
-    await enqueue_envelope(
+    await write_blob_then_enqueue(
+        envelope_id, blob_bytes,
         redis=redis,
-        envelope_id=envelope_id,
         sender_pubkey_hex=body.envelope["from"],
         recipient_pubkey_hex=body.envelope["to"],
         timestamp=int(body.envelope["ts"]),

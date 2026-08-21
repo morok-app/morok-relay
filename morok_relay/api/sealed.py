@@ -46,15 +46,14 @@ from pydantic import BaseModel, Field
 from sqlalchemy import delete, select
 from sqlalchemy import text as sa_text
 
-from .. import blob_storage
 from ..config import get_settings
 from ..deps import CurrentSession, DBSession, RedisClient
 from ..models import InboxToken, User
 from ..push_sender import schedule_push
 from ..queue import (
     delete_sealed_envelope,
-    enqueue_envelope,
     envelope_exists,
+    write_blob_then_enqueue,
 )
 from ..rate_limit import rate_limit_by_ip
 
@@ -283,10 +282,9 @@ async def send_sealed_envelope(
     if await envelope_exists(redis, envelope_id):
         return SealedAck(envelope_id=envelope_id, queued=False, expires_at=0)
 
-    await blob_storage.write_blob(envelope_id, blob_bytes)
-    expires_at = await enqueue_envelope(
+    expires_at = await write_blob_then_enqueue(
+        envelope_id, blob_bytes,
         redis=redis,
-        envelope_id=envelope_id,
         sender_pubkey_hex="",          # особа — всередині blob
         recipient_pubkey_hex=body.to,
         timestamp=body.ts,

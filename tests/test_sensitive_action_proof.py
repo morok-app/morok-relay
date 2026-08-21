@@ -140,10 +140,15 @@ async def test_different_nonce_not_blocked_by_prior_replay_guard(redis):
     ) is True
 
 
-async def test_redis_failure_fails_open_on_replay_layer(redis, monkeypatch):
-    """Fail-open на Redis-збій у anti-replay-шарі — доступність
-    важливіша за теоретичний ризик повтору в короткому вікні; сам
-    підпис (крипто-шар) продовжує перевірятись повністю."""
+async def test_redis_failure_fails_closed_on_replay_layer(redis, monkeypatch):
+    """
+    ГОЛОВНИЙ ТЕСТ (жорсткий свіжий прохід — GPT-перегляд другого
+    раунду). Fail-CLOSED на Redis-збій у anti-replay-шарі: для
+    account_delete/backup_replace/backup_delete/dms_cancel
+    correctness важливіша за availability. Крипто-валідний, але
+    ПОВТОРЕНИЙ підпис не повинен проходити саме в момент деградації
+    Redis — найгірший можливий час для тихої поступки безпеки.
+    """
     ts = int(time.time())
     sig = _sign("account_delete", OWNER, "nonce-9", ts)
 
@@ -154,7 +159,51 @@ async def test_redis_failure_fails_open_on_replay_layer(redis, monkeypatch):
     assert await verify_sensitive_action(
         redis, action="account_delete", pubkey_hex=OWNER, target=OWNER,
         nonce="nonce-9", timestamp=ts, signature_hex=sig, relay_name=RELAY,
-    ) is True
+    ) is False
+
+
+async def test_delete_me_rejects_valid_proof_when_redis_replay_layer_down(
+    db, redis, monkeypatch,
+):
+    """
+    ГОЛОВНИЙ НАСКРІЗНИЙ ТЕСТ. Через реальний DELETE /me — навіть
+    крипто-валідний підпис не проходить, якщо anti-replay-шар (Redis)
+    недоступний саме в момент перевірки. Раніше це fail-open'ило б
+    account_delete повз anti-replay захист.
+    """
+    from morok_relay.api.account import delete_me
+    from morok_relay.config import get_settings
+    from morok_relay.models import User, UserTier
+    from morok_relay.schemas import SensitiveActionProof
+    from morok_relay.sessions import Session
+
+    settings = get_settings()
+    now = int(time.time())
+    db.add(User(pubkey=bytes.fromhex(OWNER), username="frank",
+                home_relay=settings.relay_name, tier=UserTier.FREE,
+                created_at=now, last_seen_at=now))
+    await db.commit()
+
+    async def boom(*a, **kw):
+        raise ConnectionError("redis down")
+    monkeypatch.setattr(redis, "set", boom)
+
+    session = Session(token="t" * 64, pubkey_hex=OWNER, expires_at=2**31)
+    sig = _sign("account_delete", OWNER, "nonce-redis-down", now)
+    proof = SensitiveActionProof(
+        action_signature_hex=sig, action_nonce="nonce-redis-down",
+        action_timestamp=now,
+    )
+    with pytest.raises(HTTPException) as e:
+        await delete_me(session, db, redis, proof=proof)
+    assert e.value.status_code == 401
+
+    from sqlalchemy import select
+    row = (await db.execute(
+        select(User).where(User.pubkey == bytes.fromhex(OWNER))
+    )).scalar_one()
+    assert row.deleted_at is None, \
+        "акаунт видалено попри недоступний anti-replay-шар"
 
 
 # ── наскрізно: DELETE /me вимагає валідний proof, якщо переданий ────────

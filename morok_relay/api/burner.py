@@ -26,11 +26,11 @@ import time
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import select
 
-from .. import blob_storage, burner_tokens
+from .. import burner_tokens
 from ..config import get_settings
 from ..deps import CurrentSession, DBSession, RedisClient
 from ..models import User
-from ..queue import enqueue_envelope, envelope_exists
+from ..queue import envelope_exists, write_blob_then_enqueue
 from ..rate_limit import rate_limit_by_pubkey
 from ..schemas import (
     BurnerCreate,
@@ -287,8 +287,6 @@ async def public_burner_send(
     if await envelope_exists(redis, envelope_id):
         return BurnerSendAck(envelope_id=envelope_id, queued=False)
 
-    await blob_storage.write_blob(envelope_id, blob_bytes)
-
     # Sender username metadata: we set a special "🔥 burner" so the
     # owner's client can render a badge. We also put the user-supplied
     # sender_label (if any) inside the envelope metadata via a special
@@ -306,9 +304,9 @@ async def public_burner_send(
     # works normally.
     placeholder_sig = "00" * 64
 
-    expires_at = await enqueue_envelope(
+    expires_at = await write_blob_then_enqueue(
+        envelope_id, blob_bytes,
         redis=redis,
-        envelope_id=envelope_id,
         sender_pubkey_hex=body.ephemeral_pubkey_hex,
         recipient_pubkey_hex=owner_pubkey_hex,
         timestamp=now,

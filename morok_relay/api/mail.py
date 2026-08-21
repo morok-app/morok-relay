@@ -20,8 +20,7 @@ from ..config import get_settings
 from ..deps import CurrentSession, DBSession, RedisClient
 from ..mail_models import AliasStatus, MailAlias, MailOutbound, OutboundStatus
 from ..rate_limit import rate_limit_by_pubkey
-from .. import blob_storage
-from ..queue import enqueue_envelope
+from ..queue import write_blob_then_enqueue
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["mail"])
@@ -293,11 +292,10 @@ async def send_internal(
         raise HTTPException(413, "Лист завеликий")
 
     envelope_id = secrets.token_hex(32)
-    await blob_storage.write_blob(envelope_id, blob)
     ttl = s.mail_ttl_seconds
-    expires = await enqueue_envelope(
-        redis,
-        envelope_id=envelope_id,
+    expires = await write_blob_then_enqueue(
+        envelope_id, blob,
+        redis=redis,
         sender_pubkey_hex="",
         recipient_pubkey_hex=bytes(row.owner_pubkey).hex(),
         timestamp=int(time.time()),

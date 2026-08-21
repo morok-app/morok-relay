@@ -38,7 +38,7 @@ import time
 import redis.asyncio as redis_async
 from fastapi import HTTPException, status
 
-from .blob_storage import secure_delete_blob
+from .blob_storage import secure_delete_blob, write_blob
 
 logger = logging.getLogger(__name__)
 
@@ -523,6 +523,51 @@ async def enqueue_envelope(
         await pipe.execute()
 
     return expires_at
+
+
+async def write_blob_then_enqueue(
+    envelope_id: str,
+    blob_bytes: bytes,
+    **enqueue_kwargs,
+) -> int | None:
+    """
+    write_blob() + enqueue_envelope() з очищенням при відмові
+    (жорсткий свіжий прохід — знахідка з зовнішнього перегляду).
+
+    ЧОМУ ЦЕ ІСНУЄ. У п'яти місцях кодової бази (messages.py, mail.py,
+    sealed.py, burner.py, federation.py remote-DM-forward) blob
+    фізично писався на диск ПЕРЕД викликом enqueue_envelope(). Якщо
+    цей виклик кидав EnqueueRejected (inbox одержувача повний, чи
+    Redis тимчасово недоступний) — файл лишався сиротою на диску до
+    найближчого reaper-проходу: не catastrophic (максимум 256 KiB на
+    конверт, 60/хв на pubkey), але це компенсація постфактум, а не
+    нормальний lifecycle, і при цілеспрямованому навантаженні на
+    відмову — помітний дисковий churn.
+
+    Один спільний helper замість дублювання try/except у п'яти
+    місцях: важче пропустити оновлення десь, якщо колись знадобиться
+    змінити цю логіку знову.
+
+    ВАЖЛИВО: групового fan-out (enqueue_envelope_for_recipients) це
+    НЕ стосується — та функція не кидає EnqueueRejected, вона
+    gracefully пропускає переповнених одержувачів і завжди повертає
+    результат.
+    """
+    await write_blob(envelope_id, blob_bytes)
+    try:
+        return await enqueue_envelope(
+            envelope_id=envelope_id, **enqueue_kwargs,
+        )
+    except EnqueueRejected:
+        try:
+            await secure_delete_blob(envelope_id)
+        except Exception as e:
+            logger.warning(
+                "orphan blob cleanup failed for %s after EnqueueRejected "
+                "(reaper full-scan will catch it eventually): %s",
+                envelope_id[:8], e,
+            )
+        raise
 
 
 async def enqueue_envelope_for_recipients(

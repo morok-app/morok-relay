@@ -49,9 +49,17 @@ async def verify_sensitive_action(
     current.pubkey_hex з верифікованої сесії виклику, ніколи з тіла
     запиту: підмінити "хто підписав" через тіло неможливо.
 
-    Fail-closed на невалідний підпис/протухле вікно; fail-OPEN на
-    збій самого Redis (anti-replay-шар) — втрата доступності гірша за
-    теоретичний ризик повтору в межах короткого вікна.
+    Fail-closed скрізь, включно з anti-replay-шаром (жорсткий свіжий
+    прохід — GPT-перегляд другого раунду). РАНІШЕ Redis-збій ТУТ
+    означав fail-OPEN (return True) — обґрунтування було "втрата
+    доступності гірша за теоретичний ризик повтору", АЛЕ для
+    account_delete/backup_replace/backup_delete/dms_cancel
+    correctness важливіша за availability: коли SensitiveActionProof
+    стане обов'язковим, "Redis лежить → пропускаємо replay-захист"
+    означало б, що криптографічно валідний, але ПОВТОРЕНИЙ підпис
+    проходить якраз у момент деградації Redis — найгірший можливий
+    час для цього. Redis лежить → операція просто не пройде (503-
+    подібна відмова), а не тиха деградація безпеки.
     """
     now = int(time.time())
     if abs(now - timestamp) > ACTION_SIG_WINDOW_SECONDS:
@@ -79,5 +87,8 @@ async def verify_sensitive_action(
             claim_key, b"1", nx=True, ex=ACTION_SIG_WINDOW_SECONDS,
         )
     except Exception:
-        return True  # Redis-збій у anti-replay-шарі — не блокуємо легітимну дію
+        # Fail-CLOSED (жорсткий свіжий прохід): Redis-збій у anti-replay-
+        # шарі більше не означає "пропускаємо перевірку" — для незворотних
+        # дій correctness важливіша за availability.
+        return False
     return bool(claimed)
