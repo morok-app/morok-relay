@@ -188,6 +188,15 @@ def _pending_recipients_key(envelope_id: str) -> str:
 # Redis не розкриває графа спілкування довше, ніж живуть самі конверти.
 TOMBSTONE_EXTRA_TTL_SECONDS = 7 * 86400
 
+# Скільки живе "цей reader реально забрав цей envelope_id" запис —
+# для read-receipt entitlement (жорсткий свіжий прохід, підтверджено
+# зовн. аудитом як MEDIUM: "чи був цей envelope_id узагалі адресований
+# саме цьому reader"). Коротше за sender-delete tombstone (не 7 діб):
+# read receipt зазвичай надсилається одразу чи протягом кількох годин
+# після прочитання, не тижнями; 48 год — запас на реалістичну
+# затримку (клієнт офлайн кілька днів, потім шле накопичені receipts).
+DELIVERY_TOMBSTONE_TTL_SECONDS = 2 * 86400
+
 
 def _sender_tombstone_key(envelope_id: str) -> str:
     return f"morok:env_tomb:{envelope_id}"
@@ -197,6 +206,34 @@ def _sender_tombstone_value(sender_pubkey_hex: str, recipient_pubkey_hex: str) -
     return hashlib.sha256(
         f"{sender_pubkey_hex}|{recipient_pubkey_hex}".encode("utf-8")
     ).hexdigest()
+
+
+def _delivery_tombstone_key(envelope_id: str, reader_pubkey_hex: str) -> str:
+    """
+    "Цей reader реально ACK-нув цей envelope_id" — записується в
+    acknowledge_envelope, переживає видалення meta/blob (яке тепер
+    відбувається одразу на ACK, див. _ACK_PENDING_LUA). Без цього
+    entitlement-перевірка read receipt мала б перевіряти "чи meta ще
+    існує" — але meta для DM зникає МИТТЄВО після того самого ACK,
+    тож легітимний reader, який чесно прочитав повідомлення, отримав
+    би хибну відмову для власного read receipt.
+    """
+    return f"morok:delivered:{envelope_id}:{reader_pubkey_hex}"
+
+
+async def was_delivered_to(
+    redis: redis_async.Redis, envelope_id: str, reader_pubkey_hex: str,
+) -> bool:
+    """
+    Entitlement-перевірка для read receipt (жорсткий свіжий прохід):
+    чи цей envelope_id був РЕАЛЬНО адресований і ACK-нутий саме цим
+    reader'ом. Без цього bearer міг би надіслати "прочитано" для
+    ЧУЖОГО envelope_id, і сервер переслав би фальшиву галочку —
+    не витік plaintext, але оманливий сигнал для sender'а.
+    """
+    return bool(await redis.exists(
+        _delivery_tombstone_key(envelope_id, reader_pubkey_hex)
+    ))
 
 
 def _inbox_channel(recipient_pubkey_hex: str) -> str:
@@ -706,6 +743,23 @@ async def acknowledge_envelope(
     removed = await redis.zrem(_inbox_key(recipient_pubkey_hex), envelope_id)
     if removed <= 0:
         return False
+
+    # Delivery tombstone для read-receipt entitlement (жорсткий свіжий
+    # прохід) — записуємо НЕЗАЛЕЖНО від pending-decrement нижче: цей
+    # запис має пережити видалення meta, а не залежати від того, чи
+    # цей ACK був "останнім" у групі. Redis-збій тут не повинен
+    # ламати сам ACK (inbox уже прибрано) — fail-soft: без tombstone
+    # read receipt цього конкретного reader'а пізніше просто буде
+    # відхилений як неавторизований, гірше не стає.
+    try:
+        await redis.set(
+            _delivery_tombstone_key(envelope_id, recipient_pubkey_hex),
+            b"1", ex=DELIVERY_TOMBSTONE_TTL_SECONDS,
+        )
+    except Exception as e:
+        logger.warning(
+            "delivery tombstone write failed for %s: %s", envelope_id[:8], e,
+        )
 
     try:
         result = await redis.eval(

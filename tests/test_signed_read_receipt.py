@@ -160,6 +160,7 @@ async def test_post_read_receipts_forged_signature_skipped(db, redis):
 async def test_post_read_receipts_valid_signature_sent(db, redis):
     from morok_relay.api.messages import post_read_receipts
     from morok_relay.config import get_settings
+    from morok_relay.queue import acknowledge_envelope, enqueue_envelope
 
     settings = get_settings()
     now = int(time.time())
@@ -168,8 +169,17 @@ async def test_post_read_receipts_valid_signature_sent(db, redis):
                 created_at=now, last_seen_at=now))
     await db.commit()
 
-    session = Session(token="t" * 64, pubkey_hex=READER, expires_at=2**31)
+    # Entitlement-перевірка (жорсткий свіжий прохід) вимагає реального
+    # ACK — вигаданий envelope_id без доставки більше не проходить.
     eid = "dd" * 32
+    await enqueue_envelope(
+        redis, envelope_id=eid, sender_pubkey_hex=SENDER,
+        recipient_pubkey_hex=READER, timestamp=now, ttl_seconds=3600,
+        signature_hex="ff" * 64, hard_ceiling_seconds=86400,
+    )
+    await acknowledge_envelope(redis, READER, eid)
+
+    session = Session(token="t" * 64, pubkey_hex=READER, expires_at=2**31)
     sig = _sign(eid, SENDER, None, now)
     body = ReadReceiptsRequest(reads=[
         ReadReceiptItem(
@@ -186,6 +196,7 @@ async def test_post_read_receipts_legacy_unsigned_still_works(db, redis):
     """Контроль: клієнт БЕЗ підпису досі працює точно як раніше."""
     from morok_relay.api.messages import post_read_receipts
     from morok_relay.config import get_settings
+    from morok_relay.queue import acknowledge_envelope, enqueue_envelope
 
     settings = get_settings()
     now = int(time.time())
@@ -194,9 +205,17 @@ async def test_post_read_receipts_legacy_unsigned_still_works(db, redis):
                 created_at=now, last_seen_at=now))
     await db.commit()
 
+    eid = "ee" * 32
+    await enqueue_envelope(
+        redis, envelope_id=eid, sender_pubkey_hex=SENDER,
+        recipient_pubkey_hex=READER, timestamp=now, ttl_seconds=3600,
+        signature_hex="ff" * 64, hard_ceiling_seconds=86400,
+    )
+    await acknowledge_envelope(redis, READER, eid)
+
     session = Session(token="t" * 64, pubkey_hex=READER, expires_at=2**31)
     body = ReadReceiptsRequest(reads=[
-        ReadReceiptItem(envelope_id="ee" * 32, sender_pubkey_hex=SENDER),
+        ReadReceiptItem(envelope_id=eid, sender_pubkey_hex=SENDER),
     ])
     result = await post_read_receipts(body, session, db, redis)
     assert result["sent"] == 1

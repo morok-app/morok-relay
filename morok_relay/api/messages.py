@@ -32,6 +32,7 @@ from ..queue import (
     is_envelope_in_inbox,
     list_inbox,
     publish_read_receipt,
+    was_delivered_to,
 )
 from ..rate_limit import rate_limit_by_pubkey
 from ..schemas import EnvelopeAck, EnvelopeIn
@@ -455,6 +456,19 @@ async def post_read_receipts(
         try:
             sender_pubkey = bytes.fromhex(r.sender_pubkey_hex)
         except ValueError:
+            skipped += 1
+            continue
+
+        # Entitlement-перевірка (жорсткий свіжий прохід, MEDIUM):
+        # раніше сервер знав ХТО шле receipt (bearer) і чий підпис на
+        # ньому, але не перевіряв, чи цей envelope_id взагалі був
+        # адресований саме цьому reader'у. Bearer міг надіслати
+        # "прочитано" для ЧУЖОГО envelope_id — не витік plaintext, але
+        # фальшива галочка sender'у. was_delivered_to читає tombstone,
+        # записаний у acknowledge_envelope на кожному реальному ACK —
+        # переживає видалення meta (яке тепер відбувається одразу
+        # після ACK, не чекає TTL).
+        if not await was_delivered_to(redis, r.envelope_id, reader_pubkey_hex):
             skipped += 1
             continue
 
