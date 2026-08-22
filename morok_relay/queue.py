@@ -371,6 +371,7 @@ async def enqueue_envelope(
     channel: str | None = None,
     mail_from: str | None = None,
     mail_origin: str | None = None,
+    extra_meta: dict | None = None,
 ) -> int | None:
     """
     Add an envelope to the recipient's inbox queue and publish a notification.
@@ -432,6 +433,23 @@ async def enqueue_envelope(
         meta["mail_origin"] = mail_origin
     if mail_from:
         meta["mail_from"] = mail_from
+
+    # extra_meta — НЕПІДПИСАНІ службові поля релею, що потрапляють у
+    # metadata конверта (DMS-тригер: kind/dms_creator_pubkey/dms_id +
+    # окрема доменна атестація). Той самий клас, що from_username чи
+    # group_id: клієнт бачить їх у відповіді, але вони НЕ входять у
+    # canonical signed structure конверта (crypto.SIGNED_FIELDS —
+    # рівно from/to/ts/ttl/blob), інакше перевірка підпису впаде.
+    #
+    # Захист від затирання: жодне extra-поле не має права перезаписати
+    # канонічне чи вже виставлене сервером (from/to/ts/ttl/sig/
+    # expires_at/mail_*/sealed/...). Без цього виклик із помилковим
+    # extra_meta={"from": ...} тихо підмінив би відправника в metadata.
+    if extra_meta:
+        for k, v in extra_meta.items():
+            if k in meta:
+                raise ValueError(f"extra_meta may not override reserved key {k!r}")
+            meta[k] = v
 
     # SET NX is the dedup gate — only one writer "wins" the slot.
     written = await redis.set(
@@ -625,41 +643,63 @@ async def enqueue_envelope_for_recipients(
     }
 
     new_event = _new_event(envelope_id)
+    meta_json = json.dumps(meta).encode("utf-8")
+    ttl_until_expiry = expires_at - now
 
     # Per-recipient queue cap: prune expired then skip any recipient whose
     # inbox is already at the depth limit. Unlike the DM path we DON'T
     # refuse the whole send — other group members must still get the
     # message; only the flooded inbox is skipped.
-    # ЧОМУ PIPELINE. Раніше тут було ДВА послідовні await на КОЖНОГО
-    # одержувача (zremrangebyscore + zcard). Для групи на 500 осіб це
-    # 1000 послідовних round-trip до Redis у межах одного запиту на
-    # відправку повідомлення — латентність, що серіалізується на event
-    # loop і б'є по всьому релею. Тепер обидві операції для ВСІХ
-    # одержувачів ідуть однією пачкою: один round-trip замість 2×N.
+    #
+    # ВИПРАВЛЕНО (детальний аналіз relay). DM-шлях уже був атомарним
+    # через _INBOX_ENQUEUE_LUA, груповий — ні: окремий pipeline читав
+    # ZCARD усіх учасників, формував eligible, а ЗОВСІМ ІНШИЙ pipeline
+    # пізніше робив ZADD. Між ними — вікно, у яке кілька паралельних
+    # групових розсилок на СПІЛЬНОГО одержувача (учасник кількох
+    # активних груп) бачили однакову глибину під лімітом і всі
+    # вставлялись. Доведено емпірично на незміненому коді: cap=5,
+    # 3 наявні конверти, 10 паралельних fan-out'ів → прийнято 10,
+    # фінальна глибина 13. «Hard cap» перевищено в 2.6 раза.
+    #
+    # Тепер той самий перевірений Lua, що й у DM-шляху, для КОЖНОГО
+    # одержувача — але батчовано в ОДИН round-trip, тож виграш у
+    # латентності (проти старих 2×N послідовних await) зберігається.
+    # meta йде першою командою тієї ж пачки: конверт має з'явитись у
+    # metadata НЕ ПІЗНІШЕ, ніж у чиємусь inbox'і, інакше паралельний
+    # list_inbox побачив би id у черзі без metadata і мовчки його
+    # пропустив.
     eligible: list[str] = []
+    atomic_ok = True
     try:
         async with redis.pipeline(transaction=False) as pipe:
+            pipe.set(_envelope_meta_key(envelope_id), meta_json, ex=ttl_until_expiry)
             for recipient in recipient_pubkeys_hex:
-                pipe.zremrangebyscore(_inbox_key(recipient), 0, now)
-                pipe.zcard(_inbox_key(recipient))
-            depth_results = await pipe.execute()
+                pipe.eval(
+                    _INBOX_ENQUEUE_LUA,
+                    1,
+                    _inbox_key(recipient),
+                    now,
+                    envelope_id,
+                    expires_at,
+                    MAX_INBOX_QUEUE_DEPTH,
+                )
+            results = await pipe.execute()
     except Exception as e:
         # Fail-open, як і раніше: перевірка глибини — захист сховища, а не
         # межа безпеки. Краще доставити, ніж мовчки загубити групову
         # розсилку через блимок Redis.
-        logger.warning("group fan-out depth check failed (allowing all): %s", e)
-        depth_results = []
+        logger.warning(
+            "group fan-out atomic enqueue failed (allowing all): %s", e,
+        )
+        atomic_ok = False
 
-    if depth_results:
-        # Результати йдуть парами (zremrangebyscore, zcard) у порядку
-        # одержувачів.
-        for idx, recipient in enumerate(recipient_pubkeys_hex):
-            zcard_result = depth_results[idx * 2 + 1]
-            if not isinstance(zcard_result, int):
-                # Помилка на цьому конкретному ключі — не караємо одержувача.
-                eligible.append(recipient)
-                continue
-            if zcard_result < MAX_INBOX_QUEUE_DEPTH:
+    if atomic_ok:
+        # results[0] — відповідь на SET meta; далі по одному EVAL на
+        # одержувача, у тому самому порядку.
+        for recipient, inserted in zip(
+            recipient_pubkeys_hex, results[1:], strict=True,
+        ):
+            if inserted:
                 eligible.append(recipient)
             else:
                 logger.warning(
@@ -667,20 +707,21 @@ async def enqueue_envelope_for_recipients(
                     recipient[:8],
                 )
     else:
+        # Redis не відповів на атомарну пачку — вставляємо безумовно,
+        # включно з meta, якої в такому разі теж могло не бути.
         eligible = list(recipient_pubkeys_hex)
+        async with redis.pipeline(transaction=True) as pipe:
+            pipe.set(_envelope_meta_key(envelope_id), meta_json, ex=ttl_until_expiry)
+            for recipient in eligible:
+                pipe.zadd(_inbox_key(recipient), {envelope_id: expires_at})
+            await pipe.execute()
 
     async with redis.pipeline(transaction=True) as pipe:
-        pipe.set(
-            _envelope_meta_key(envelope_id),
-            json.dumps(meta).encode("utf-8"),
-            ex=expires_at - now,
-        )
         for recipient in eligible:
-            pipe.zadd(_inbox_key(recipient), {envelope_id: expires_at})
             # Той самий TTL на ключ, що й у DM-шляху (див. коментар там).
             pipe.expire(
                 _inbox_key(recipient),
-                max(expires_at - now, 60) + INBOX_KEY_TTL_SLACK_SECONDS,
+                max(ttl_until_expiry, 60) + INBOX_KEY_TTL_SLACK_SECONDS,
             )
             pipe.publish(_inbox_channel(recipient), new_event)
         # Pending-recipient tracking (жорсткий свіжий прохід) — SET

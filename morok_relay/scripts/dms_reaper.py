@@ -37,7 +37,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
-import json
 import logging
 import sys
 import time
@@ -46,12 +45,11 @@ import redis.asyncio as redis_async
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
-from ..blob_storage import write_blob
 from ..config import get_settings
 from ..crypto import canonical_json, ed25519_sign
 from ..db import close_db, init_db
 from ..models import DeadManSwitch, DMSStatus
-from ..queue import enqueue_envelope
+from ..queue import write_blob_then_enqueue
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +57,46 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 # Trigger logic
 # ============================================================================
+
+def build_dms_attestation_message(
+    *,
+    envelope_id: str,
+    recipient_pubkey_hex: str,
+    timestamp: int,
+    dms_creator_pubkey_hex: str,
+    dms_id: str,
+) -> bytes:
+    """
+    Канонічне повідомлення ОКРЕМОЇ доменної атестації DMS-тригера.
+
+    ЧОМУ ОКРЕМИЙ ПІДПИС, А НЕ РОЗШИРЕНИЙ КОНВЕРТ. Підпис самого конверта
+    в Morok рахується РІВНО над crypto.SIGNED_FIELDS
+    (from/to/ts/ttl/blob) — так підписує клієнт, так перевіряє
+    verify_envelope_signature, і так мусить робити релей, інакше його
+    підпис не перевірить ніхто. Але клієнту все одно треба
+    криптографічно (а не «на слово metadata») знати, що конверт — це
+    спрацьований заповіт саме такого-то автора. Тому дві незалежні
+    підписані структури над одним конвертом:
+
+      1. sig  — стандартний envelope signature (5 канонічних полів),
+                перевіряється тим самим кодом, що й будь-який інший
+                конверт;
+      2. dms_attestation_sig — ця атестація, доменно розділена
+                ("morok_dms_trigger": "v1"), прив'язана до конкретного
+                envelope_id + одержувача + моменту, тож її не можна
+                переграти на інший конверт.
+
+    Обидва — ключем релею. Клієнт знає relay pubkey з DNS/handshake.
+    """
+    return canonical_json({
+        "morok_dms_trigger": "v1",
+        "envelope_id": envelope_id,
+        "to": recipient_pubkey_hex,
+        "ts": timestamp,
+        "dms_creator_pubkey": dms_creator_pubkey_hex,
+        "dms_id": dms_id,
+    })
+
 
 async def _build_and_deliver_envelope(
     redis: redis_async.Redis,
@@ -71,6 +109,27 @@ async def _build_and_deliver_envelope(
     Build a DMS-triggered envelope and deliver it to one recipient.
 
     Returns envelope_id. Does NOT mark recipient as delivered — caller does.
+
+    ВИПРАВЛЕНО (детальний аналіз relay, P1 — зламана релізна фіча).
+    Було ДВІ незалежні поломки в одній функції:
+
+    1. ПІДПИС БУВ НЕПЕРЕВІРЮВАНИЙ. Релей підписував dict із ВОСЬМИ
+       полів (5 канонічних + kind/dms_creator_pubkey/dms_id), а
+       crypto.verify_envelope_signature рахує канонічний JSON рівно з
+       П'ЯТИ (SIGNED_FIELDS). Доведено емпірично: перевірка падала і
+       для урізаного, і для повного конверта — DMS-підпис релею не міг
+       пройти НІКОЛИ, жодним клієнтом на стандартній схемі.
+    2. МІТКИ НЕ ДОХОДИЛИ ДО КЛІЄНТА. kind/creator/dms_id писались у
+       sidecar-ключ morok:dms:envelope:{id}, який НЕ читає жодне місце
+       кодової бази (ні GET /messages/{id}, ні inbox). Одержувач бачив
+       звичайний конверт від невідомого pubkey (релею) без жодної
+       ознаки, що це спрацьований заповіт.
+
+    Тепер: sig рахується над канонічною п'ятіркою (стандартна
+    перевірка проходить), мітки їдуть у САМІЙ metadata конверта через
+    enqueue_envelope(extra_meta=...) — як from_username/group_id, — а
+    їх автентичність підтверджує окрема доменна атестація
+    (build_dms_attestation_message). Sidecar-ключ прибрано.
     """
     settings = get_settings()
     now = int(time.time())
@@ -80,21 +139,6 @@ async def _build_and_deliver_envelope(
     # re-arm by reactivating, but this is by design (per privacy promise).
     ttl_seconds = settings.message_ttl_hard_seconds
 
-    # Envelope body
-    payload_b64 = base64.b64encode(dms.payload_encrypted).decode()
-    unsigned = {
-        "from": relay_pubkey_hex,                # signed by relay
-        "to": recipient_pubkey.hex(),
-        "ts": now,
-        "ttl": ttl_seconds,
-        "blob": payload_b64,
-        "kind": "dms_trigger",                   # client distinguishes from regular envelope
-        "dms_creator_pubkey": dms.creator_pubkey.hex(),
-        "dms_id": str(dms.id),
-    }
-    sig = ed25519_sign(canonical_json(unsigned), relay_priv)
-    envelope = {**unsigned, "sig": sig.hex()}
-
     # Compute envelope_id (stable for dedup if we retry)
     h = hashlib.sha256()
     h.update(dms.id.bytes)
@@ -102,27 +146,54 @@ async def _build_and_deliver_envelope(
     h.update(dms.payload_encrypted)
     envelope_id = h.hexdigest()
 
-    # Write blob and enqueue
-    await write_blob(envelope_id, dms.payload_encrypted)
-    await enqueue_envelope(
+    recipient_hex = recipient_pubkey.hex()
+    creator_hex = dms.creator_pubkey.hex()
+    dms_id_str = str(dms.id)
+
+    # ── 1. Підпис конверта: РІВНО canonical SIGNED_FIELDS ──────────────
+    payload_b64 = base64.b64encode(dms.payload_encrypted).decode()
+    sig = ed25519_sign(canonical_json({
+        "from": relay_pubkey_hex,
+        "to": recipient_hex,
+        "ts": now,
+        "ttl": ttl_seconds,
+        "blob": payload_b64,
+    }), relay_priv)
+
+    # ── 2. Доменна атестація DMS-тригера ──────────────────────────────
+    attestation_sig = ed25519_sign(
+        build_dms_attestation_message(
+            envelope_id=envelope_id,
+            recipient_pubkey_hex=recipient_hex,
+            timestamp=now,
+            dms_creator_pubkey_hex=creator_hex,
+            dms_id=dms_id_str,
+        ),
+        relay_priv,
+    )
+
+    # Write blob and enqueue. write_blob_then_enqueue замість голої пари
+    # write_blob()+enqueue_envelope(): при відмові постановки в чергу
+    # (переповнений inbox одержувача, Redis недоступний) blob інакше
+    # лишався сиротою на диску до наступного full-scan reaper'а. Той
+    # самий helper уже використовують messages/mail/sealed/burner/
+    # federation — dms_reaper був останнім місцем без нього.
+    await write_blob_then_enqueue(
+        envelope_id, dms.payload_encrypted,
         redis=redis,
-        envelope_id=envelope_id,
         sender_pubkey_hex=relay_pubkey_hex,
-        recipient_pubkey_hex=recipient_pubkey.hex(),
+        recipient_pubkey_hex=recipient_hex,
         timestamp=now,
         ttl_seconds=ttl_seconds,
         signature_hex=sig.hex(),
         hard_ceiling_seconds=settings.message_ttl_hard_seconds,
+        extra_meta={
+            "kind": "dms_trigger",
+            "dms_creator_pubkey": creator_hex,
+            "dms_id": dms_id_str,
+            "dms_attestation_sig": attestation_sig.hex(),
+        },
     )
-
-    # Stash the full envelope metadata so clients fetching via
-    # GET /messages/{id} get the kind/creator hint.
-    meta_key = f"morok:dms:envelope:{envelope_id}"
-    await redis.setex(meta_key, ttl_seconds, json.dumps({
-        "kind": "dms_trigger",
-        "dms_creator_pubkey": dms.creator_pubkey.hex(),
-        "dms_id": str(dms.id),
-    }).encode("utf-8"))
 
     return envelope_id
 

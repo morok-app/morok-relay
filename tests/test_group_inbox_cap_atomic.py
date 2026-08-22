@@ -100,19 +100,32 @@ async def test_concurrent_group_sends_never_exceed_cap_for_shared_recipient(
     redis,
 ):
     """
-    ГОЛОВНИЙ ТЕСТ. Один спільний recipient (наприклад, учасник кількох
-    активних груп) отримує ОДНОЧАСНО 10 різних групових розсилок,
-    маючи місце рівно під ліміт (MAX-1 вже зайнято). Атомарно має
-    пройти рівно один fan-out для нього.
+    ГОЛОВНИЙ ТЕСТ. Один спільний recipient (учасник кількох активних
+    груп) отримує ОДНОЧАСНО 10 різних групових розсилок, маючи РІВНО
+    ДВА вільні слоти під лімітом.
+
+    ЧОМУ САМЕ ДВА, А НЕ ОДИН. Попередня версія цього тесту заповнювала
+    чергу до MAX-1 — і була ФІКТИВНОЮ: проходила навіть на зламаному,
+    неатомарному коді. Причина в тому, як asyncio серіалізує перший
+    round-trip: найшвидша задача встигає і перевірити, і вставитись,
+    після чого черга стоїть РІВНО на межі, і решта чесно бачить
+    «повно». Гонка є, але саме цей сетап її маскує.
+
+    З двома вільними слотами маска зникає: на неатомарному коді решта
+    задач бачить однакову глибину під лімітом і всі вставляються
+    (виміряно: cap=5, prefill=3, 10 паралельних fan-out'ів → прийнято
+    10, фінальна глибина 13). На атомарному — рівно 2, і глибина
+    точно на межі.
     """
-    monkeypatch_depth = 5
     import morok_relay.queue as qmod
+    cap = 5
+    free_slots = 2
     orig_depth = qmod.MAX_INBOX_QUEUE_DEPTH
-    qmod.MAX_INBOX_QUEUE_DEPTH = monkeypatch_depth
+    qmod.MAX_INBOX_QUEUE_DEPTH = cap
     try:
         shared_recipient = "ff" * 32
         now = int(time.time())
-        for i in range(monkeypatch_depth - 1):
+        for i in range(cap - free_slots):
             await redis.zadd(
                 f"morok:inbox:{shared_recipient}",
                 {f"pre-existing-{i}": now + 3600},
@@ -125,11 +138,30 @@ async def test_concurrent_group_sends_never_exceed_cap_for_shared_recipient(
         results = await asyncio.gather(*[try_fanout(i) for i in range(10)])
         accepted = sum(1 for _, count in results if count == 1)
 
-        assert accepted == 1, \
-            f"прийнято {accepted} fan-out'ів на спільного одержувача " \
-            f"замість рівно 1 — group cap race"
-
         final_depth = await redis.zcard(f"morok:inbox:{shared_recipient}")
-        assert final_depth == monkeypatch_depth
+        assert final_depth <= cap, (
+            f"глибина {final_depth} перевищила hard cap {cap} — "
+            f"group cap race"
+        )
+        assert accepted == free_slots, (
+            f"прийнято {accepted} fan-out'ів на спільного одержувача "
+            f"замість рівно {free_slots} — group cap race"
+        )
     finally:
         qmod.MAX_INBOX_QUEUE_DEPTH = orig_depth
+
+
+async def test_meta_written_before_inbox_row_is_visible(redis):
+    """
+    Порядок усередині атомарної пачки: metadata конверта має існувати
+    не пізніше, ніж запис у чиємусь inbox'і. Інакше паралельний
+    list_inbox побачив би id у ZSET, не знайшов meta і мовчки
+    пропустив конверт (list_inbox ігнорує записи без metadata).
+    """
+    eid = "12" * 32
+    recipient = "34" * 32
+    await _fanout(redis, eid, [recipient])
+
+    assert await redis.exists(f"morok:envelope:{eid}")
+    inbox = await q.list_inbox(redis, recipient)
+    assert [m["envelope_id"] for m in inbox] == [eid]
