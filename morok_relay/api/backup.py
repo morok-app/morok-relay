@@ -247,7 +247,20 @@ async def restore_by_username(
 
     Heavily rate-limited (3/min per IP) to prevent online brute-force.
     """
-    normalized = normalize_username(username)
+    # ВИМКНЕНО (аудит безпеки, жовтень 2026). Ендпоінт без автентифікації
+    # віддавав будь-кому зашифрований seed + сіль + параметри KDF. Ліміт
+    # 3/хв на IP захищав лише від ОНЛАЙН-перебору; отримавши blob один раз,
+    # атакуючий перебирає короткий PIN офлайн (6 цифр — ~година на
+    # орендованому сервері) і отримує seed, тобто весь акаунт.
+    # Серверний бекап у клієнтах прибрано; власник і далі може прочитати
+    # чи видалити свій бекап автентифікованими GET/DELETE /api/v1/backup.
+    # Повернути публічне відновлення можна лише разом із серверним
+    # лічильником спроб (OPRF/SVR-подібна схема), а не віддачею blob.
+    raise HTTPException(
+        status_code=status.HTTP_410_GONE,
+        detail="public_backup_restore_disabled",
+    )
+    normalized = normalize_username(username)  # noqa: unreachable (лишено для історії)
 
     # Look up user by username
     stmt = (
