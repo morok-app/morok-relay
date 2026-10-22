@@ -30,7 +30,7 @@ from ..config import get_settings
 from ..deps import CurrentSession, DBSession, RedisClient
 from ..models import EncryptedBackup, User, UserTier
 from ..rate_limit import rate_limit_by_pubkey, rate_limit_tor_aware_by_path_param
-from ..sensitive_action import verify_sensitive_action
+from ..sensitive_action import enforce_sensitive_action
 from ..schemas import (
     SensitiveActionProof,
     BackupCreateRequest,
@@ -97,30 +97,17 @@ async def create_or_replace_backup(
     stmt = select(EncryptedBackup).where(EncryptedBackup.pubkey == pubkey_bytes)
     backup = (await db.execute(stmt)).scalar_one_or_none()
 
-    # Крипто-підтвердження (аудит зовн. №5, P1). Якщо клієнт ПЕРЕДАВ
-    # підпис — перевіряємо fail-closed, незалежно від того, це заміна
-    # чи перше створення (раз уже надіслав, недійсний підпис
-    # підозріліший за його повну відсутність). Якщо підпису немає
-    # взагалі — legacy bearer-only шлях, без змін (поки клієнти не
-    # підтримають підписування) — заміна БЕЗ підпису й далі можлива,
-    # це свідомий компроміс сумісності, не діра, що з'явилась щойно.
-    if body.action_signature_hex is not None:
-        settings = get_settings()
-        valid = await verify_sensitive_action(
-            redis,
-            action="backup_replace",
-            pubkey_hex=current.pubkey_hex,
-            target=current.pubkey_hex,
-            nonce=body.action_nonce or "",
-            timestamp=body.action_timestamp or 0,
-            signature_hex=body.action_signature_hex,
-            relay_name=settings.relay_name,
-        )
-        if not valid:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="invalid_action_proof",
-            )
+    # Крипто-підтвердження (аудит зовн. №5, P1), і для заміни, і для
+    # першого створення. Обов'язковість — MOROK_ACTION_PROOF_REQUIRED
+    # (за замовчуванням так; RN-клієнт серверного бекапу не має, веб
+    # передає підпис).
+    await enforce_sensitive_action(
+        redis,
+        action="backup_replace",
+        pubkey_hex=current.pubkey_hex,
+        target=current.pubkey_hex,
+        proof=body,
+    )
 
     if backup is not None:
         backup.encrypted_seed = encrypted_seed
@@ -193,23 +180,13 @@ async def delete_my_backup(
         return BackupDeleted(deleted=False)
 
     # Крипто-підтвердження (аудит зовн. №5, P1) — див. sensitive_action.py.
-    if proof is not None and proof.action_signature_hex is not None:
-        settings = get_settings()
-        valid = await verify_sensitive_action(
-            redis,
-            action="backup_delete",
-            pubkey_hex=current.pubkey_hex,
-            target=current.pubkey_hex,
-            nonce=proof.action_nonce or "",
-            timestamp=proof.action_timestamp or 0,
-            signature_hex=proof.action_signature_hex,
-            relay_name=settings.relay_name,
-        )
-        if not valid:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="invalid_action_proof",
-            )
+    await enforce_sensitive_action(
+        redis,
+        action="backup_delete",
+        pubkey_hex=current.pubkey_hex,
+        target=current.pubkey_hex,
+        proof=proof,
+    )
 
     await db.delete(backup)
     await db.flush()

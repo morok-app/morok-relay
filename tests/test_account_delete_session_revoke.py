@@ -14,7 +14,9 @@ import time
 
 import pytest
 
-pytestmark = pytest.mark.asyncio
+# Тут перевіряється логіка відкликання сесій, не підпис — тому
+# обов'язковість підпису вимкнено (її покриває test_sensitive_action_proof).
+pytestmark = [pytest.mark.asyncio, pytest.mark.usefixtures("no_required_action_proof")]
 
 
 async def _make_user(db, pubkey_hex: str, username: str):

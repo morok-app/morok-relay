@@ -22,7 +22,7 @@ from ..crypto import canonical_json, ed25519_verify
 from ..deps import CurrentSession, DBSession, RedisClient
 from ..models import DeadManSwitch, DMSRecipient, DMSStatus, User, UserTier
 from ..rate_limit import rate_limit_by_pubkey
-from ..sensitive_action import verify_sensitive_action
+from ..sensitive_action import enforce_sensitive_action
 from ..schemas import (
     SensitiveActionProof,
     DMS_FREE_TIER_MAX_ACTIVE,
@@ -371,23 +371,13 @@ async def cancel_dms(
     # pubkey!) — прив'язує підпис до КОНКРЕТНОГО DMS, інакше один
     # валідний підпис на "скасування" міг би переграно закрити ІНШИЙ
     # DMS того самого власника.
-    if proof is not None and proof.action_signature_hex is not None:
-        settings = get_settings()
-        valid = await verify_sensitive_action(
-            redis,
-            action="dms_cancel",
-            pubkey_hex=current.pubkey_hex,
-            target=str(did),
-            nonce=proof.action_nonce or "",
-            timestamp=proof.action_timestamp or 0,
-            signature_hex=proof.action_signature_hex,
-            relay_name=settings.relay_name,
-        )
-        if not valid:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="invalid_action_proof",
-            )
+    await enforce_sensitive_action(
+        redis,
+        action="dms_cancel",
+        pubkey_hex=current.pubkey_hex,
+        target=str(did),
+        proof=proof,
+    )
 
     dms.status = DMSStatus.CANCELLED
     dms.cancelled_at = int(time.time())

@@ -113,3 +113,21 @@ def fake_session():
         return Session(token="t" * 64, pubkey_hex=pubkey_hex, expires_at=2**31)
 
     return _make
+
+
+@pytest.fixture
+def action_proof_required(monkeypatch):
+    """Задати список дій з обов'язковим підписом (MOROK_ACTION_PROOF_REQUIRED)
+    на час тесту: action_proof_required("dms_cancel") або ("")."""
+    settings = get_settings()
+
+    def _set(value: str) -> None:
+        monkeypatch.setattr(settings, "action_proof_required", value)
+
+    return _set
+
+
+@pytest.fixture
+def no_required_action_proof(action_proof_required):
+    """Для тестів ІНШОЇ логіки DELETE /me, що викликають його без підпису."""
+    action_proof_required("")

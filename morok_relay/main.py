@@ -271,6 +271,7 @@ async def health() -> HealthResponse:
         version=__version__,
         onion=onion,
         onion_supported=bool(onion),
+        server_time=int(time.time()),
     )
 
 

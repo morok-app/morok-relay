@@ -593,6 +593,10 @@ class HealthResponse(BaseModel):
     version: str
     onion: str | None = None
     onion_supported: bool = False
+    # Час релею (unix, с). Клієнти беруть його як timestamp для
+    # SensitiveActionProof — годинник телефона може відставати більше
+    # ніж на вікно свіжості (300 с).
+    server_time: int | None = None
 
 
 class ErrorResponse(BaseModel):

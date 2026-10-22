@@ -14,9 +14,9 @@ account_delete, backup replace/delete і dms_cancel довше не було
 Домен-розділений Ed25519 підпис над
 (action, relay, timestamp, nonce, target) — той самий підхід, що вже
 працює для DMS signed check-in (dms.py) і read receipt (messages.py).
-Опціональний і зворотно-сумісний: клієнт, який ще не вміє підписувати,
-проходить bearer-only шляхом, як і раніше — коли клієнти дозріють,
-підпис для цих конкретних дій можна буде зробити обов'язковим.
+Для дій зі списку MOROK_ACTION_PROOF_REQUIRED підпис ОБОВ'ЯЗКОВИЙ
+(без нього — 401 action_proof_required). Для решти — опціональний:
+якщо переданий, перевіряється fail-closed; якщо ні — bearer-only.
 
 `target` прив'язує підпис до КОНКРЕТНОГО об'єкта дії (self pubkey для
 account/backup-дій, dms_id для скасування DMS) — без цього підпис на
@@ -27,6 +27,8 @@ account/backup-дій, dms_id для скасування DMS) — без цьо
 from __future__ import annotations
 
 import time
+
+from fastapi import HTTPException, status
 
 from . import crypto
 
@@ -92,3 +94,50 @@ async def verify_sensitive_action(
         # дій correctness важливіша за availability.
         return False
     return bool(claimed)
+
+
+async def enforce_sensitive_action(
+    redis,
+    *,
+    action: str,
+    pubkey_hex: str,
+    target: str,
+    proof,
+) -> None:
+    """
+    Єдина точка застосування для ендпоінтів. `proof` — будь-який об'єкт
+    з полями action_signature_hex / action_nonce / action_timestamp
+    (SensitiveActionProof або тіло, що його успадковує) або None.
+
+      • proof є → перевірка fail-closed (401 invalid_action_proof);
+      • proof нема, а дія в action_proof_required → 401 action_proof_required;
+      • proof нема й дія необов'язкова → legacy bearer-only, нічого не робимо.
+
+    Викликати ДО будь-якої мутації.
+    """
+    from .config import get_settings
+
+    settings = get_settings()
+    sig = getattr(proof, "action_signature_hex", None) if proof is not None else None
+    if sig is None:
+        if action in settings.action_proof_required_set():
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="action_proof_required",
+            )
+        return
+    valid = await verify_sensitive_action(
+        redis,
+        action=action,
+        pubkey_hex=pubkey_hex,
+        target=target,
+        nonce=getattr(proof, "action_nonce", None) or "",
+        timestamp=getattr(proof, "action_timestamp", None) or 0,
+        signature_hex=sig,
+        relay_name=settings.relay_name,
+    )
+    if not valid:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="invalid_action_proof",
+        )

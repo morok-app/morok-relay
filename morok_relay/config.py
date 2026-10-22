@@ -6,7 +6,7 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -136,6 +136,35 @@ class Settings(BaseSettings):
     fcm_service_account_path: Path = Field(
         default=Path("/etc/morok/fcm-service-account.json"),
     )
+
+    # ----- Крипто-підтвердження незворотних дій (sensitive_action.py) -----
+    # Для яких дій підпис ключем акаунта ОБОВ'ЯЗКОВИЙ (через кому).
+    # Можливі: account_delete, backup_replace, backup_delete, dms_cancel.
+    # dms_cancel за замовчуванням НЕ обов'язковий: старі клієнти (Android
+    # до 1.1.1, Windows до 0.9.4) його не підписують, і відмова в скасуванні
+    # означала б, що «мертва рука» спрацює проти волі власника. Додати
+    # dms_cancel, коли старі версії зійдуть.
+    action_proof_required: str = Field(
+        default="account_delete,backup_replace,backup_delete",
+    )
+
+    @field_validator("action_proof_required")
+    @classmethod
+    def _known_actions(cls, v: str) -> str:
+        # Помилка в назві мовчки вимкнула б захист — тому валимо старт.
+        known = {"account_delete", "backup_replace", "backup_delete", "dms_cancel"}
+        bad = sorted({a.strip() for a in v.split(",") if a.strip()} - known)
+        if bad:
+            raise ValueError(
+                f"MOROK_ACTION_PROOF_REQUIRED: unknown action(s) {bad}; "
+                f"known: {sorted(known)}"
+            )
+        return v
+
+    def action_proof_required_set(self) -> frozenset[str]:
+        return frozenset(
+            a.strip() for a in self.action_proof_required.split(",") if a.strip()
+        )
 
 
 @lru_cache

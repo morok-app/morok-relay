@@ -146,7 +146,7 @@ async def test_rate_limit_dependency_registered():
 
 
 # ── delete + reactivate не має блокувати перший claim (жорсткий прохід) ──
-async def test_delete_account_resets_username_changed_at(db, redis):
+async def test_delete_account_resets_username_changed_at(db, redis, no_required_action_proof):
     """
     ЗНАЙДЕНО ПІД ЧАС ЖОРСТКОГО ПРОХОДУ (не аудитом ззовні). Сценарій:
     людина claim'ить ім'я → видаляє акаунт (username=None, але

@@ -263,15 +263,21 @@ async def test_delete_me_accepts_valid_proof(db, redis):
     assert result == {"deleted": True, "sessions_revoked": True}
 
 
-async def test_delete_me_still_works_without_proof_legacy(db, redis):
-    """Контроль: клієнт БЕЗ підтримки підписування (жоден proof не
-    переданий) досі працює bearer-only шляхом, без регресії."""
+async def test_delete_me_without_proof_rejected_by_default(db, redis):
+    """
+    ГОЛОВНИЙ ТЕСТ обов'язковості. Голий bearer (вкрадений токен) більше
+    НЕ може стерти акаунт: account_delete за замовчуванням у
+    MOROK_ACTION_PROOF_REQUIRED. Відмова — до будь-якої мутації.
+    """
+    from sqlalchemy import select
+
     from morok_relay.api.account import delete_me
     from morok_relay.config import get_settings
     from morok_relay.models import User, UserTier
     from morok_relay.sessions import Session
 
     settings = get_settings()
+    assert "account_delete" in settings.action_proof_required_set()
     now = int(time.time())
     db.add(User(pubkey=bytes.fromhex(OWNER), username="carol",
                 home_relay=settings.relay_name, tier=UserTier.FREE,
@@ -279,8 +285,76 @@ async def test_delete_me_still_works_without_proof_legacy(db, redis):
     await db.commit()
 
     session = Session(token="t" * 64, pubkey_hex=OWNER, expires_at=2**31)
+    with pytest.raises(HTTPException) as e:
+        await delete_me(session, db, redis, proof=None)
+    assert e.value.status_code == 401
+    assert e.value.detail == "action_proof_required"
+
+    # порожній proof-об'єкт (усі поля None) — те саме, що його відсутність
+    with pytest.raises(HTTPException) as e:
+        await delete_me(session, db, redis, proof=_empty_proof())
+    assert e.value.detail == "action_proof_required"
+
+    row = (await db.execute(
+        select(User).where(User.pubkey == bytes.fromhex(OWNER))
+    )).scalar_one()
+    assert row.deleted_at is None
+
+
+async def test_delete_me_without_proof_allowed_when_not_required(
+    db, redis, action_proof_required,
+):
+    """Самохостер може свідомо вимкнути обов'язковість (порожній список)."""
+    from morok_relay.api.account import delete_me
+    from morok_relay.config import get_settings
+    from morok_relay.models import User, UserTier
+    from morok_relay.sessions import Session
+
+    action_proof_required("")
+    settings = get_settings()
+    now = int(time.time())
+    db.add(User(pubkey=bytes.fromhex(OWNER), username="dave",
+                home_relay=settings.relay_name, tier=UserTier.FREE,
+                created_at=now, last_seen_at=now))
+    await db.commit()
+
+    session = Session(token="t" * 64, pubkey_hex=OWNER, expires_at=2**31)
     result = await delete_me(session, db, redis, proof=None)
     assert result == {"deleted": True, "sessions_revoked": True}
+
+
+def _empty_proof():
+    from morok_relay.schemas import SensitiveActionProof
+    return SensitiveActionProof()
+
+
+async def test_backup_delete_without_proof_rejected(db, redis):
+    from morok_relay.api.backup import delete_my_backup
+    from morok_relay.config import get_settings
+    from morok_relay.models import EncryptedBackup, User, UserTier
+    from morok_relay.sessions import Session
+
+    settings = get_settings()
+    now = int(time.time())
+    db.add(User(pubkey=bytes.fromhex(OWNER), username="erin",
+                home_relay=settings.relay_name, tier=UserTier.FREE,
+                created_at=now, last_seen_at=now))
+    await db.commit()
+    cols = {c.name for c in EncryptedBackup.__table__.columns}
+    kw = dict(pubkey=bytes.fromhex(OWNER), encrypted_seed=b"\x01" * 64,
+              kdf_salt=b"\x02" * 16, kdf_params={}, schema_version=1)
+    for c in ("created_at", "updated_at"):
+        if c in cols:
+            kw[c] = now
+    if "username_at_backup" in cols:
+        kw["username_at_backup"] = "erin"
+    db.add(EncryptedBackup(**kw))
+    await db.commit()
+
+    session = Session(token="t" * 64, pubkey_hex=OWNER, expires_at=2**31)
+    with pytest.raises(HTTPException) as e:
+        await delete_my_backup(session, db, redis, proof=None)
+    assert e.value.detail == "action_proof_required"
 
 
 # ── DMS cancel: target=dms_id, не self pubkey ────────────────────────────
@@ -316,3 +390,81 @@ async def test_dms_cancel_rejects_proof_for_different_dms(db, redis):
     with pytest.raises(HTTPException) as e:
         await cancel_dms(info.dms_id, session, db, redis, proof=proof)
     assert e.value.status_code == 401
+
+
+async def test_dms_cancel_without_proof_allowed_by_default(db, redis):
+    """
+    dms_cancel НЕ обов'язковий за замовчуванням: старі клієнти його не
+    підписують, і відмова означала б спрацювання «мертвої руки» проти
+    волі власника.
+    """
+    import base64
+
+    from morok_relay.api.dms import cancel_dms, create_dms
+    from morok_relay.config import get_settings
+    from morok_relay.models import User, UserTier
+    from morok_relay.schemas import DMSCreate
+    from morok_relay.sessions import Session
+
+    settings = get_settings()
+    assert "dms_cancel" not in settings.action_proof_required_set()
+    now = int(time.time())
+    db.add(User(pubkey=bytes.fromhex(OWNER), tier=UserTier.FREE,
+                home_relay=settings.relay_name,
+                created_at=now, last_seen_at=now))
+    await db.commit()
+    session = Session(token="t" * 64, pubkey_hex=OWNER, expires_at=2**31)
+    info = await create_dms(
+        DMSCreate(trigger_seconds=86400,
+                  payload_encrypted=base64.b64encode(b"\x01" * 50).decode(),
+                  recipient_pubkeys_hex=["aa" * 32], label=None),
+        session, db,
+    )
+    res = await cancel_dms(info.dms_id, session, db, redis, proof=None)
+    assert res.cancelled is True
+
+
+async def test_dms_cancel_required_when_configured(db, redis, action_proof_required):
+    import base64
+
+    from morok_relay.api.dms import cancel_dms, create_dms
+    from morok_relay.config import get_settings
+    from morok_relay.models import User, UserTier
+    from morok_relay.schemas import DMSCreate, SensitiveActionProof
+    from morok_relay.sessions import Session
+
+    action_proof_required("account_delete,dms_cancel")
+    settings = get_settings()
+    now = int(time.time())
+    db.add(User(pubkey=bytes.fromhex(OWNER), tier=UserTier.FREE,
+                home_relay=settings.relay_name,
+                created_at=now, last_seen_at=now))
+    await db.commit()
+    session = Session(token="t" * 64, pubkey_hex=OWNER, expires_at=2**31)
+    info = await create_dms(
+        DMSCreate(trigger_seconds=86400,
+                  payload_encrypted=base64.b64encode(b"\x01" * 50).decode(),
+                  recipient_pubkeys_hex=["aa" * 32], label=None),
+        session, db,
+    )
+    with pytest.raises(HTTPException) as e:
+        await cancel_dms(info.dms_id, session, db, redis, proof=None)
+    assert e.value.detail == "action_proof_required"
+
+    sig = _sign("dms_cancel", info.dms_id, "nonce-dreq", now)
+    res = await cancel_dms(info.dms_id, session, db, redis, proof=SensitiveActionProof(
+        action_signature_hex=sig, action_nonce="nonce-dreq", action_timestamp=now,
+    ))
+    assert res.cancelled is True
+
+
+def test_unknown_action_name_in_config_fails_startup():
+    """Помилка в назві дії (MOROK_ACTION_PROOF_REQUIRED) не має мовчки
+    вимикати захист — Settings відмовляється стартувати."""
+    from pydantic import ValidationError
+
+    from morok_relay.config import Settings
+
+    with pytest.raises(ValidationError):
+        Settings(action_proof_required="account_delet,backup_delete")
+    assert Settings(action_proof_required="").action_proof_required_set() == frozenset()
