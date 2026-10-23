@@ -31,6 +31,7 @@ from ..queue import (
     envelope_exists,
     is_envelope_in_inbox,
     list_inbox,
+    mark_mail_seen,
     publish_read_receipt,
     was_delivered_to,
     write_blob_then_enqueue,
@@ -39,7 +40,7 @@ from ..rate_limit import rate_limit_by_pubkey
 from ..schemas import EnvelopeAck, EnvelopeIn
 from ..push_sender import schedule_push
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 logger = logging.getLogger(__name__)
 
@@ -308,6 +309,37 @@ async def ack_envelope(
         )
     await acknowledge_envelope(redis, current.pubkey_hex, envelope_id)
     return {"acknowledged": True}
+
+
+class MailSeenRequest(BaseModel):
+    envelope_ids: list[str] = Field(..., min_length=1, max_length=200)
+
+    @field_validator("envelope_ids")
+    @classmethod
+    def _hex_ids(cls, v: list[str]) -> list[str]:
+        out = []
+        for eid in v:
+            if len(eid) != 64 or not all(c in "0123456789abcdef" for c in eid):
+                raise ValueError("malformed_envelope_id")
+            out.append(eid)
+        return list(dict.fromkeys(out))
+
+
+@router.post(
+    "/mail-seen",
+    summary="Mark my own mail envelopes as read (survives relogin / other devices)",
+    dependencies=[Depends(rate_limit_by_pubkey(
+        "mail_seen",
+        get_settings().rate_limit_messages_per_minute,
+    ))],
+)
+async def mail_seen(
+    body: MailSeenRequest,
+    current: CurrentSession,
+    redis: RedisClient,
+) -> dict:
+    marked = await mark_mail_seen(redis, current.pubkey_hex, body.envelope_ids)
+    return {"marked": marked}
 
 
 class DMDeleteRequest(BaseModel):

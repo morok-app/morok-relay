@@ -17,6 +17,7 @@ from sqlalchemy import func, select, update
 from sqlalchemy import text as sa_text
 from sqlalchemy.orm import selectinload
 
+from ..dms_liveness import remember_signed_checkin, signed_checkin_enforced
 from ..config import get_settings
 from ..crypto import canonical_json, ed25519_verify
 from ..deps import CurrentSession, DBSession, RedisClient
@@ -289,6 +290,7 @@ async def check_in_signed(
     body: SignedCheckInRequest,
     current: CurrentSession,
     db: DBSession,
+    redis: RedisClient,
 ) -> SignedDMSCheckInResponse:
     """
     current.pubkey_hex тут — вже верифікований bearer, тобто ЦЕЙ шлях
@@ -326,6 +328,7 @@ async def check_in_signed(
 
     bumped = await bump_check_in_for_pubkey(db, current.pubkey_hex)
     await db.commit()
+    await remember_signed_checkin(redis, current.pubkey_hex)
     return SignedDMSCheckInResponse(
         checked_in_count=bumped,
         checked_in_at=now,
@@ -334,8 +337,16 @@ async def check_in_signed(
 
 @router.post("/{dms_id}/check-in", response_model=DMSCheckInResponse)
 async def check_in(
-    dms_id: str, current: CurrentSession, db: DBSession,
+    dms_id: str, current: CurrentSession, db: DBSession, redis: RedisClient,
 ) -> DMSCheckInResponse:
+    # Суворий режим (dms_checkin) для власника, чий клієнт уже вміє
+    # підписаний check-in: лише /checkin-signed. Вкрадений bearer-токен
+    # сам по собі не повинен тримати «мертву руку» взведеною.
+    if await signed_checkin_enforced(redis, current.pubkey_hex):
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail="signed_checkin_required",
+        )
     did = _parse_dms_id(dms_id)
     pubkey = bytes.fromhex(current.pubkey_hex)
     dms = await _load_dms_for_owner(db, did, pubkey, for_update=True)

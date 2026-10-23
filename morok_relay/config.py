@@ -139,7 +139,10 @@ class Settings(BaseSettings):
 
     # ----- Крипто-підтвердження незворотних дій (sensitive_action.py) -----
     # Для яких дій підпис ключем акаунта ОБОВ'ЯЗКОВИЙ (через кому).
-    # Можливі: account_delete, backup_replace, backup_delete, dms_cancel.
+    # Можливі: account_delete, backup_replace, backup_delete, dms_cancel,
+    # dms_checkin («я живий» лише підписаний /dms/checkin-signed — для тих,
+    # чий клієнт хоч раз так зробив; старі клієнти не страждають, див.
+    # dms_liveness.py).
     # dms_cancel за замовчуванням НЕ обов'язковий: старі клієнти (Android
     # до 1.1.1, Windows до 0.9.4) його не підписують, і відмова в скасуванні
     # означала б, що «мертва рука» спрацює проти волі власника. Додати
@@ -152,7 +155,7 @@ class Settings(BaseSettings):
     @classmethod
     def _known_actions(cls, v: str) -> str:
         # Помилка в назві мовчки вимкнула б захист — тому валимо старт.
-        known = {"account_delete", "backup_replace", "backup_delete", "dms_cancel"}
+        known = {"account_delete", "backup_replace", "backup_delete", "dms_cancel", "dms_checkin"}
         bad = sorted({a.strip() for a in v.split(",") if a.strip()} - known)
         if bad:
             raise ValueError(

@@ -13,6 +13,7 @@ from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .db import get_redis, get_session
+from .dms_liveness import signed_checkin_enforced
 from .sessions import Session, verify_session_token
 
 logger = logging.getLogger(__name__)
@@ -150,15 +151,21 @@ async def get_current_session(
     # others skip spawning entirely. If Redis is down we skip the bump
     # (fail-safe: a missed check-in only delays nothing — the next
     # request bumps it; DMS won't misfire from one skipped bump).
-    try:
-        should_bump = await redis.set(
-            f"morok:dms:checkin_throttle:{session.pubkey_hex}",
-            b"1",
-            nx=True,
-            ex=DMS_CHECKIN_THROTTLE_SECONDS,
-        )
-    except Exception:
-        should_bump = False
+    # Суворий режим (dms_checkin): для власника, чий клієнт уже робить
+    # підписаний check-in, звичайний запит із bearer — НЕ «я живий»,
+    # інакше вкрадений токен тримав би DMS взведеним до 30 днів.
+    # Див. dms_liveness.py (старі клієнти — стара поведінка).
+    should_bump = False
+    if not await signed_checkin_enforced(redis, session.pubkey_hex):
+        try:
+            should_bump = await redis.set(
+                f"morok:dms:checkin_throttle:{session.pubkey_hex}",
+                b"1",
+                nx=True,
+                ex=DMS_CHECKIN_THROTTLE_SECONDS,
+            )
+        except Exception:
+            should_bump = False
     if should_bump:
         asyncio.create_task(_bump_dms_check_in_for_pubkey(session.pubkey_hex))
 

@@ -821,6 +821,61 @@ async def get_envelope_meta(
         return None
 
 
+MAIL_SEEN_BATCH_MAX = 200
+
+
+async def mark_mail_seen(
+    redis: redis_async.Redis,
+    recipient_pubkey_hex: str,
+    envelope_ids: list[str],
+) -> int:
+    """
+    Позначити поштові конверти як прочитані ВЛАСНИКОМ (флаг у meta).
+
+    Навіщо: пошта навмисно НЕ ack-ається (кілька пристроїв), а локальна
+    скринька стирається при виході. Без серверного флагу після повторного
+    входу всі листи за 7 діб поверталися «непрочитаними». Тепер
+    list_inbox віддає mail_seen=True, і клієнт одразу ставить «прочитано».
+
+    Лише конверти з ВЛАСНОЇ черги і лише channel="mail" — чужі чи
+    звичайні DM тихо пропускаються. SET ... XX KEEPTTL: якщо конверт
+    уже ack-нули/протух між GET і SET — не воскрешаємо meta, і строк
+    життя не продовжуємо.
+    """
+    ids = envelope_ids[:MAIL_SEEN_BATCH_MAX]
+    if not ids:
+        return 0
+    async with redis.pipeline(transaction=False) as pipe:
+        for eid in ids:
+            pipe.zscore(_inbox_key(recipient_pubkey_hex), eid)
+            pipe.get(_envelope_meta_key(eid))
+        res = await pipe.execute()
+    marked = 0
+    to_set: list[tuple[str, str]] = []
+    for i, eid in enumerate(ids):
+        score, raw = res[2 * i], res[2 * i + 1]
+        if score is None or raw is None:
+            continue
+        try:
+            meta = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if meta.get("channel") != "mail" or meta.get("to") != recipient_pubkey_hex:
+            continue
+        if meta.get("mail_seen") is True:
+            marked += 1
+            continue
+        meta["mail_seen"] = True
+        to_set.append((eid, json.dumps(meta)))
+    if to_set:
+        async with redis.pipeline(transaction=False) as pipe:
+            for eid, val in to_set:
+                pipe.set(_envelope_meta_key(eid), val, xx=True, keepttl=True)
+            oks = await pipe.execute()
+        marked += sum(1 for ok in oks if ok)
+    return marked
+
+
 async def acknowledge_envelope(
     redis: redis_async.Redis,
     recipient_pubkey_hex: str,
